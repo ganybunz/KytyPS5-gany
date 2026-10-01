@@ -149,9 +149,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		buffer_info.pQueueFamilyIndices   = families;
 	}
 
+	// Game buffers (the ones with device addresses) took dedicated memory, a kernel allocation
+	// each (Demon's Souls gameplay, X69: 13% of the GPU command thread in vmaCreateBuffer). Up to
+	// SharedMax they share VMA's blocks instead: the BDA page table holds each page's own device
+	// address (BufferCache::Register), so any placement works. From BryanKAdams/KytyPS5 4068f4a.
+	static constexpr uint64_t SharedMax = 64ull * 1024 * 1024;
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && size > SharedMax ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
