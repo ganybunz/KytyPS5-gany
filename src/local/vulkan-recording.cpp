@@ -1,5 +1,6 @@
 #include "vulkan-recording.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "live-census.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
 #include "time-census.h"
@@ -294,12 +295,14 @@ void InvalidateRawState() {
 // Work calls recorded by this thread (read by the render thread's barrier dedupe, which orders
 // only its own command stream): a plain increment, not a locked add on every command.
 thread_local uint64_t g_work_calls = 0;
+thread_local uint64_t g_packets    = 0;
 #include "local-vulkan-recording.inc"
 } // namespace
 
 void Install() { InstallDispatch(); }
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
 uint64_t WorkCalls() { return g_work_calls; }
+uint64_t RecordedWork() { return g_work_calls + g_packets; }
 void Drain() { if (producer) producer->Drain(); }
 bool PacketsEnabled() {
     return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
@@ -312,6 +315,7 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
     if (!PacketsEnabled() || !replay || segments.size() > 8) return false;
     for (const auto& segment : segments)
         if (segment.size && !segment.data) return false;
+    ++g_packets;
     auto* stream = RecordingStream();
     return stream->Enqueue([&](Writer& writer) {
         std::array<Segment, 8> copied {};

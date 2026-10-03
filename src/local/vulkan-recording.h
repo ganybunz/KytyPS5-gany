@@ -48,6 +48,8 @@ uint64_t StateEpoch();
 // Commands the calling thread recorded that do GPU work or synchronize (draws, dispatches,
 // copies, clears, rendering scopes, barriers): unchanged between two barriers = no work in between.
 uint64_t WorkCalls();
+// Work calls and packets (draws, descriptors) the calling thread recorded: unchanged = nothing recorded.
+uint64_t RecordedWork();
 class ProducerScope {
 public:
     ProducerScope();

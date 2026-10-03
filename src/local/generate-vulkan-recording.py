@@ -123,6 +123,11 @@ def generate(registry, header):
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
             declarations.append('    ++g_work_calls;')
+        # Local diagnostic (live census): barriers by the code that records them.
+        if name.startswith('vkCmdPipelineBarrier'):
+            declarations.append('    if (LiveCensus::g_on.load(std::memory_order_relaxed) && LiveCensus::g_render) '
+                                'LiveCensus::Add(LiveCensus::Barrier, reinterpret_cast<uint64_t>(__builtin_return_address(0)), '
+                                f'{1 if "2" in name else 0} | LiveCensus::g_queue, 0);')
         if ok:
             deferred.append(name)
             declarations.append('    if (auto* stream = pAllocator == nullptr ? RecordingStream() : nullptr) {'

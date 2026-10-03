@@ -24,7 +24,8 @@ enum Kind : uint32_t {
 	SrtInterpreter = 10, // a: shader hash, b: 1 no linear plan, 2 other sources, 3 other clean slots
 	CommandSync   = 11, // GPU-written command memory check before parsing (indirect tables)
 	DrawPhase     = 12, // a: pixel shader, b: phase (LogDrawPhase marks; DrawPhases below)
-	Kinds         = 13
+	Barrier       = 13, // a: return address of the recorded vkCmdPipelineBarrier(2), b: 1 for the 2 form
+	Kinds         = 14
 };
 
 struct Entry {

@@ -1886,9 +1886,10 @@ void CommandProcessor::EmitGlobalBarrier() {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	{
 		// KYTY_GLOBAL_BARRIER_DEDUPE: a barrier orders all earlier work in submission order, so
-		// one with nothing recorded since the previous barrier orders nothing new.
+		// one with nothing recorded since the previous barrier orders nothing new (draws recorded as
+		// packets are work too).
 		static uint64_t last_work = UINT64_MAX;
-		const auto      work      = LocalVulkanRecording::WorkCalls();
+		const auto      work      = LocalVulkanRecording::RecordedWork();
 		if (work == last_work && kyty_local_global_barrier_dedupe.load(std::memory_order_relaxed) != 0) return;
 		last_work = work + 1; // this barrier's own recorded call
 	}

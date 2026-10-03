@@ -38,6 +38,7 @@ environment variables; the ideas carry over to any HLE PS5 emulator.
 | Reprotect on a worker thread | +0.25; render mprotect 608 -> 320/frame | |
 | Narrow readback window | +0.20; sync downloads 10 -> 5.4 | |
 | Global barrier dedupe | +1.4% (-330 of ~920 barriers) | barriers with no work between them |
+| No barriers between guest storage writes repeated in one layout/access; keep a sampled depth target's shader reads while no sampled aspect is attachment-written | 33.9 -> 40.6 fps same-process (barriers 7470 -> 3087/frame) | the deferred decal pass recorded ~3 barriers (each a render pass break) per decal: a ~5 ms GPU tail that delayed the next frame's culling readbacks; guest partial flushes already order those writes, as on the console |
 | Record ordinary draws as packets | -1.3 ms render | they were silently excluded |
 | Image recycle pool | -1 ms | |
 | -O3 -march=native + ThinLTO | ~+4% | |
@@ -72,6 +73,7 @@ separate from the generic emulator and verify the patched bytes before writing.
 | Wider CPU write windows (16/64 pages) | slower, upload x4 | |
 | Leave hot pages unprotected | slower guest | |
 | Second async queue for the frame-start chain | <= 0.6 ms | true data dependency |
+| Culling chain or guest async compute queues on a second graphics-family queue | slower (31 vs 36 fps), black patches | EOP labels are written at translation, so guest cross-queue sync orders translation only; inputs uploaded in the open graphics buffer and output pages uploaded by region syncs race the lane |
 | Unprotect on the guest thread | 9 s freeze | |
 | Strict pinning of render/record/upload threads | 28 fps (worse) | |
 | VK_EXT_shader_object | slower warm (3582 vs 1358 ms), broken | |
