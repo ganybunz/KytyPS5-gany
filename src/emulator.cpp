@@ -206,6 +206,27 @@ void Run(const RunOptions& options) {
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
+	// _GameOverrides/<title id>/ next to the emulator: files there replace the game's own (for
+	// example text render settings), without touching the game's folder.
+	if (std::string title_id;
+	    Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
+		std::error_code ec;
+		const auto      overrides = std::filesystem::current_path(ec) / "_GameOverrides" / title_id;
+		if (!ec && std::filesystem::is_directory(overrides, ec)) {
+			size_t files = 0;
+			for (const auto& entry: std::filesystem::recursive_directory_iterator(overrides, ec)) {
+				if (entry.is_regular_file(ec)) {
+					::printf("Game override: /app0/%s\n",
+					         Common::PathToGenericString(std::filesystem::relative(entry.path(), overrides, ec))
+					             .c_str());
+					files++;
+				}
+			}
+			if (files != 0) {
+				Libs::LibKernel::FileSystem::SetApp0OverrideFolder(overrides);
+			}
+		}
+	}
 
 	MountSandboxDirs();
 

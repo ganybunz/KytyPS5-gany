@@ -46,6 +46,8 @@ struct Lifecycle {
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
 void                  Umount(const std::string& folder_or_point);
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+// Regular files under folder replace the game's files at the same path under /app0.
+void                  SetApp0OverrideFolder(const std::filesystem::path& folder);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);

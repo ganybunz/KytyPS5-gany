@@ -55,7 +55,13 @@ public:
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
 
+	void SetApp0Override(const std::filesystem::path& folder) {
+		Common::LockGuard lock(m_mutex);
+		m_app0_override = folder;
+	}
+
 private:
+	std::filesystem::path  m_app0_override;
 	std::vector<MountPair> m_mount_pairs;
 	Common::Mutex          m_mutex;
 };
@@ -345,6 +351,14 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
+		// _GameOverrides/<title id>/: a regular file there replaces the game's own under /app0.
+		if (!m_app0_override.empty() && p.point == "/app0/" && !rel_path.empty()) {
+			std::error_code ec;
+			auto            replacement = m_app0_override / rel_path;
+			if (std::filesystem::is_regular_file(replacement, ec)) {
+				return replacement;
+			}
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
 			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
@@ -391,6 +405,10 @@ void Umount(const std::string& folder_or_point) {
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 
 	return g_mount_points->ResolvePath(mounted_file_name);
+}
+
+void SetApp0OverrideFolder(const std::filesystem::path& folder) {
+	g_mount_points->SetApp0Override(folder);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
