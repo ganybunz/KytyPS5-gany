@@ -1779,7 +1779,11 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector(bool collect) {
 	const auto tick = m_gc_tick++;
-	if (!collect) {
+	// After a frame with BDA shaders a collected buffer faults straight back, so buffers are kept,
+	// unless video memory is about to run out: on an 8 GB card Demon's Souls filled it by the
+	// title screen (nearly every frame has BDA shaders) and the next allocation failed.
+	if (!collect && (!m_graphics.CanReportMemoryUsage() ||
+	                 m_graphics.GetDeviceMemoryUsage() < m_critical_gc_memory)) {
 		return;
 	}
 	if (m_graphics.CanReportMemoryUsage()) {

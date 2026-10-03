@@ -40,10 +40,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -141,9 +143,34 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	VkBuffer      buffer = VK_NULL_HANDLE;
 	VmaAllocation memory = nullptr;
 	const auto    raw    = static_cast<VkBufferCreateInfo>(create);
-	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
-	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
-	                     "allocate TileManager scratch buffer");
+	auto result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	if (result != VK_SUCCESS) {
+		// Out of video memory (8 GB card, Demon's Souls level load): give back the pooled buffers
+		// (the GPU is done with every one of them), then try once more.
+		std::vector<PooledScratch> idle;
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			idle.swap(m_scratch_pool);
+			m_scratch_pool_bytes = 0;
+		}
+		for (const auto& pooled: idle) {
+			vmaDestroyBuffer(m_graphics.allocator, pooled.buffer, pooled.allocation);
+		}
+		result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	}
+	if (result != VK_SUCCESS) {
+		// Still full: scratch data is read and written by the GPU once, so system memory the GPU
+		// can reach works too (floppa-ps5 5ff603f).
+		VmaAllocationCreateInfo host {};
+		host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		result     = vmaCreateBuffer(m_graphics.allocator, &raw, &host, &buffer, &memory, nullptr);
+		static std::atomic<uint32_t> host_count {0};
+		if (host_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("TileManager: %llu MiB scratch placed in system memory (video memory full)\n",
+			            static_cast<unsigned long long>(capacity >> 20u));
+		}
+	}
+	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
 	return {buffer, memory, size};
 }
 
