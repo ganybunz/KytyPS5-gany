@@ -36,6 +36,12 @@ public:
 		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
 	}
+	// A write protection of the region's pages is queued (KYTY_ASYNC_REPROTECT): their copies are taken
+	// after it lands, so a write before it is uploaded and one after it faults.
+	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr && manager->DeferredProtectionPending();
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
 	// `handoff` (a held caller lock) is released once the region lock is held, so the

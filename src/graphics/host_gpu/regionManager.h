@@ -140,6 +140,9 @@ public:
 	}
 	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
 	void BeginDeferredProtection() noexcept { m_deferred_protects.fetch_add(1, std::memory_order_acq_rel); }
+	[[nodiscard]] bool DeferredProtectionPending() const noexcept {
+		return m_deferred_protects.load(std::memory_order_acquire) != 0;
+	}
 	// The upload worker (or the render thread as a fallback) applies it.
 	void ApplyDeferredProtection(uint64_t vaddr, uint64_t size) {
 		m_page_manager.ReapplyProtection(vaddr, size);

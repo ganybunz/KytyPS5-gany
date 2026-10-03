@@ -298,7 +298,11 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 				m_buffer_cache.SynchronizeRegionRequest(*it);
 				unproven |= it->cpu_epoch == 0;
 			}
-			if (unproven) BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
+			// A request left unproven by its own uploads' queued write protection needs no other visit:
+			// a write before the protection lands is in the copies taken after it, and a write after it
+			// faults (and marks the region).
+			if (unproven && !m_buffer_cache.DeferredProtectionPending(region_begin))
+				BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
 		}
 	}
 }

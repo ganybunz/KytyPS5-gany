@@ -119,6 +119,9 @@ public:
 	// A range spanning several 4 MiB tracker regions returns the sum of their
 	// epochs: region managers are never destroyed and each epoch only grows, so
 	// an unchanged sum proves that no region saw a new CPU-dirty mark.
+	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
+		return m_memory_tracker.DeferredProtectionPending(vaddr);
+	}
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
 		if (!GuestRange {vaddr, size}.Valid()) return 0;
 		constexpr uint64_t MaxRegions = 64;

@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -408,6 +409,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
 		                 (static_cast<uint64_t>(*addr) << 32u) | static_cast<uint32_t>(ref));
 		SuspendPm4();
+	} else {
+		BdaDirtyRegions::Publish();
 	}
 }
 
@@ -552,6 +555,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
 	InitializePerformanceSwitches();
 	LiveControl::Start();
@@ -681,6 +685,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	BdaDirtyRegions::Publish();
 	if (submission.type == SubmissionType::FrameBoundary) {
 		EXIT_IF(submission.started || submission.queue_id != 0);
 		Common::LockGuard lock(m_queue_mutex);
