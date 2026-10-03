@@ -167,9 +167,11 @@ static uint64_t ShaderCodeHash(uint64_t shader_addr, std::span<const uint32_t> c
 		uint64_t addr = 0, generation = UINT64_MAX, hash = 0;
 		uint32_t uses = 0;
 	};
-	thread_local std::array<Entry, 1024> entries {};
+	// Direct-mapped: ~800 shaders a frame at Boletaria (460 compute) collided often in 1024 entries. On the
+	// heap: only the threads that hash need one.
+	thread_local auto entries = std::make_unique<std::array<Entry, 8192>>();
 	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
-	auto&      entry      = entries[((shader_addr >> 8u) * 0x9e3779b97f4a7c15ull) >> 54u];
+	auto&      entry      = (*entries)[((shader_addr >> 8u) * 0x9e3779b97f4a7c15ull) >> 51u];
 	const bool known      = entry.addr == shader_addr && entry.generation == generation;
 	if (known && (++entry.uses & 63u) != 0) return entry.hash;
 	const auto declared = GetDeclaredShaderHash(shader_addr);
