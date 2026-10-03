@@ -31983,7 +31983,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--demons-compute-chain-only") == 0) {
     Require("DemonsSoulsProfile", "title isolation",
             DemonsSouls::IsSupportedTitle("PPSA01341") && DemonsSouls::IsSupportedTitle("PPSA01340") &&
-            !DemonsSouls::IsSupportedTitle("PPSA01342") && !DemonsSouls::IsSupportedTitle(""),
+            DemonsSouls::IsSupportedTitle("PPSA01342") && !DemonsSouls::IsSupportedTitle("PPSA01343") &&
+                !DemonsSouls::IsSupportedTitle(""),
             "another title enabled the profile");
     VulkanHarness vulkan;
     vulkan.CheckStreamingCompute(true);
