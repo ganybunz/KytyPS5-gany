@@ -242,11 +242,18 @@ bool ReadMappedMemorySpan(void* userdata, uint64_t address, uint32_t* values, ui
 	       ReadShaderMemorySpan(userdata, address, values, count, clean);
 }
 
-void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+// An indirect dispatch takes a failed evaluation back (GetComputeProgram): with no thread groups in its
+// arguments the GPU never reads its tables, which then hold anything.
+thread_local std::string* g_unevaluated = nullptr;
+
+bool ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
-		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
-		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
+		auto message = fmt::format("shader resource materialization failed: stage={} hash=0x{:016x} reason={}\n",
+		                           static_cast<uint32_t>(stage), hash, report.reason);
+		if (g_unevaluated == nullptr) EXIT("%s", message.c_str());
+		*g_unevaluated = std::move(message);
+		return false;
 	}
 	if (!report.dropped_summary.empty()) {
 		LOGF("%s indirect image tables: hash=0x%016" PRIx64 " dropped=%" PRIu32 " shapes=%" PRIu32
@@ -254,6 +261,7 @@ void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
 		     label, hash, report.dropped_candidates, report.dropped_shapes,
 		     report.dropped_summary.c_str());
 	}
+	return true;
 }
 
 // KYTY_DUMP_HASHES=<hash,hash,...>: the SPIR-V and guest code of these programs, without the whole
@@ -735,11 +743,11 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          entry->second.resource_plan, runtime, resources,
-			                          specialization, &report, &entry->second.specialization_guard,
-			                          &borrowed_specialization));
+			if (!ReportMaterialization(label, stage, params.hash, report,
+			                           ShaderRecompiler::IR::MaterializeResources(
+			                               entry->second.resource_plan, runtime, resources, specialization,
+			                               &report, &entry->second.specialization_guard, &borrowed_specialization)))
+				return {};
 			const auto& active_specialization =
 			    borrowed_specialization ? *borrowed_specialization : specialization;
 			const auto compatible_push_data = [&](const Permutation& candidate) {
@@ -811,9 +819,10 @@ struct PipelineCache::ProgramCache {
 		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
 			if (auto* group = PrefetchedGroup(params)) {
-				ReportMaterialization(label, stage, params.hash, report,
-				                      ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
-				                                                                 specialization, &report));
+				if (!ReportMaterialization(label, stage, params.hash, report,
+				                           ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
+				                                                                      specialization, &report)))
+					return {};
 				entry = programs.try_emplace(lookup_key, std::move(*group->plan)).first;
 				entry->second.prefetched = std::move(group->modules);
 				group->plan.reset();
@@ -836,9 +845,10 @@ struct PipelineCache::ProgramCache {
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			if (entry == programs.end()) {
 				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-				ReportMaterialization(label, stage, params.hash, report,
-				                      ShaderRecompiler::IR::MaterializeResources(
-				                          resource_plan, runtime, resources, specialization, &report));
+				if (!ReportMaterialization(label, stage, params.hash, report,
+				                           ShaderRecompiler::IR::MaterializeResources(
+				                               resource_plan, runtime, resources, specialization, &report)))
+					return {};
 				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 			}
 			// A specialization met for the first time whose formatted buffers can decode their formats at
@@ -1824,14 +1834,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               std::string*                 unevaluated) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	// Reused per thread: every dispatch prepares one (its user data was a new vector each time).
 	thread_local ShaderParams params;
 	PrepareProgramInto(regs, sh, input_info, params);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	g_unevaluated     = unevaluated;
+	const auto program = m_program_cache->Get(params, input_info, push_data_cursor);
+	g_unevaluated     = nullptr;
+	return program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

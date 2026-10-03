@@ -183,9 +183,12 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, ShaderVertexInputInfo& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info);
+	// `unevaluated`: a resource table that does not evaluate returns an empty program with the error here
+	// (an indirect dispatch decides) instead of stopping the emulator.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                std::string*                 unevaluated = nullptr);
 
 	Pipeline&
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,

@@ -384,8 +384,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto census_shader = sh_ctx.GetCs().cs_regs.data_addr;
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 0);
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	std::string unevaluated;
+	const auto  compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, sh_regs, input_info, indirect_args != 0 ? &unevaluated : nullptr);
+	if (!compute_program && !unevaluated.empty()) {
+		// An indirect dispatch whose resource tables do not evaluate (pointers into memory the guest has not
+		// mapped, while it loads): with no thread groups in its arguments the GPU never reads the tables.
+		std::array<uint32_t, 3> groups {};
+		m_context.GetBufferCache().ReadMemory(indirect_args, sizeof(groups));
+		std::memcpy(groups.data(), reinterpret_cast<const void*>(indirect_args), sizeof(groups));
+		if (groups[0] != 0 && groups[1] != 0 && groups[2] != 0) EXIT("%s", unevaluated.c_str());
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("Dispatch: an indirect dispatch of no thread groups skipped, its tables did not evaluate: %s",
+			            unevaluated.c_str());
+		ResetBindings();
+		return;
+	}
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 1);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
