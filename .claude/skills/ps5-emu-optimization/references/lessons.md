@@ -20,6 +20,12 @@ environment variables; the ideas carry over to any HLE PS5 emulator.
   at 3.9 us (~8% of the render thread, 60% of it kernel VMA split/merge).
 - Causal probe: +1.2 ms on graphics-queue translation -> +1.06-1.23 ms frame time; the same delay on
   async compute queues -> +0.06 ms.
+- At ~43 fps after the decal barrier fix (1-1 standing): render thread ~22.4 ms of work per frame (cap ~45 fps
+  however the queues are scheduled); the chain per frame is previous frame's main-batch translation (~15 ms) ->
+  this frame's culling translation (~4.4 ms, gated by a label at the previous frame's end) -> its GPU work queued
+  behind the previous frame's ~5 ms post-processing tail (one in-order VkQueue) -> guest readbacks -> main batch.
+  60 fps needs async translation off the render thread, async compute overlapping the GPU tail, and ~4 ms less
+  translation on the chain, together: each alone is capped by the others.
 
 ## Wins
 
@@ -39,6 +45,8 @@ environment variables; the ideas carry over to any HLE PS5 emulator.
 | Narrow readback window | +0.20; sync downloads 10 -> 5.4 | |
 | Global barrier dedupe | +1.4% (-330 of ~920 barriers) | barriers with no work between them |
 | No barriers between guest storage writes repeated in one layout/access; keep a sampled depth target's shader reads while no sampled aspect is attachment-written | 33.9 -> 40.6 fps same-process (barriers 7470 -> 3087/frame) | the deferred decal pass recorded ~3 barriers (each a render pass break) per decal: a ~5 ms GPU tail that delayed the next frame's culling readbacks; guest partial flushes already order those writes, as on the console |
+| A compute fill of exactly one image clears it for 64/128-bit texel formats too (each 32-bit part holds the fill word) | 17 image re-initializations (41.8 MB of detiles) per frame gone; +0.5-1.5% | an 18 MiB fill of a froxel volume ran as a buffer write and marked every render target aliased in that arena for re-upload from memory |
+| BDA region syncs only where a guest write becomes visible (guest-thread marks published at submission start and satisfied WAIT_REG_MEM); no re-mark of a region left unproven only by its own queued write protection | region syncs 2.5-10K -> ~850/frame; +0.5%, render -0.3 ms | a guest write after a submission without a label races the GPU on the console too; the deferred protection's copies already capture writes before it lands |
 | Record ordinary draws as packets | -1.3 ms render | they were silently excluded |
 | Image recycle pool | -1 ms | |
 | -O3 -march=native + ThinLTO | ~+4% | |
@@ -74,6 +82,11 @@ separate from the generic emulator and verify the patched bytes before writing.
 | Leave hot pages unprotected | slower guest | |
 | Second async queue for the frame-start chain | <= 0.6 ms | true data dependency |
 | Culling chain or guest async compute queues on a second graphics-family queue | slower (31 vs 36 fps), black patches | EOP labels are written at translation, so guest cross-queue sync orders translation only; inputs uploaded in the open graphics buffer and output pages uploaded by region syncs race the lane |
+| Let next-frame async compute run before the frame boundary | flat | the game's own label (frame counter written at the end of the previous frame's graphics) gates it anyway |
+| Engine convar enableAsyncCompute=false (all compute on the graphics ring) | flat (cross-queue suspends 70 -> 0/frame) | total translation work is unchanged |
+| Deeper software prefetch over the learned draw-record order (index 3 ahead, fields 2, arrays 1) | flat to -0.3% | record/guest memory latency is spread over many structures; the extra lookups cost what they hide |
+| Skip both barriers around CPU->GPU upload copies (unsafe ceiling) | 0 fps (1300 barriers/frame) | not on the critical path |
+| Memo of recent read-only buffer lookups (epoch-proven) | flat | each lookup is cheap; the miss path dominates |
 | Unprotect on the guest thread | 9 s freeze | |
 | Strict pinning of render/record/upload threads | 28 fps (worse) | |
 | VK_EXT_shader_object | slower warm (3582 vs 1358 ms), broken | |
