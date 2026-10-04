@@ -1105,10 +1105,12 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 				                       static_cast<uint32_t>(i)});
 			}
 			for (const auto& image: prepared->images) {
+				// A null image (an empty texture descriptor: a texture not streamed in yet) is bound as the normal
+				// path binds it (the null image, in GENERAL); a texture arriving there rebinds the record.
+				if (image.desc.info.data.Empty()) continue;
 				if (image.layout == vk::ImageLayout::eGeneral) {
 					return "general_image";
 				}
-				if (image.desc.info.data.Empty()) continue;
 				if (!textures.IsSampledImageCurrent(image.image_id, image.desc)) return "image_not_current";
 				const auto& view = image.desc.view_info;
 				image_deps.push_back({image.image_id, image.layout,
@@ -1357,7 +1359,18 @@ bool RenderExecutor::NativeXprRebindSlots(NativeXprRecord& record,
 		const auto& resource = stage.program->info.images[index];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) return false;
 		auto binding = ResolveTexture(resource, stage.snapshot.images[index]);
-		if (binding.desc.type != TextureCache::BindingType::Texture || binding.desc.info.data.Empty()) return false;
+		if (binding.desc.type != TextureCache::BindingType::Texture) return false;
+		if (binding.desc.info.data.Empty()) {
+			// The normal path binds the null image in GENERAL; one it never bound yet is not.
+			auto* null_image = textures.m_slot_images.try_get(binding.image_id);
+			if (null_image == nullptr || null_image->backing.state.layout != vk::ImageLayout::eGeneral)
+				return false;
+			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
+			binding.mip_views.clear();
+			binding.layout = vk::ImageLayout::eGeneral;
+			resolved.push_back(std::move(binding));
+			continue;
+		}
 		auto* image = textures.m_slot_images.try_get(binding.image_id);
 		if (image == nullptr || image->binding.is_target || image->binding.force_general) return false;
 		binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
@@ -1530,6 +1543,11 @@ bool RenderExecutor::NativeXprRebind(NativeXprRecord&                           
 	for (uint32_t st = 0; st < record.stage_count && ok; ++st)
 		for (auto& binding: prepared[st].images) {
 			auto& image = textures.GetImage(binding.image_id);
+			if (image.info.data.Empty() && binding.desc.type != TextureCache::BindingType::Storage &&
+			    image.backing.state.layout == vk::ImageLayout::eGeneral) {
+				binding.layout = vk::ImageLayout::eGeneral;
+				continue;
+			}
 			if (image.info.data.Empty() || binding.desc.type == TextureCache::BindingType::Storage ||
 			    image.binding.is_target || image.binding.force_general) {
 				ok = false;
