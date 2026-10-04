@@ -837,6 +837,27 @@ static Decoder::ImageDimension NullImageDimension(Decoder::ImageDimension declar
 }
 
 void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& specialization) {
+	// What the shader cannot tell apart translates to one permutation: the swizzle of an image it
+	// only reads in a format the device converts (only stores and converted texels apply it), and a
+	// texture without layers it samples addressing layers (a one-layer view: the layer is clamped).
+	for (size_t i = 0; i < specialization.images.size(); i++) {
+		auto&      image = specialization.images[i];
+		const auto root  = i < info.images.size() ? i : image.indirect_root;
+		if (root >= info.images.size()) continue;
+		const auto& base = info.images[root];
+		if (!base.written && image.conversion_format == Prospero::BufferFormat::kInvalid) {
+			image.shader_swizzle = ShaderImageIdentitySwizzle;
+		}
+		using Decoder::ImageDimension;
+		const auto layers = image.dimension == ImageDimension::Dim1D        ? ImageDimension::Dim1DArray
+		                    : image.dimension == ImageDimension::Dim2D      ? ImageDimension::Dim2DArray
+		                    : image.dimension == ImageDimension::Dim2DMsaa  ? ImageDimension::Dim2DMsaaArray
+		                                                                    : ImageDimension::Unknown;
+		if (!image.cube && layers != ImageDimension::Unknown && base.dimension == layers &&
+		    base.resource_class != ImageResourceClass::Storage) {
+			image.dimension = layers;
+		}
+	}
 	if (!PortableShaders()) {
 		return;
 	}
@@ -913,12 +934,25 @@ std::vector<Prospero::TextureNumericClass> PredictImageNumericClasses(const Prog
 			default: return false;
 		}
 	};
+	// The EXEC predicate of an image read or write: a SelectU32 on it keeps, for the lanes that
+	// access the image, the value of its first arm (the register written under that predicate).
+	const auto predicate_of = [](const Inst& access) -> const Inst* {
+		switch (access.GetOpcode()) {
+			case ValueOpcode::ImageRead: return access.Arg(2).Resolve().TryInstruction();
+			case ValueOpcode::ImageWrite: return access.Arg(3).Resolve().TryInstruction();
+			default: return nullptr;
+		}
+	};
+	const auto exec_merge = [](const Inst* select, const Inst* predicate) {
+		return predicate != nullptr && select->Arg(0).Resolve().TryInstruction() == predicate;
+	};
 	// What reads the texels of `read`: F32 operands (through BitCastF32U32) or U32 operations.
 	const auto merges = [](const Inst* user, size_t arg) {
 		if (user->GetOpcode() == ValueOpcode::Phi) return true;
 		return user->GetOpcode() == ValueOpcode::SelectU32 && !user->Arg(arg == 1 ? 2 : 1).Resolve().IsImmediate();
 	};
 	const auto classify_uses = [&](const Inst* read, size_t image) {
+		const auto* predicate = predicate_of(*read);
 		std::vector<std::pair<const Inst*, bool>> work {{read, false}}; // (value, merged on the way)
 		std::array<std::unordered_set<const Inst*>, 2> seen {{{read}, {}}}; // by merged
 		while (!work.empty() && seen[0].size() + seen[1].size() < 512) {
@@ -930,7 +964,7 @@ std::vector<Prospero::TextureNumericClass> PredictImageNumericClasses(const Prog
 				const auto opcode = user->GetOpcode();
 				bool       is_float = false, is_integer = false;
 				if (moves(opcode) && !(opcode == ValueOpcode::SelectU32 && arg == 0)) {
-					const bool next = merged || merges(user, arg);
+					const bool next = merged || (merges(user, arg) && !(arg == 1 && exec_merge(user, predicate)));
 					if (seen[next].insert(user).second) work.emplace_back(user, next);
 				} else if (opcode == ValueOpcode::BitCastF32U32) {
 					is_float = true;
@@ -948,25 +982,39 @@ std::vector<Prospero::TextureNumericClass> PredictImageNumericClasses(const Prog
 			}
 		}
 	};
-	// What makes the texels `write` stores: float bits (BitCastU32F32) or U32 operations.
-	const auto classify_producers = [&](const Value& data, size_t image) {
-		std::vector<const Inst*>         work;
-		std::unordered_set<const Inst*> seen;
-		if (auto* inst = data.TryInstruction()) work.push_back(inst);
-		while (!work.empty() && seen.size() < 512) {
-			const auto* value = work.back();
+	// What makes the texels `write` stores: float bits (BitCastU32F32) or U32 operations, the direct
+	// ones up to the first merge as for reads.
+	const auto classify_producers = [&](const Inst& write, size_t image) {
+		const auto*                     predicate = predicate_of(write);
+		std::vector<std::pair<const Inst*, bool>> work; // (value, merged on the way)
+		std::array<std::unordered_set<const Inst*>, 2> seen;
+		if (auto* inst = write.Arg(2).TryInstruction()) work.emplace_back(inst, false);
+		while (!work.empty() && seen[0].size() + seen[1].size() < 512) {
+			const auto [value, merged] = work.back();
 			work.pop_back();
-			if (!seen.insert(value).second) continue;
+			if (!seen[merged].insert(value).second) continue;
 			const auto opcode = value->GetOpcode();
+			bool       is_float = false, is_integer = false;
 			if (moves(opcode)) {
-				for (size_t arg = opcode == ValueOpcode::SelectU32 ? 1 : 0; arg < value->NumArgs(); arg++) {
-					if (auto* inst = value->Arg(arg).TryInstruction()) work.push_back(inst);
+				const bool select = opcode == ValueOpcode::SelectU32;
+				const bool own    = select && exec_merge(value, predicate);
+				const bool mixes  = select && !own && !value->Arg(1).Resolve().IsImmediate() &&
+				                   !value->Arg(2).Resolve().IsImmediate();
+				const bool next   = merged || opcode == ValueOpcode::Phi || mixes;
+				for (size_t arg = select ? 1 : 0; arg < (own ? 2u : value->NumArgs()); arg++) {
+					if (auto* inst = value->Arg(arg).TryInstruction()) work.emplace_back(inst, next);
 				}
 			} else if (opcode == ValueOpcode::BitCastU32F32) {
-				floating[image]++;
+				is_float = true;
 			} else if (TypeOf(opcode) == Type::U32 && ImageOpcodeInfoOf(opcode).access == ImageAccess::None &&
 			           BufferAccessOf(opcode) == BufferAccess::None && SharedAccessOf(opcode) == SharedAccess::None) {
-				integer[image]++;
+				is_integer = true;
+			}
+			floating[image] += is_float;
+			integer[image] += is_integer;
+			if (!merged) {
+				direct_floating[image] += is_float;
+				direct_integer[image] += is_integer;
 			}
 		}
 	};
@@ -978,7 +1026,7 @@ std::vector<Prospero::TextureNumericClass> PredictImageNumericClasses(const Prog
 			if (index >= program.memory_info.size() || program.memory_info[index].resource >= count) continue;
 			const auto image = program.memory_info[index].resource;
 			if (access == ImageAccess::Read) classify_uses(&inst, image);
-			else classify_producers(inst.Arg(2), image);
+			else classify_producers(inst, image);
 		}
 	}
 	// Uint when every use (or every use before a merge) is an integer one.
@@ -1116,7 +1164,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .byte_base_offset = (descriptor.Base48() & 3u) != 0,
 		});
 	}
-	CanonicalizeSpecialization(program.info, next_specialization);
 	for (uint32_t i = 0; i < next_specialization.images.size(); i++) {
 		const auto& descriptor = next_snapshot.images[i];
 		auto&       image      = next_specialization.images[i];
@@ -1172,6 +1219,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		image.conversion_format = ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
+			// Loads of a format the device converts apply no swizzle, and a store writes each channel
+			// of the format the component the swizzle routes to it first: one that routes every channel
+			// its own component (X001, XXXX, XY00...) writes what an identity one does.
+			const auto count    = Format::GetFormatInfo(format).component_count;
+			bool       identity = image.conversion_format == Prospero::BufferFormat::kInvalid && count >= 1u &&
+			                count <= 4u;
+			for (uint32_t channel = 0; identity && channel < count; channel++) {
+				uint32_t source = 0;
+				while (source < 4u && ((image.shader_swizzle >> (source * 3u)) & 7u) != 4u + channel) source++;
+				identity = source == channel;
+			}
+			if (identity) image.shader_swizzle = ShaderImageIdentitySwizzle;
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
@@ -1194,6 +1253,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			                static_cast<uint32_t>(format)));
 		}
 	}
+	CanonicalizeSpecialization(program.info, next_specialization);
 	for (uint32_t root_index = 0; root_index < next_specialization.images.size(); root_index++) {
 		auto& root = next_specialization.images[root_index];
 		if (root.indirect_root != root_index) {

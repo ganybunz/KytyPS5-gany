@@ -122,6 +122,13 @@ Diagnostic ceilings (not optimizations, useful for "how far can we go"): volumet
   NVIDIA compiles big compute shaders nearly serially inside one process). Cache ~2.3 GB.
 - Runtime coverage of statically derived keys: CS 82%, PS 91%, VS 100%; misses are specialization
   guesses (uint textures, storage swizzles, cube/2D bound to a declared 2D array, written buffer formats).
+- What stalls is a specialization key the prefetch lacks (re-translation 0.1-0.5 s on the render
+  thread), not a SPIR-V the static cache lacks: measure coverage at the canonical input level. Key
+  fields the module ignores (the swizzle of a native-format image it only reads; one whose store
+  routes every channel its own component), the instruction's DIM CUBE kept by the decoder, an
+  EXEC merge on the access's own predicate not counted as mixing types, and two observed 3D->2D
+  patterns took recorded play from CS 92.3% / PS 93.9% to 97.5% / 98.6% for +3% seeds; a full
+  playthrough's recording covers the rest (effects met once).
 - Compile-cost multipliers: wave64 on a 32-wide GPU emitting every instruction twice (x2.3 compile),
   runtime format decode as nested switches per component (up to 9.5 MB SPIR-V, 107 s), EXEC
   predication (~4K selects, ~11K bitcasts per big shader). 77% of formatted buffer loads were plain

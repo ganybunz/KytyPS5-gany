@@ -1370,6 +1370,7 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+				image.cube = image.cube || memory.image_cube;
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1382,6 +1383,8 @@ private:
 		image.first_use_pc   = pc;
 		image.resource_class = resource_class;
 		image.dimension      = memory.image_dimension;
+		// What the shader declares until a specialization gives what is bound (as the dimension).
+		image.cube           = memory.image_cube;
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
