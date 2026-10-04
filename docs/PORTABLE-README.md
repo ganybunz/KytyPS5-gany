@@ -26,8 +26,9 @@ At start-up the launcher reads the game's `sce_sys\param.json` and warns when th
 | GPU driver | The latest | The emulator uses Vulkan, which comes with the driver |
 | Disk | About 83 GB for the game, an SSD recommended | The emulator takes about 270 MB, the shader caches up to about 2.5 GB, and while playing the system temp folder needs another 4–5 GB |
 
-On the test PC (i9-14900K + RTX 5090, 2560×1440 window) the game runs at roughly 35–60 fps, with the
-lowest around 35 fps in the open areas. Much slower PCs may not run it or may stutter badly.
+On the test PC (i9-14900K + RTX 5090, 2560×1440 window) the game runs at roughly 42–60 fps: about
+42–50 fps in the heaviest areas (Boletaria, the Tower of Latria), 55–60 fps in most others. Much
+slower PCs may not run it or may stutter badly.
 
 On a CPU with performance and efficiency cores (Intel Core 12th generation and later), the launcher
 keeps the emulator's render threads on the performance cores (all but the one of CPU 0) by itself,
