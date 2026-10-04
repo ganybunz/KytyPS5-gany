@@ -208,6 +208,8 @@ public:
 	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	[[nodiscard]] bool             AcquireImages(PreparedBindings& bindings);
+	[[nodiscard]] bool             AcquirableImage(const TextureBinding& binding);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);

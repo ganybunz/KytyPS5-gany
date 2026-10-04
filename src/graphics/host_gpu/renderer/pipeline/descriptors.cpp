@@ -1038,6 +1038,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+// What FindTexture requires of a bound image.
+bool RenderExecutor::AcquirableImage(const TextureBinding& binding) {
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image != nullptr && !image->binding.needs_rebind &&
+	       (image->info.data.Empty() || (image->registered && !image->depth_id));
+}
+
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1045,21 +1052,35 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot = prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
-	auto& texture_cache = m_context.GetTextureCache();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto acquirable    = [&](const TextureBinding& binding) { return AcquirableImage(binding); };
+	// Resolving one image (discovery can merge or replace owners) or acquiring one (a refresh) can take
+	// another one's away: both repeat until every image holds (a stale image met only at its acquisition
+	// ended a load at 1-1 with "texture requires rediscovery").
+	for (uint32_t attempt = 0;; ++attempt) {
+		for (uint32_t pass = 0; !std::ranges::all_of(images, acquirable); ++pass) {
+			if (pass + attempt == 16) EXIT("RebindImages: the images of a binding do not settle\n");
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				if (acquirable(images[i])) continue;
+				if (auto* old_image = texture_cache.m_slot_images.try_get(images[i].image_id)) {
+					old_image->binding = {};
+				}
+				images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
+		if (AcquireImages(prepared) && std::ranges::all_of(images, acquirable)) return;
 	}
+}
+
+bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
+	const auto& program       = *prepared.runtime->program;
+	auto&       images        = prepared.images;
+	auto&       texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
+		// An earlier acquisition took this image away: RebindImages resolves and acquires again.
+		if (!AcquirableImage(binding)) return false;
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
@@ -1093,6 +1114,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			sampled |= host_view->info.aspect;
 		}
 	}
+	return true;
 }
 
 RenderExecutor::GraphicsBindings
