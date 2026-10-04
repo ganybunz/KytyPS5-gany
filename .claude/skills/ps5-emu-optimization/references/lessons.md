@@ -95,6 +95,7 @@ separate from the generic emulator and verify the patched bytes before writing.
 | Skip both barriers around CPU->GPU upload copies (unsafe ceiling) | 0 fps (1300 barriers/frame) | not on the critical path |
 | Memo of recent read-only buffer lookups (epoch-proven) | flat | each lookup is cheap; the miss path dominates |
 | Records for compute programs that run once a frame (program phase only; 0 mismatches) | program phase 2.74 -> 3.43 ms | a record used once a frame adds its store and proof to the cold evaluation |
+| Per-key dispatch records or a materialization memo (diagnosed, not built) | of ~2040 dispatches/frame at 1-1 (standing or walking), 96.7% have a (shader, user data, groups) key and a materialized result (flattened tables + descriptors) seen neither last frame nor earlier that frame; same key 1.4%, same result under another key 1.9% | user data and the tables it points to live in per-frame rings |
 | Helper thread prefetching the next draws' record data on another core (unpaced / paced) | -9% / flat | the data is already in L3 and another core cannot fill this core's L2; unpaced it competes for bandwidth |
 | Prefetch the next compute program's tables from the learned dispatch order (79% predicted) | 45.06 vs 45.00 fps | |
 | Prefetch the AOT-compiled table code (median 12 KB per function) before calling it | call 1.25 -> 0.7 us, net 0 | the prefetches cost what they hide |
