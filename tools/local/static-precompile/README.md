@@ -6,7 +6,7 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
 
 ## Flow
 
-1. `precompile.py seeds OUT`: static collection into a seed file (`KytyShaderSeeds1`, the warmup
+1. `precompile.py seeds OUT`: static collection into a seed file (`KytyShaderSeeds2`, the warmup
    cache's format).
    - Shaders: every CSDR package (`_trinity` is the PS5 Pro variant, skipped) plus the AGC headers and
      code embedded in eboot.bin's data segment.

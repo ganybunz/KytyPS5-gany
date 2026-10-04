@@ -152,7 +152,7 @@ def vertex_record(code, agc):
     out_cntl = reg_first(agc['cx_registers'], PA_CL_VS_OUT_CNTL, 0)
     info = {
         'resources_num': 0, 'fetch_attrib_reg': 0, 'fetch_buffer_reg': 0, 'scratch_size_dwords': scratch,
-        'pa_cl_vs_out_cntl': out_cntl, 'fetch_external': 0, 'fetch_embedded': 0, 'clip_enabled': 0,
+        'pa_cl_vs_out_cntl': out_cntl, 'start_instance_sgpr': -1, 'fetch_external': 0, 'fetch_embedded': 0, 'clip_enabled': 0,
         'clip_scale': (0, 0), 'clip_offset': (0, 0), 'clip_half_extent': (0, 0),
         'mesh': {'threads_num': (0, 0, 0), 'lds_size_dwords': 0, 'scratch_size_dwords': 0, 'host_subgroup_size': 64,
                  'wave_size': 64, 'input_primitive': 0, 'primitives_per_group': 0, 'vertices_per_group': 0,

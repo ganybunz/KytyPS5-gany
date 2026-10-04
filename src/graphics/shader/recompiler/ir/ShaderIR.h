@@ -167,6 +167,7 @@ struct SampledResourcePair {
 enum class StageInputKind {
 	VertexIndex,
 	InstanceIndex,
+	BaseInstance,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,

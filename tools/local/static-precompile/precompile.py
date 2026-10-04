@@ -39,7 +39,7 @@ GAME = Path.home() / 'Documents' / 'PPSA01341-app0'  # precompile-windows.ps1's 
 STATES = Path(__file__).with_name('pass-states.json')
 HOST_SUBGROUP_SIZE = 32  # SupportsComputeWave64() is false on the NVIDIA GPU
 LOD_STATS_SUBGROUP = 1   # fragment_subgroup_reduction on the same GPU
-SEED_IDENTITY = b'KytyShaderSeeds1:PPSA01341\n'
+SEED_IDENTITY = b'KytyShaderSeeds2:PPSA01341\n'
 ENGINE_SHADERS = ('coredata', 'enginesupport', 'shaders')
 FULLSCREEN_VS = 'vs_fullscreen'
 
@@ -246,7 +246,7 @@ def cmd_learn_states(args):
 # Seeds
 # ---------------------------------------------------------------------------------------------------
 class SeedFile:
-    """KytyShaderSeeds1: the warmup file layout (records, then pipeline recipes) under its own identity."""
+    """KytyShaderSeeds2: the warmup file layout (records, then pipeline recipes) under its own identity."""
 
     def __init__(self):
         self.records, self.record_index = [], {}

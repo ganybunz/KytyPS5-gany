@@ -786,7 +786,8 @@ void RenderExecutor::NativeXprEndPacket() {
 }
 
 // Object identity: both shader addresses and every user-data SGPR (the XPR
-// geometry root and whatever else the SRT chains start from).
+// geometry root and whatever else the SRT chains start from), and the one the
+// CP writes the start instance into (the vertex shader is translated for it).
 void RenderExecutor::NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& key) const {
 	const auto& sh = buffer.GetShaders();
 	const auto  es = sh.GetVs().es_regs.data_addr;
@@ -802,6 +803,7 @@ void RenderExecutor::NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& 
 		key.push_back(count);
 		key.insert(key.end(), sgprs->value, sgprs->value + count);
 	}
+	key.push_back(static_cast<uint32_t>(sh.GetVs().start_instance_user_sgpr));
 }
 
 // Draw-state identity: the whole graphics context, the user configuration and

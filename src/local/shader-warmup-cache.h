@@ -106,13 +106,14 @@ template<class A> bool Visit(A& a, Record& r) {
     if (r.stage == ShaderType::Vertex || r.stage == ShaderType::Mesh) {
         auto& s = r.vertex;
         Fields(a, s.resources_num, s.fetch_attrib_reg, s.fetch_buffer_reg,
-            s.scratch_size_dwords, s.pa_cl_vs_out_cntl, s.fetch_external, s.fetch_embedded,
-            s.clip_space.enabled);
+            s.scratch_size_dwords, s.pa_cl_vs_out_cntl, s.start_instance_sgpr, s.fetch_external,
+            s.fetch_embedded, s.clip_space.enabled);
         Array(a, s.clip_space.scale); Array(a, s.clip_space.offset); Array(a, s.clip_space.half_extent);
         Workgroup(a, s.mesh);
         Fields(a, s.mesh.input_primitive, s.mesh.primitives_per_group, s.mesh.vertices_per_group,
             s.mesh.max_vertices, s.mesh.max_primitives, s.mesh.provoking_vertex);
-        if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX) return false;
+        if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX ||
+            s.start_instance_sgpr < -1 || s.start_instance_sgpr >= 8 + 32) return false;
         for (int i = 0; i < s.resources_num; ++i) {
             Array(a, s.resources[i].fields);
             auto& dst = s.resources_dst[i];
@@ -221,7 +222,7 @@ public:
         StopWriter();
         records.clear(); pipelines.clear(); record_index.clear(); pipeline_index.clear();
         changed = false; total_bytes = 8;
-        path = location; identity = "KytyShaderWarmup2:" + signature;
+        path = location; identity = "KytyShaderWarmup3:" + signature;
         if (!std::filesystem::exists(path)) return true;
         return Load(path, identity);
     }
@@ -243,24 +244,8 @@ public:
     bool Adopt(const std::filesystem::path& from) {
         if (!Enabled() || !records.empty() || !pipelines.empty()) return false;
         const auto signature = FileIdentity(from);
-        if (!signature.starts_with("KytyShaderWarmup2:") || !Load(from, signature)) return false;
+        if (!signature.starts_with("KytyShaderWarmup3:") || !Load(from, signature)) return false;
         changed = true;
-        return true;
-    }
-
-    // Version 1 contains compiler inputs, not compiled driver binaries. Import
-    // only matching hardware inputs, validate every record, then recompile with
-    // the current compiler. Live source/key/specialization checks still apply.
-    bool ImportLegacy(const std::filesystem::path& location, std::string_view device_suffix) {
-        const auto signature = FileIdentity(location);
-        if (!signature.starts_with("KytyShaderWarmup1:KytyPC1:") ||
-            !signature.ends_with(device_suffix)) return false;
-        std::vector<uint32_t> contents;
-        if (!ReadFile(location, signature, contents)) return false;
-        Reader reader {contents};
-        std::vector<std::vector<uint32_t>> loaded;
-        if (!ReadRecords(reader, loaded) || reader.cursor != contents.size()) return false;
-        for (auto& words : loaded) AddWords(std::move(words), false);
         return true;
     }
 
@@ -317,7 +302,7 @@ public:
                           std::vector<std::vector<uint32_t>>& out_pipelines) {
         const auto signature = FileIdentity(location);
         std::vector<uint32_t> contents;
-        return signature.starts_with("KytyShaderSeeds1:") && ReadFile(location, signature, contents) &&
+        return signature.starts_with("KytyShaderSeeds2:") && ReadFile(location, signature, contents) &&
                Parse(contents, out_records, out_pipelines);
     }
 

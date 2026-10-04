@@ -652,8 +652,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	depth_clip_control.depthClipControl = VK_TRUE;
 
+	// Indirect draws' start instance reaches the shaders as gl_BaseInstance.
+	vk::PhysicalDeviceShaderDrawParametersFeatures draw_parameters {};
+	draw_parameters.pNext                = &depth_clip_control;
+	draw_parameters.shaderDrawParameters = VK_TRUE;
+
 	auto features12  = WindowContext::RequiredVulkan12Features();
-	features12.pNext = &depth_clip_control;
+	features12.pNext = &draw_parameters;
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
@@ -709,6 +714,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	vk::PhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {};
+	supported_draw_parameters.pNext = supported_features2.pNext;
+	supported_features2.pNext       = &supported_draw_parameters;
 	const bool binary_extensions = HasExtension(device_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 	vk::PhysicalDevicePipelineBinaryFeaturesKHR supported_binaries {};
 	vk::PhysicalDeviceMaintenance5FeaturesKHR   supported_maintenance5 {};
@@ -756,6 +764,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.fillModeNonSolid != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.drawIndirectFirstInstance != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_draw_parameters.shaderDrawParameters != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
 	                     supported_features12.shaderOutputLayer != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputViewportIndex == VK_TRUE &&
@@ -786,6 +796,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	device_features.drawIndirectFirstInstance            = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 

@@ -9636,6 +9636,8 @@ void TestMeshInputAssembly() {
   };
   for (const auto &test : cases) {
     ShaderVertexInputInfo input{};
+    // An indirect draw's start instance goes to the user SGPR it names (s10 here).
+    input.start_instance_sgpr = 10;
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
     mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
@@ -9684,17 +9686,19 @@ void TestMeshInputAssembly() {
     load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
     ConstantPropagationPass(program.blocks);
     std::array<uint32_t, 9> vgprs{};
-    uint32_t sgpr3 = 0;
+    std::array<uint32_t, 11> sgprs{};
     for (const auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
         vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
       } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgpr3 = inst.Arg(1).Resolve().U32();
+        sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
       }
     }
-    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+    // The instance ID counts from 0 (workgroup y); the draw's first instance is in the SGPR.
+    Check(sgprs[3] == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 2 &&
+              sgprs[10] == 7,
+          "mesh prolog changed input assembly, wave counts, vertex ID, instance ID or start instance");
   }
 }
 
@@ -10970,9 +10974,42 @@ void TestNewShaderRecompilerVertexSystemInputsWithoutMirrors() {
         "vertex SPIR-V does not load gl_VertexIndex");
   Check(CountSourceOccurrences(source, "OpLoad %int %gl_InstanceIndex") == 1u,
         "vertex SPIR-V does not load gl_InstanceIndex");
+  // The instance ID counts from 0 as on the GPU: gl_InstanceIndex - gl_BaseInstance.
+  Check(CountSourceOccurrences(source, "OpLoad %int %gl_BaseInstance") == 1u,
+        "vertex instance ID does not count from the base instance");
   Check(!Common::ContainsStr(source, "%v5") &&
             !Common::ContainsStr(source, "%v8"),
         "vertex system values were routed through guest VGPR mirrors");
+}
+
+// An indirect draw has the CP write its start instance into a user SGPR (START_INST_LOC): the
+// shader reads that SGPR as gl_BaseInstance instead of its user data.
+void TestNewShaderRecompilerVertexStartInstanceSgpr() {
+  using StageInputKind = ShaderRecompiler::IR::StageInputKind;
+
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 10), // v_mov_b32 v0, s10
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 0, 0, 0), // POS0
+      0xbf810000u,
+  };
+
+  ShaderVertexInputInfo vertex{};
+  vertex.start_instance_sgpr = 10;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  options.dump_ir = true;
+
+  const auto result = RecompileForTest(shader, options);
+  Check(ProgramHasInput(result.program, StageInputKind::BaseInstance),
+        "vertex shader missing BaseInstance input");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(Common::ContainsStr(source, "OpCapability DrawParameters"),
+        "vertex SPIR-V lacks the DrawParameters capability");
+  Check(CountSourceOccurrences(source, "OpLoad %int %gl_BaseInstance") == 1u,
+        "start instance SGPR does not read gl_BaseInstance");
 }
 
 void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
@@ -13106,6 +13143,7 @@ int main() {
 #endif
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
+  TestNewShaderRecompilerVertexStartInstanceSgpr();
   TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();

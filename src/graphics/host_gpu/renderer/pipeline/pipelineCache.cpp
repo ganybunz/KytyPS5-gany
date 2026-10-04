@@ -996,12 +996,6 @@ struct PipelineCache::ProgramCache {
 				                 warmup.pipelines.size(), Common::PathToString(adopt_from));
 			else PipelineCacheLog("Shader warmup: could not adopt {}", Common::PathToString(adopt_from));
 		}
-		if (const char* import = std::getenv("KYTY_SHADER_WARMUP_IMPORT"); import && *import) {
-			const auto old_count = warmup.records.size();
-			if (warmup.ImportLegacy(import, identity.substr(identity.find(':'))))
-				PipelineCacheLog("Shader warmup: imported {} legacy inputs", warmup.records.size() - old_count);
-			else PipelineCacheLog("Shader warmup: rejected legacy input cache {}", import);
-		}
 		PipelineCacheLog("Shader warmup: loaded {} shader inputs and {} pipeline recipes", warmup.records.size(), warmup.pipelines.size());
 		if (!compile || warmup.records.empty()) return;
 		const auto begin = std::chrono::steady_clock::now();
@@ -1281,7 +1275,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		std::filesystem::path adopt_from;
 		std::error_code       error;
 		if ((file == nullptr || *file == 0) && !std::filesystem::exists(path, error)) {
-			const auto gpu = "KytyShaderWarmup2:" + title + device.substr(0, 1 + 8 + 1 + 8 + 1);
+			const auto gpu = "KytyShaderWarmup3:" + title + device.substr(0, 1 + 8 + 1 + 8 + 1);
 			std::filesystem::file_time_type newest {};
 			for (const auto& entry: std::filesystem::directory_iterator(root, error)) {
 				const auto candidate = entry.path() / (title + ".shaders");

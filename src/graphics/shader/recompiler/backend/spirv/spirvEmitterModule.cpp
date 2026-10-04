@@ -484,6 +484,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
 		case IR::StageInputKind::VertexIndex: return BuiltInVertexIndex;
 		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
+		case IR::StageInputKind::BaseInstance: return BuiltInBaseInstance;
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
 		case IR::StageInputKind::Layer: return BuiltInLayer;
@@ -704,6 +705,9 @@ void DefineModule(EmitterState& state) {
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(CapabilitySampleRateShading);
 	}
+	if (InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
+		state.builder.RequireCapability(CapabilityDrawParameters);
+	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
@@ -804,6 +808,7 @@ void DefineModule(EmitterState& state) {
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
 			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::BaseInstance:
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId:
 				ptr_type = TypePointer(state, StorageClassInput, TypeI32(state));

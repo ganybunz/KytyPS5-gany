@@ -130,6 +130,9 @@ objects, DX12, pipeline libraries, strict thread pinning, skipping readback copi
 - **Windows specifics**: exception dispatch clobbers the guest SysV red zone (patch guest code at load);
   NVIDIA vkQueuePresentKHR holds a device lock (no wait-before-signal pending on the recorder, own present queue).
 - **Nondeterminism** (pointer-keyed maps) breaking cache keys.
+- **Implicit CP writes ignored**: indirect draws name user SGPRs the CP fills from their arguments
+  (START_INST_LOC); the instance ID VGPR counts from 0. Missing or floating objects
+  (reverse-engineering.md, "Missing or floating geometry").
 
 When a crash is reported: get host frames (RtlVirtualUnwind or backtrace), the fault address' page
 state and the guest registers, symbolize with the build's linker map, then reproduce with the

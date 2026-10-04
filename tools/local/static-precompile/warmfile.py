@@ -1,4 +1,4 @@
-"""warmlib.py -- strict decoder + validator for KytyShaderWarmup2 caches.
+"""warmlib.py -- strict decoder + validator for KytyShaderWarmup3 caches.
 
 Mirrors, field for field and word for word:
   * src/local/shader-warmup-cache.h   (Visit, VisitPipeline, Cache::Load/ReadRecords/ValidPipeline)
@@ -318,6 +318,7 @@ def decode_record(w, index: int = -1) -> Record:
         info['fetch_buffer_reg'] = t.s()
         info['scratch_size_dwords'] = t.u()
         info['pa_cl_vs_out_cntl'] = t.u()
+        info['start_instance_sgpr'] = t.s()
         info['fetch_external'] = t.b()
         info['fetch_embedded'] = t.b()
         info['clip_enabled'] = t.b()
@@ -435,6 +436,7 @@ def key_components(rec: Record) -> list[tuple[str, int, int]]:
         add('resources_num', i['resources_num'])
         add('scratch_size_dwords', i['scratch_size_dwords'])
         add('pa_cl_vs_out_cntl', i['pa_cl_vs_out_cntl'])
+        add('start_instance_sgpr', i['start_instance_sgpr'])
         add('clip.enabled', i['clip_enabled'])
         if i['clip_enabled']:
             for k, nm in (('clip_scale', 'clip.scale'), ('clip_offset', 'clip.offset'),
@@ -666,7 +668,8 @@ def encode_record(rec: Record) -> list[int]:
     if rec.stage in (ST_VERTEX, ST_MESH):
         for k in ('resources_num', 'fetch_attrib_reg', 'fetch_buffer_reg'):
             u(i[k] & M32)
-        u(i['scratch_size_dwords']); u(i['pa_cl_vs_out_cntl']); u(i['fetch_external']); u(i['fetch_embedded'])
+        u(i['scratch_size_dwords']); u(i['pa_cl_vs_out_cntl']); u(i['start_instance_sgpr'] & M32)
+        u(i['fetch_external']); u(i['fetch_embedded'])
         u(i['clip_enabled'])
         out.extend(i['clip_scale']); out.extend(i['clip_offset']); out.extend(i['clip_half_extent'])
         m = i['mesh']

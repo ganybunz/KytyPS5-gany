@@ -16,7 +16,7 @@ class AuditTests(unittest.TestCase):
         r = [4, 1, 0, 2, 0, 1, 0xbf810000, 0, 0] + [0] * 17 + [0, 0]
         words = [1, len(r), *r, 1, 3, 0xffffffff, 0xffffffff, int(invalid_ref), *tail]
         payload = struct.pack(f'<{len(words)}I', *words)
-        data = b'KytyShaderWarmup2:TEST:device\n' + struct.pack('<Q', xxh3(payload)) + payload
+        data = b'KytyShaderWarmup3:TEST:device\n' + struct.pack('<Q', xxh3(payload)) + payload
         path.write_bytes(data)
         return data
 

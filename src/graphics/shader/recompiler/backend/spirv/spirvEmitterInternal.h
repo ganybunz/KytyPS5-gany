@@ -55,6 +55,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityShaderLayer                    = 69,
 	CapabilityShaderViewportIndex            = 70,
+	CapabilityDrawParameters                 = 4427,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
@@ -108,6 +109,7 @@ enum : uint32_t {
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
+	BuiltInBaseInstance              = 4425,
 	BuiltInBaryCoordKHR              = 5286,
 	BuiltInBaryCoordNoPerspKHR       = 5287,
 };

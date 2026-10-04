@@ -739,6 +739,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.resources_num);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	key.push_back(static_cast<uint32_t>(info.start_instance_sgpr));
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -843,16 +844,23 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 	FillShaderParams(regs.es_regs.data_addr, "ShaderRecompiler VS",
 	                 std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	                 params);
+	// The GS user SGPRs start at s8: one the shader receives may hold the draw's start instance.
+	const auto start_instance      = regs.start_instance_user_sgpr;
+	const auto start_instance_sgpr =
+	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.gs_regs.rsrc2.user_sgpr
+	        ? 8 + start_instance : -1;
 	if ((context.GetShaderStages() & 0x20u) == 0) {
 		if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
+		info.start_instance_sgpr = start_instance_sgpr;
 		return;
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
 	params.user_data.insert(params.user_data.begin(), 8u, 0u);
 	ResetNativeVertexInput(info);
+	info.start_instance_sgpr = start_instance_sgpr;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());

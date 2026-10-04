@@ -88,7 +88,7 @@ def decode_record(words):
     if not code:
         raise ValueError('empty shader code')
     if stage in (1, 5):
-        inputs = r.take(27)
+        inputs = r.take(28)
         if inputs[0] > 32:
             raise ValueError('invalid vertex resource count')
         r.take(inputs[0] * 8)
@@ -114,7 +114,7 @@ def decode_record(words):
 def read_cache(path):
     data = path.read_bytes()
     newline = data.find(b'\n', 0, 1024)
-    if newline < 0 or not data.startswith(b'KytyShaderWarmup2:'):
+    if newline < 0 or not data.startswith(b'KytyShaderWarmup3:'):
         raise ValueError('unsupported cache signature')
     prefix = newline + 1
     if len(data) < prefix + 16 or len(data) > 256 * 1024 * 1024:

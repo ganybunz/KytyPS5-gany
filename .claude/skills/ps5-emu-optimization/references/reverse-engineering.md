@@ -44,6 +44,25 @@
 - The resulting seed file drives offline compilation (shard across processes on NVIDIA). Validate by
   comparing the modules a real run compiles against the precompiled set (coverage by stage).
 
+## Missing or floating geometry
+
+An object that is missing or floats while the rest of the frame is right is usually per-draw data
+read at the wrong index, not a broken shader. Before bisecting draws, check what the CP writes by
+itself for each draw packet. In Demon's Souls (a brazier at Boletaria 1-1 floating without its
+stone pillar) the cause was in the original emulator:
+- PM4 indirect draws (DRAW_INDIRECT, DRAW_INDEX_INDIRECT, the _MULTI forms) name SH registers the CP
+  fills from the draw's arguments: START_INST_LOC (here SPI_SHADER_USER_DATA_GS_2) gets the start
+  instance, BASE_VTX_LOC the base vertex. Both fields were ignored (the CPU path logged "partial
+  args"), so shaders indexing per-object data with that SGPR read a stale user-data value.
+- The instance ID VGPR counts from 0 on the GPU; Vulkan's gl_InstanceIndex includes firstInstance.
+  Shaders adding the SGPR to the ID worked by accident; shaders using the SGPR alone broke.
+- Fix: instance ID = gl_InstanceIndex - gl_BaseInstance; the named SGPR = gl_BaseInstance (shaders
+  are translated per start-instance SGPR); firstInstance = the arguments' start instance, which also
+  covers arguments that stay on the GPU. 95% of the game's indexed indirect draws start above 0.
+- Proof before the fix: an experiment writing the SGPR on the CPU path (firstInstance 0) restored
+  the pillar exactly as on the console; skipping draws, occlusion queries and culling switches had
+  only ruled things out.
+
 ## Game patches
 
 - Format used: etaHEN-style JSON (`id`, `version`, `process`, `mods[].memory[] {offset, off, on}`).
