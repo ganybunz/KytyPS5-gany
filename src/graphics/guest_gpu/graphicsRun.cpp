@@ -32,6 +32,14 @@
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
 
 #include <algorithm>
 #include <array>
@@ -547,6 +555,17 @@ void GuestGpu::ThreadRun(void* data) {
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::ProducerScope recording;
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// This thread alone turns the guest's command buffers into GPU work, while a game may keep a
+	// dozen job workers spinning on a lock-free job table at the host's normal priority. At that
+	// priority this thread got under half a core on an 8 core host and spent much of its time merely
+	// runnable. The guest's own threads are kept below it by the priority band in
+	// PthreadAttrSetschedparam.
+	if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) == 0) {
+		printf("could not raise the GPU thread priority, error %lu\n", GetLastError());
+	}
 #endif
 
 	for (;;) {
