@@ -194,6 +194,8 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void WriteBackGpuOwned(uint64_t address, const uint8_t* data, uint64_t size, const char* source);
+	// KYTY_COPY_FORWARD: a recorded GPU copy from CPU-current memory also written to guest memory (CopyBuffer).
+	void ForwardCopy(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 	void FinishWriteReadback(uint64_t vaddr, uint64_t size);
 	struct GuestReadback;

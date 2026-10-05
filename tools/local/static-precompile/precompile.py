@@ -293,7 +293,7 @@ def cmd_seeds(args):
         for code, headers in inv.headers.items():
             for header in headers:
                 if header['type'] == agc.CS:
-                    seeds.record(keys.compute_record(code, header, HOST_SUBGROUP_SIZE))
+                    seeds.record(keys.compute_record(code, header, args.host_subgroup))
                     counts['compute programs'] += 1
 
     def graphics(vs_code, vs_agc, ps_code, ps_agc, group, culling=True):
@@ -303,7 +303,7 @@ def cmd_seeds(args):
             return
         try:
             vs = seeds.record(keys.vertex_record(vs_code, vs_agc))
-            ps = seeds.record(keys.pixel_record(ps_code, ps_agc, vs_agc, LOD_STATS_SUBGROUP))
+            ps = seeds.record(keys.pixel_record(ps_code, ps_agc, vs_agc, args.lod_stats_subgroup))
         except ValueError:
             counts['pairs with unsupported inputs'] += 1
             return
@@ -531,6 +531,10 @@ def main():
     seeds.add_argument('out')
     seeds.add_argument('--stages', default='cs,gfx', help='cs, gfx or both (default)')
     seeds.add_argument('--limit', type=int, default=0, help='keep the first N programs (a smoke test)')
+    seeds.add_argument('--host-subgroup', type=int, default=HOST_SUBGROUP_SIZE,
+                       help='compute subgroup size of the GPU: 64 with wave64 compute (AMD), 32 otherwise')
+    seeds.add_argument('--lod-stats-subgroup', type=int, default=LOD_STATS_SUBGROUP,
+                       help='1 when the GPU has fragment subgroup reductions')
     seeds.set_defaults(run=cmd_seeds)
     recorded_seeds = sub.add_parser('recorded-seeds')
     recorded_seeds.add_argument('out')

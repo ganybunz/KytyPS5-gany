@@ -4,9 +4,11 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
+#include "live-counters.h"
 #include "loader/systemContent.h"
 
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -32,7 +34,13 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
                    uint32_t z, uint32_t mode) {
 	const auto& program = *input.stage.program;
 	const auto& data    = input.stage.resources.user_data;
-	if (!IsSupportedGame() || program.shader_hash != 0xeb7456322124ecc7ULL ||
+	// The copy kernels by release (their code differs only in the shader id the first instruction loads
+	// into m0): dst[i] = src[i % period] (PPSA01341 1.007 eb74563..., PPSA01342 1.004 2a12b35...), and
+	// PPSA01342's dst[i] = src[i & mask] (dc18751...), the same user data, i < count; parameters count
+	// and period or mask. Only the linear subset is replaced (period >= count; mask keeping every i).
+	const bool modulo = program.shader_hash == 0xeb7456322124ecc7ULL || program.shader_hash == 0x2a12b35175b11703ULL;
+	const bool masked = program.shader_hash == 0xdc18751cb6791ef9ULL;
+	if (!IsSupportedGame() || !(modulo || masked) ||
 	    data.size() != 12 || program.user_data_base != 0 || input.dispatch_thread_dimensions ||
 	    mode != 0x41 || input.threads_num[0] != 64 || input.threads_num[1] != 1 ||
 	    input.threads_num[2] != 1 || !input.group_id[0] || input.group_id[1] || input.group_id[2] ||
@@ -58,7 +66,10 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 	                                                           sizeof(controls)))
 		return false;
 	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
-	if (count == 0 || period < count || count > source.NumRecords() ||
+	// The mask keeps every index below count: all bits of count - 1 and below are set in it.
+	const uint64_t index_bits = count == 0 ? 0 : (uint64_t {1} << std::bit_width(count - 1)) - 1;
+	const bool     linear     = modulo ? period >= count : (controls[1] & index_bits) == index_bits;
+	if (count == 0 || !linear || count > source.NumRecords() ||
 	    count > destination.NumRecords() || x != (count + 63) / 64 || bytes > 16 * 1024 * 1024)
 		return false;
 	const auto src = source.Base48(), dst = destination.Base48();
@@ -71,6 +82,7 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 		return false;
 	cache.CopyBuffer(dst, src, bytes, false, false);
 	cache.ScheduleCopyFeedback(dst, bytes);
+	LiveCounters::Add(LiveCounters::LinearCopies);
 	return true;
 }
 } // namespace Libs::Graphics::DemonsSouls

@@ -159,7 +159,9 @@ def vertex_record(code, agc):
                  'max_vertices': 0, 'max_primitives': 0, 'provoking_vertex': 0},
         'res_fields': [], 'res_dst': [], '_kind': 'vs',
     }
-    key = (0, 0, 0, 0, scratch, out_cntl, 0, 0)
+    # BuildStageStaticKey: fetch_embedded, fetch_attrib_reg, fetch_buffer_reg, resources_num, scratch,
+    # PA_CL_VS_OUT_CNTL, start_instance_sgpr (-1: none, as u32), clip enabled, mesh threads.
+    key = (0, 0, 0, 0, scratch, out_cntl, 0xFFFFFFFF, 0, 0)
     rsrc2 = reg_first(agc['sh_registers'], SPI_SHADER_PGM_RSRC2_GS, 0)
     return _record(warmfile.ST_VERTEX, code, _user_data_count(rsrc2), key, info)
 

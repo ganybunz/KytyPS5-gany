@@ -1864,6 +1864,41 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	if (src_memory && dst_memory) ForwardCopy(dst_vaddr, src_vaddr, size);
+}
+
+// KYTY_COPY_FORWARD=1: a copy whose source the CPU holds current (no GPU write pending on it) also lands
+// in the destination's guest memory when it is recorded, and those bytes stop being GPU-written: a later
+// CPU read (an SRT evaluation reading constants the game copies on the GPU every frame, Demon's Souls'
+// copy kernels) is served from memory instead of draining the GPU. The GPU copy stays, so the GPU buffer
+// holds the same bytes once it runs. Not over images, not under a pending guest readback (its write-back
+// could land older bytes), and only bytes: pages keep GPU ownership while other GPU-written bytes remain.
+void BufferCache::ForwardCopy(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
+	static const bool forward = [] {
+		const char* value = std::getenv("KYTY_COPY_FORWARD");
+		return value != nullptr && value[0] == '1';
+	}();
+	constexpr uint64_t ForwardMax = 16ull << 20u;
+	if (!forward || size > ForwardMax || IsRegionGpuModified(src_vaddr, size) ||
+	    m_texture_cache.FindImageFromRange(src_vaddr, size) || m_texture_cache.HasTrackedDataOverlap(dst_vaddr, size) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(src_vaddr, size) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(dst_vaddr, size)) {
+		return;
+	}
+	const auto begin = dst_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end   = (dst_vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	for (const auto& pending: m_guest_readbacks)
+		if (pending && pending->begin < end && begin < pending->begin + pending->size) return;
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	if (!LibKernel::Memory::TryReadBackingToHost(src_vaddr, bytes.data(), size)) return;
+	WriteBackGpuOwned(dst_vaddr, bytes.data(), size, "forward");
+	m_gpu_modified_ranges.Subtract(dst_vaddr, size);
+	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE)
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE))
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+	LiveCounters::Add(LiveCounters::CopyForwards);
+	LiveCounters::Add(LiveCounters::CopyForwardBytes, size);
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
