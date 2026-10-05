@@ -629,19 +629,55 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_offset = owner.Offset(indirect_args);
 	}
 
-	// KYTY_DS_COMPUTE_CHAIN=0: the Demon's Souls profile without the barrier elision between its
-	// compute dispatches (verified on PPSA01341 1.007; A/B on other releases and drivers).
-	static const bool chain_enabled = [] {
+	// KYTY_DS_COMPUTE_CHAIN: 1 (default) the Demon's Souls profile leaves out the barrier between two
+	// compute dispatches only when neither writes what the other reads or writes (bound buffer and
+	// image ranges; dispatches that reach memory through pointers always wait); 2 leaves it out
+	// always, as verified on PPSA01341 1.007 with NVIDIA (on the USA 1.004 build with an AMD card,
+	// dependent dispatches overlapped: teal tint); 0 keeps every barrier.
+	static const int chain_mode = [] {
 		const char* value = std::getenv("KYTY_DS_COMPUTE_CHAIN");
-		return value == nullptr || value[0] != '0';
+		return value == nullptr ? 1 : std::atoi(value);
 	}();
+	const bool chain_enabled = chain_mode != 0;
 	const bool        chain            = chain_enabled && DemonsSouls::IsSupportedGame();
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
-	const bool continues_chain = chain && buffer.ComputeChainPending();
+	thread_local std::vector<CommandBuffer::ChainAccess> chain_accesses;
+	chain_accesses.clear();
+	const bool chain_unknown = program.info.uses_dma;
+	if (chain && chain_mode == 1) {
+		for (uint32_t i = 0; i < bindings.buffer_sources.size(); ++i) {
+			const auto& source = bindings.buffer_sources[i];
+			if (source.size == 0) continue;
+			const bool written = i < program.info.buffers.size() && program.info.buffers[i].written;
+			chain_accesses.push_back({source.address, source.address + source.size, written});
+		}
+		for (uint32_t i = 0; i < bindings.images.size() && i < program.info.images.size(); ++i) {
+			const auto& data = bindings.images[i].desc.info.data;
+			if (data.size == 0) continue;
+			chain_accesses.push_back({data.address, data.address + data.size, program.info.images[i].written});
+		}
+		if (indirect_args != 0) chain_accesses.push_back({indirect_args, indirect_args + 12u, false});
+	}
+	bool continues_chain = chain && buffer.ComputeChainPending();
+	static const bool chain_stats = std::getenv("KYTY_CHAIN_STATS") != nullptr;
+	static uint64_t   stat_dispatches = 0, stat_elided = 0, stat_hazard = 0, stat_unknown = 0;
+	if (continues_chain && chain_mode == 1 && buffer.ChainConflicts(chain_accesses, chain_unknown)) {
+		(void)buffer.Handle(); // records the pending compute barrier
+		continues_chain = false;
+		(chain_unknown ? stat_unknown : stat_hazard)++;
+	} else if (continues_chain) {
+		stat_elided++;
+	}
+	if (chain_stats && ++stat_dispatches % 20000 == 0) {
+		std::printf("Compute chain: %llu dispatches, barrier left out %llu, kept for a range conflict %llu, "
+		            "for pointer access %llu\n",
+		            static_cast<unsigned long long>(stat_dispatches), static_cast<unsigned long long>(stat_elided),
+		            static_cast<unsigned long long>(stat_hazard), static_cast<unsigned long long>(stat_unknown));
+	}
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -683,6 +719,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (chain) {
 		buffer.ContinueComputeChain();
+		if (chain_mode == 1) buffer.RecordChainAccess(chain_accesses, chain_unknown);
 	} else {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}

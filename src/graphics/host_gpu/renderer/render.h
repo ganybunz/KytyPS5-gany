@@ -136,6 +136,19 @@ public:
 	[[nodiscard]] bool ComputeChainPending() const noexcept { return m_compute_access_pending; }
 	void ContinueComputeChain() const;
 	[[nodiscard]] vk::CommandBuffer HandleForFullBarrier() const;
+	// Guest ranges a dispatch in the compute chain reads or writes. The chain leaves out the barrier
+	// between two dispatches only when neither writes what the other touches: the Demon's Souls
+	// profile relied on the engine's own boundaries alone, and on the USA 1.004 build with an AMD card
+	// dependent dispatches overlapped (teal tint, dark blotches; X97 vs X100).
+	struct ChainAccess {
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+		bool     written = false;
+	};
+	// Whether a dispatch with these accesses (unknown: it reaches memory through pointers) must wait
+	// for the pending chain.
+	[[nodiscard]] bool ChainConflicts(std::span<const ChainAccess> accesses, bool unknown) const;
+	void               RecordChainAccess(std::span<const ChainAccess> accesses, bool unknown) const;
 	// Local diagnostic (GPU marks): the handle without draining a pending dependency.
 	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
 
@@ -159,6 +172,8 @@ private:
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	mutable bool        m_compute_access_pending = false;
+	mutable std::vector<ChainAccess> m_chain_access;
+	mutable bool        m_chain_unknown          = false;
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps

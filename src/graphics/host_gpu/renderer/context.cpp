@@ -33,6 +33,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	if (m_compute_access_pending) {
 		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		m_compute_access_pending = false;
+		m_chain_access.clear();
+		m_chain_unknown = false;
 	}
 	return m_buffer;
 }
@@ -47,10 +49,35 @@ void CommandBuffer::ContinueComputeChain() const {
 	m_compute_access_pending = true;
 }
 
+bool CommandBuffer::ChainConflicts(std::span<const ChainAccess> accesses, bool unknown) const {
+	if (!m_compute_access_pending) return false;
+	if (unknown || m_chain_unknown) return true;
+	for (const auto& pending: m_chain_access) {
+		for (const auto& access: accesses) {
+			if ((pending.written || access.written) && access.begin < pending.end && pending.begin < access.end) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void CommandBuffer::RecordChainAccess(std::span<const ChainAccess> accesses, bool unknown) const {
+	m_chain_unknown = m_chain_unknown || unknown;
+	// A long chain is ended rather than scanned: past 256 ranges the next dispatch waits.
+	if (m_chain_access.size() + accesses.size() > 256) {
+		m_chain_unknown = true;
+		return;
+	}
+	m_chain_access.insert(m_chain_access.end(), accesses.begin(), accesses.end());
+}
+
 vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
 	EXIT_IF(IsInvalid());
 	// The caller records a full AllCommands memory dependency immediately.
 	m_compute_access_pending = false;
+	m_chain_access.clear();
+	m_chain_unknown = false;
 	return m_buffer;
 }
 
