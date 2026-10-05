@@ -7,6 +7,7 @@
 #include "loader/systemContent.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -14,6 +15,10 @@ namespace Libs::Graphics::DemonsSouls {
 bool IsSupportedGame() {
 	// Called by the dispatch path after game metadata has been loaded.
 	static const bool supported = [] {
+		// KYTY_DS_PROFILE=0: none of the game's code patches, compute chain or linear copy (A/B tests).
+		if (const char* value = std::getenv("KYTY_DS_PROFILE"); value != nullptr && value[0] == '0') {
+			return false;
+		}
 		std::string title;
 		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title) && IsSupportedTitle(title);
 	}();
