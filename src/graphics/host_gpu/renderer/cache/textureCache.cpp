@@ -3222,6 +3222,14 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	m_tick_history.Record(tick);
+	static const bool print_memory = std::getenv("KYTY_MEMORY_STATS") != nullptr;
+	if (print_memory) {
+		static auto last = std::chrono::steady_clock::now();
+		if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(30)) {
+			last = now;
+			m_graphics.PrintMemoryStatistics();
+		}
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

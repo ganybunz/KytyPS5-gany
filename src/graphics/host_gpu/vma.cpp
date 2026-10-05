@@ -231,6 +231,25 @@ void GraphicContext::TrimImagePool() {
 }
 
 // Out of video memory: the first few times say so in the log, with the heaps' budgets.
+void GraphicContext::PrintMemoryStatistics() const {
+	if (allocator == nullptr) return;
+	VmaTotalStatistics stats {};
+	vmaCalculateStatistics(allocator, &stats);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	std::printf("Memory: blocks %u (%" PRIu64 " MiB), allocations %u (%" PRIu64 " MiB), image pool %" PRIu64
+	            " MiB",
+	            stats.total.statistics.blockCount, stats.total.statistics.blockBytes >> 20u,
+	            stats.total.statistics.allocationCount, stats.total.statistics.allocationBytes >> 20u,
+	            g_image_pool_bytes >> 20u);
+	for (uint32_t i = 0; i < GetPhysicalDeviceMemoryProperties().memoryHeapCount; i++) {
+		std::printf("; heap %u usage %" PRIu64 " of %" PRIu64 " MiB", i, budgets[i].usage >> 20u,
+		            budgets[i].budget >> 20u);
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
 void GraphicContext::ReportMemoryFallback(const char* what, uint64_t bytes) const {
 	static std::atomic<uint32_t> reported {0};
 	if (reported.fetch_add(1, std::memory_order_relaxed) >= 8) return;
