@@ -29,6 +29,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -852,6 +855,37 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		    (info->exception_address < 0x800000000ull || info->exception_address >= 0x100000000000ull)) {
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
+		}
+		// KYTY_SYNC_LOG: every 10 s, the code that faults most on tracked pages (guest reads of GPU-written
+		// memory become readbacks, guest writes re-protections; each fault is a Windows exception).
+		static const bool fault_log = std::getenv("KYTY_SYNC_LOG") != nullptr;
+		if (fault_log) {
+			struct Site {
+				uint64_t pc = 0, count = 0, writes = 0, last_vaddr = 0;
+			};
+			static std::mutex                             mutex;
+			static std::unordered_map<uint64_t, Site>     sites;
+			static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+			std::lock_guard                               lock(mutex);
+			auto&                                         site = sites[info->exception_address];
+			site.pc         = info->exception_address;
+			site.last_vaddr = info->access_violation_vaddr;
+			site.count++;
+			if (access == GpuAccess::Write) site.writes++;
+			if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+				last = now;
+				std::vector<Site> top;
+				for (const auto& [pc, value]: sites) top.push_back(value);
+				std::sort(top.begin(), top.end(), [](const Site& a, const Site& b) { return a.count > b.count; });
+				std::printf("Fault sites in 10 s:");
+				for (size_t i = 0; i < top.size() && i < 12; ++i)
+					std::printf(" [%s x%llu w%llu at 0x%llx]", DescribeGuestAddress(top[i].pc).c_str(),
+					            static_cast<unsigned long long>(top[i].count), static_cast<unsigned long long>(top[i].writes),
+					            static_cast<unsigned long long>(top[i].last_vaddr));
+				std::printf("\n");
+				std::fflush(stdout);
+				sites.clear();
+			}
 		}
 		// A fault at a red-zone memory instruction no patch protects: Windows has already written the
 		// exception frame over the guest's red zone (the values the function keeps below rsp are lost).
