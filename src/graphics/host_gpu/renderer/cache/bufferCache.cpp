@@ -47,6 +47,9 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <cstdlib>
+#include <chrono>
 #include <array>
 #include <cinttypes>
 #include <cstdio>
@@ -1223,6 +1226,38 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	    });
 	if (!copies.empty()) {
 		LiveCounters::Add(LiveCounters::SyncDownloads);
+		// KYTY_SYNC_LOG: every 10 s, the guest ranges whose CPU reads drained the GPU most often (and
+		// the shader whose resource evaluation read them): what a frame stalls on.
+		static const bool sync_log = std::getenv("KYTY_SYNC_LOG") != nullptr;
+		if (sync_log) {
+			struct Entry {
+				uint64_t count = 0, bytes = 0, size = 0, shader = 0;
+			};
+			static std::unordered_map<uint64_t, Entry> entries;
+			static auto                                last = std::chrono::steady_clock::now();
+			auto&                                      entry = entries[vaddr];
+			entry.count++;
+			entry.size   = size;
+			entry.shader = Libs::LibKernel::Memory::g_srt_shader_hash;
+			for (const auto& copy: copies) entry.bytes += copy.size;
+			if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+				last = now;
+				std::vector<std::pair<uint64_t, Entry>> top(entries.begin(), entries.end());
+				std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+				std::printf("Sync downloads in 10 s:");
+				for (size_t i = 0; i < top.size() && i < 10; i++) {
+					std::printf(" [0x%llx size 0x%llx x%llu %llu KiB shader %016llx]",
+					            static_cast<unsigned long long>(top[i].first),
+					            static_cast<unsigned long long>(top[i].second.size),
+					            static_cast<unsigned long long>(top[i].second.count),
+					            static_cast<unsigned long long>(top[i].second.bytes >> 10u),
+					            static_cast<unsigned long long>(top[i].second.shader));
+				}
+				std::printf("\n");
+				std::fflush(stdout);
+				entries.clear();
+			}
+		}
 		DownloadBufferMemory(copies);
 		// The enumeration covered whole dirty pages and every exact interval on them.
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
