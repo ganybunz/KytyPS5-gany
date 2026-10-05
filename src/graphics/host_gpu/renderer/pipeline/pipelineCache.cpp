@@ -1341,6 +1341,17 @@ static PipelineBuild FirstBuild() {
 // a copy with the same layouts; PromoteOptimized() puts it in place.
 void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build) {
 	if (!pipeline.unoptimized) return;
+	// KYTY_PIPELINE_FAST_BUILD=2: the unoptimized pipeline stays (no optimized build on a worker). On an
+	// AMD card amdvlk aborted inside those background builds (X95); with a static precompile only the
+	// pipelines it missed are built here, so their slower code costs little and nothing stalls.
+	static const bool keep_unoptimized = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_FAST_BUILD");
+		return value != nullptr && std::string_view(value) == "2";
+	}();
+	if (keep_unoptimized) {
+		m_unoptimized_builds++;
+		return;
+	}
 	m_unoptimized_builds++;
 	m_optimizing.push_back(&pipeline);
 	pipeline.optimized = std::make_shared<OptimizedBuild>();
