@@ -13,6 +13,8 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -65,7 +67,14 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		if (ReadFile(f.handle, data, size, &w, nullptr) == 0) {
+			// Shown: a failed read used to pass as a short one.
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::printf("File: ReadFile failed (error %lu), %lu of %u bytes read\n", GetLastError(), w, size);
+				std::fflush(stdout);
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

@@ -596,6 +596,29 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	return OK;
 }
 
+// A file read into guest memory goes through a host buffer and is copied in by a write that takes the
+// fault path like any other. The kernel writes a guest buffer without it: a page the GPU trackers
+// protected again after the read invalidated it (a buffer or image sync on the render thread) made
+// ReadFile stop short, and the short count went to the game as the read's result.
+static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
+	constexpr uint32_t                 Chunk = 4u << 20u;
+	thread_local std::vector<uint8_t> bounce;
+	uint32_t                          total = 0;
+	while (total < nbytes) {
+		const uint32_t want = std::min(nbytes - total, Chunk);
+		if (bounce.size() < want) bounce.resize(want);
+		uint32_t got = 0;
+		f.Read(bounce.data(), want, &got);
+		if (got == 0) break;
+		const auto destination = reinterpret_cast<uint64_t>(buf) + total;
+		Memory::InvalidateMemory(destination, got);
+		std::memcpy(reinterpret_cast<void*>(destination), bounce.data(), got);
+		total += got;
+		if (got < want) break;
+	}
+	return total;
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
@@ -643,13 +666,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
-	const auto pos        = file->f.Tell();
-	const auto file_size  = file->f.Size();
-	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 
 	file->mutex.Unlock();
 
@@ -768,14 +785,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
-	const auto file_size  = file->f.Size();
-	const auto remaining =
-	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
