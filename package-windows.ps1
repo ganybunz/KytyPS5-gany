@@ -61,6 +61,9 @@ foreach ($property in $launch.environment.PSObject.Properties) {
 	if ($property.Name -eq 'KYTY_SRT_AOT_LIBRARY') { if ($aot) { $environment[$property.Name] = 'srt-aot.dll' }; continue }
 	$environment[$property.Name] = $property.Value
 }
+# The table path by default (docs/GPU-DRIVEN-XPR.md); run.cmd -Set "KYTY_TABLE_XPR=,KYTY_TABLE_DISPATCH=" starts without.
+$environment['KYTY_TABLE_XPR']      = '2'
+$environment['KYTY_TABLE_DISPATCH'] = '1'
 [ordered]@{ checkpoint = $launch.checkpoint; environment = $environment; command = @('--', 'kyty_emulator.exe') + $options } |
 	ConvertTo-Json -Depth 3 | Set-Content "$Out\launch.json" -Encoding UTF8
 # Double-click to play (PowerShell's script policy would stop run-windows.ps1 itself).

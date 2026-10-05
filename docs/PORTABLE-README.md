@@ -35,6 +35,11 @@ keeps the emulator's render threads on the performance cores (all but the one of
 which was about 2% faster than leaving them to Windows; the console shows them as "render threads on
 CPUs ...". To leave everything to Windows instead: `run.cmd -Set KYTY_RECORDING_CPUS=,KYTY_RENDER_CPUS=`.
 
+The game starts with the table path: most draws and compute dispatches read their resources straight
+from GPU memory instead of descriptor sets the emulator builds for each of them (Boletaria standing
+about 45 → 50–53 fps). The first visit to an area compiles its pipelines in the background, so the
+gain grows as you play. To start without it: `run.cmd -Set KYTY_TABLE_XPR=,KYTY_TABLE_DISPATCH=`.
+
 ## Where to put the game files
 
 You need the unpacked PS5 game folder: the level that directly contains `eboot.bin` and the `sce_sys`
