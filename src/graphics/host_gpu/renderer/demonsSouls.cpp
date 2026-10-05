@@ -33,7 +33,6 @@ bool IsSupportedGame() {
 bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
                    uint32_t z, uint32_t mode) {
 	const auto& program = *input.stage.program;
-	const auto& data    = input.stage.resources.user_data;
 	// The copy kernels by release (their code differs only in the shader id the first instruction loads
 	// into m0): dst[i] = src[i % period] (PPSA01341 1.007 eb74563..., PPSA01342 1.004 2a12b35...), and
 	// PPSA01342's dst[i] = src[i & mask] (dc18751...), the same user data, i < count; parameters count
@@ -45,12 +44,32 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 	}();
 	const bool modulo = program.shader_hash == 0xeb7456322124ecc7ULL || (usa && program.shader_hash == 0x2a12b35175b11703ULL);
 	const bool masked = usa && program.shader_hash == 0xdc18751cb6791ef9ULL;
-	if (!IsSupportedGame() || !(modulo || masked) ||
-	    data.size() != 12 || program.user_data_base != 0 || input.dispatch_thread_dimensions ||
-	    mode != 0x41 || input.threads_num[0] != 64 || input.threads_num[1] != 1 ||
-	    input.threads_num[2] != 1 || !input.group_id[0] || input.group_id[1] || input.group_id[2] ||
-	    input.thread_ids_num != 1 || input.workgroup_register != 12 || input.tg_size_en || y != 1 ||
-	    z != 1 || x == 0)
+	if (!IsSupportedGame() || !(modulo || masked) || program.user_data_base != 0)
+		return false;
+	const LinearCopyDispatch dispatch {.user_data          = input.stage.resources.user_data,
+	                                   .threads            = {input.threads_num[0], input.threads_num[1],
+	                                                          input.threads_num[2]},
+	                                   .group_id           = {input.group_id[0], input.group_id[1], input.group_id[2]},
+	                                   .thread_ids         = static_cast<uint32_t>(input.thread_ids_num),
+	                                   .workgroup_register = static_cast<uint32_t>(input.workgroup_register),
+	                                   .tg_size            = input.tg_size_en,
+	                                   .thread_dimensions  = input.dispatch_thread_dimensions,
+	                                   .masked             = masked};
+	return TryLinearCopy(dispatch, cache, x, y, z, mode);
+}
+
+bool LinearCopyMasked(uint64_t shader_hash) {
+	return shader_hash == 0xdc18751cb6791ef9ULL;
+}
+
+bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint32_t x, uint32_t y, uint32_t z,
+                   uint32_t mode) {
+	const auto& data   = dispatch.user_data;
+	const bool  modulo = !dispatch.masked;
+	if (data.size() != 12 || dispatch.thread_dimensions || mode != 0x41 || dispatch.threads[0] != 64 ||
+	    dispatch.threads[1] != 1 || dispatch.threads[2] != 1 || !dispatch.group_id[0] || dispatch.group_id[1] ||
+	    dispatch.group_id[2] || dispatch.thread_ids != 1 || dispatch.workgroup_register != 12 || dispatch.tg_size ||
+	    y != 1 || z != 1 || x == 0)
 		return false;
 	ShaderBufferResource source, destination, parameters;
 	std::memcpy(source.fields, data.data(), 16);

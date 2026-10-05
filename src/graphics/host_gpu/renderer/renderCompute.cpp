@@ -382,6 +382,29 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
+	// The linear copy shader, while its code stands: checked from the registers without its program (700+ small
+	// copies a frame in Boletaria, each preparing the same program).
+	if (indirect_args == 0 && cs_regs.cs_regs.data_addr == m_linear_copy_shader &&
+	    ShaderMapGeneration() == m_linear_copy_generation && (++m_linear_copy_uses & 63u) != 0 &&
+	    !FrameCapture::Active()) {
+		const auto&                           regs = cs_regs.cs_regs;
+		const DemonsSouls::LinearCopyDispatch dispatch {
+		    .user_data          = std::span<const uint32_t> {cs_regs.cs_user_sgpr.value, regs.user_sgpr},
+		    .threads            = {regs.num_thread_x, regs.num_thread_y, regs.num_thread_z},
+		    .group_id           = {regs.tgid_x_en, regs.tgid_y_en, regs.tgid_z_en},
+		    .thread_ids         = regs.tidig_comp_cnt + 1u,
+		    .workgroup_register = regs.user_sgpr,
+		    .tg_size            = regs.tg_size_en,
+		    .thread_dimensions  = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0,
+		    .masked             = m_linear_copy_masked};
+		if (DemonsSouls::TryLinearCopy(dispatch, m_context.GetBufferCache(), thread_group_x, thread_group_y,
+		                               thread_group_z, mode)) {
+			TableDispatchSeen(sh_ctx.GetCs(), true);
+			ResetBindings();
+			return;
+		}
+	}
+
 	NativePreparationScratch<ShaderComputeInputInfo> input_storage;
 	auto& input_info = input_storage.Get();
 	ResetNativeStageInput(input_info);
@@ -391,7 +414,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 0);
 	std::string unevaluated;
-	const auto  compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	const auto  shader_generation = ShaderMapGeneration(); // (before the program reads the code)
+	const auto  compute_program   = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, sh_regs, input_info, indirect_args != 0 ? &unevaluated : nullptr);
 	if (!compute_program && !unevaluated.empty()) {
 		// An indirect dispatch whose resource tables do not evaluate (pointers into memory the guest has not
@@ -450,6 +474,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                                     thread_group_x, thread_group_y,
 	                                                     thread_group_z, mode)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "linear_copy";
+		m_linear_copy_shader     = sh_ctx.GetCs().cs_regs.data_addr;
+		m_linear_copy_generation = shader_generation;
+		m_linear_copy_masked     = DemonsSouls::LinearCopyMasked(program.shader_hash);
 		TableDispatchSeen(sh_ctx.GetCs(), true);
 		ResetBindings();
 		return;

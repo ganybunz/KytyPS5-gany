@@ -376,6 +376,11 @@ private:
 	struct TableImageSet;
 	enum class TableResult { Drawn, Native, Store };
 	std::shared_ptr<TableXpr> m_table_xpr;
+	// The linear copy shader the normal path last copied with (DemonsSouls::TryLinearCopy), the shader map generation
+	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
+	uint64_t m_linear_copy_shader = 0, m_linear_copy_generation = 0;
+	uint32_t m_linear_copy_uses   = 0;
+	bool     m_linear_copy_masked = false; // its kernel (DemonsSouls::LinearCopyMasked)
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
