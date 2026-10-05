@@ -141,6 +141,26 @@ inline void OnFlip() {
 	g_active.store(true, std::memory_order_relaxed);
 }
 
+// Any thread: record the next `frames` frames into `dir` without waiting (the render thread arms it at
+// a flip number with KYTY_CAPTURE_AT_FLIP, LiveControl::Flip). `hashes` as for Arm.
+inline bool ArmNow(const std::string& dir, int frames, const std::string& hashes) {
+	if (g_active.load() || g_pending.load() > 0) return false;
+	{
+		const std::lock_guard lock(g_mutex);
+		g_dir = dir;
+	}
+	g_data_hashes.clear();
+	for (size_t begin = 0; begin < hashes.size();) {
+		const auto end = std::min(hashes.find(',', begin), hashes.size());
+		if (end > begin) g_data_hashes.push_back(std::strtoull(hashes.substr(begin, end - begin).c_str(), nullptr, 16));
+		begin = end + 1;
+	}
+	g_data_counts.assign(g_data_hashes.size(), 0u);
+	g_done.store(0);
+	g_pending.store(frames, std::memory_order_release);
+	return true;
+}
+
 // Live thread: record the next `frames` frames into `dir`, wait for them. `hashes` is a
 // comma-separated list of shader hashes whose constants are stored too.
 [[nodiscard]] inline bool Arm(const std::string& dir, int frames, const std::string& hashes,

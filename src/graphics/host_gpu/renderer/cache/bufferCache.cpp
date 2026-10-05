@@ -60,6 +60,12 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <utility>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// kernel32 export, declared here instead of including <windows.h> (KYTY_SYNC_LOG stacks).
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long,
+                                                                                   void**, unsigned long*);
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
@@ -1287,6 +1293,43 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 				std::fflush(stdout);
 				entries.clear();
 			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// The code paths that drained: return-address stacks (through the fault handler into the faulting
+			// code), the most frequent printed every 10 s for offline symbolization (tools/sync_stacks.py).
+			struct Stack {
+				uint64_t count = 0, vaddr = 0;
+				void*    frames[40] {};
+				uint16_t depth = 0;
+			};
+			static std::unordered_map<uint64_t, Stack> stacks;
+			static auto                                stacks_last = std::chrono::steady_clock::now();
+			void*                                      frames[40] {};
+			const auto depth = RtlCaptureStackBackTrace(1, 40, frames, nullptr);
+			uint64_t   hash  = 1469598103934665603ull;
+			for (uint16_t i = 0; i < depth; ++i) hash = (hash ^ reinterpret_cast<uint64_t>(frames[i])) * 1099511628211ull;
+			auto& stack = stacks[hash];
+			if (stack.count++ == 0) {
+				stack.vaddr = vaddr;
+				stack.depth = depth;
+				std::memcpy(stack.frames, frames, sizeof(frames));
+			}
+			if (const auto now = std::chrono::steady_clock::now(); now - stacks_last >= std::chrono::seconds(10)) {
+				stacks_last = now;
+				std::vector<const Stack*> top;
+				for (const auto& [key, value]: stacks) top.push_back(&value);
+				std::sort(top.begin(), top.end(), [](const Stack* a, const Stack* b) { return a->count > b->count; });
+				for (size_t i = 0; i < top.size() && i < 8; ++i) {
+					std::printf("SYNC_STACK count=%llu vaddr=0x%llx frames=", static_cast<unsigned long long>(top[i]->count),
+					            static_cast<unsigned long long>(top[i]->vaddr));
+					for (uint16_t f = 0; f < top[i]->depth; ++f)
+						std::printf("%s%llx", f == 0 ? "" : ",",
+						            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(top[i]->frames[f])));
+					std::printf("\n");
+				}
+				std::fflush(stdout);
+				stacks.clear();
+			}
+#endif
 		}
 		DownloadBufferMemory(copies);
 		// The enumeration covered whole dirty pages and every exact interval on them.

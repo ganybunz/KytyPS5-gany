@@ -86,6 +86,22 @@ inline void Flip() {
 	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                     std::memory_order_relaxed);
 	g_flips.store(flip + 1, std::memory_order_release);
+	// KYTY_CAPTURE_AT_FLIP=<n>: a frame capture (frame-capture.h) armed at flip n without the live thread,
+	// into KYTY_CAPTURE_DIR, KYTY_CAPTURE_FRAMES frames (default 1), with the constants of the shaders in
+	// KYTY_CAPTURE_HASHES (comma-separated hex).
+	static const uint64_t capture_at = [] {
+		const char* value = std::getenv("KYTY_CAPTURE_AT_FLIP");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+	}();
+	if (capture_at != 0 && flip == capture_at) {
+		const char* dir    = std::getenv("KYTY_CAPTURE_DIR");
+		const char* frames = std::getenv("KYTY_CAPTURE_FRAMES");
+		const char* hashes = std::getenv("KYTY_CAPTURE_HASHES");
+		const bool  ok     = dir != nullptr && FrameCapture::ArmNow(dir, frames != nullptr ? std::max(1, std::atoi(frames)) : 1,
+		                                                           hashes != nullptr ? hashes : "");
+		std::printf("Frame capture armed at flip %llu: %s\n", static_cast<unsigned long long>(flip), ok ? dir : "failed");
+		std::fflush(stdout);
+	}
 	// KYTY_FRAME_LOG=<path>: one CSV line per frame (flip to flip on the render thread), flushed every
 	// frame, so frame-time percentiles and every hitch can be read without a hitch threshold.
 	// *_wait_ms / compile_ms: the render thread's waits as LiveCensus times them, inclusive; they nest
