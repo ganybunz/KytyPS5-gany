@@ -8,6 +8,7 @@
 #include "kernel/memory.h"
 #include "loader/runtimeLinker.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -79,7 +80,7 @@ void Install(Program* program) {
 		std::memcpy(poll_bytes.data(), reinterpret_cast<const void*>(poll), poll_bytes.size());
 	}
 	if (!(at_offsets && Matches(call_bytes, poll_bytes)) && !FindSites(*program, &call, &poll)) {
-		LOGF("Demon's Souls idle wait: code signature differs; retaining guest code\n");
+		std::printf("Demon's Souls idle wait: code signature differs; retaining guest code\n");
 		return;
 	}
 	const auto requested = program->base_vaddr + CaveOffset;
@@ -118,7 +119,7 @@ void Install(Program* program) {
 	}
 	cave = allocated;
 	site = call;
-	LOGF("Demon's Souls idle wait: installed portable 50 us backoff (call at eboot+0x%llx)\n",
+	std::printf("Demon's Souls idle wait: installed portable 50 us backoff (call at eboot+0x%llx)\n",
 	     static_cast<unsigned long long>(call - program->base_vaddr));
 #endif
 }

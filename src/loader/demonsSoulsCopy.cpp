@@ -7,6 +7,7 @@
 #include "kernel/memory.h"
 #include "loader/runtimeLinker.h"
 
+#include <cstdio>
 #include <xxhash.h>
 
 namespace Loader::DemonsSoulsCopy {
@@ -32,7 +33,10 @@ void Install(Program* program) {
 	// Hash the complete audited shared memmove/bcopy body, not just the prologue.
 	// This entry follows the guest's argument/stack checks and has one saved RBP.
 	// Changed module versions, relocations, or platform loader patches fail closed.
-	if (XXH3_64bits(bytes, verify_size) != 0xe654325b8be848a9ull) return;
+	if (XXH3_64bits(bytes, verify_size) != 0xe654325b8be848a9ull) {
+		std::printf("Demon's Souls copy: libc memmove differs; retaining guest code\n");
+		return;
+	}
 	std::memcpy(original.data(), bytes, original.size());
 	patch = Tailcall(reinterpret_cast<uint64_t>(&CoherentMove));
 	std::memcpy(reinterpret_cast<void*>(address), patch.data(), patch.size());
@@ -42,7 +46,7 @@ void Install(Program* program) {
 		return;
 	}
 	site = address;
-	LOGF("Demon's Souls copy: installed verified coherent memmove\n");
+	std::printf("Demon's Souls copy: installed verified coherent memmove\n");
 #endif
 }
 
