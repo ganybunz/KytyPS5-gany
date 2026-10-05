@@ -158,6 +158,8 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+// Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
+[[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,

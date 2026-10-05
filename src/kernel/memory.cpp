@@ -1249,6 +1249,10 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
+bool IsGuestMappedAfterChanges(uint64_t vaddr) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsMappedAfterChanges(vaddr);
+}
+
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }

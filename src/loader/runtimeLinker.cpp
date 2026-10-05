@@ -858,6 +858,27 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	// Guest code that touched memory another thread is mapping back (a partial unmap on Windows unmaps the
+	// whole view and maps its other parts again): once that is done the address is mapped and the access
+	// runs again. Texture streaming unmaps parts of pool views every frame; a read in the gap exited.
+	// A thread faulting again and again on the same address is a real fault.
+	if (info->type == Common::HostException::ExceptionType::AccessViolation && g_faulting_linker != nullptr &&
+	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
+	    Libs::LibKernel::Memory::IsGuestMappedAfterChanges(info->access_violation_vaddr)) {
+		thread_local uint64_t last_fault = 0;
+		thread_local uint32_t repeats    = 0;
+		repeats    = info->access_violation_vaddr == last_fault ? repeats + 1 : 0;
+		last_fault = info->access_violation_vaddr;
+		if (repeats < 64) {
+			static std::atomic<uint32_t> reported {0};
+			if (repeats == 0 && reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("Guest access to memory being mapped again retried: %s reading/writing 0x%016" PRIx64 "\n",
+				            DescribeGuestAddress(info->exception_address).c_str(), info->access_violation_vaddr);
+				std::fflush(stdout);
+			}
+			return true;
+		}
+	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{

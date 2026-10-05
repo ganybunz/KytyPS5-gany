@@ -1180,6 +1180,15 @@ public:
 		});
 	}
 
+	// Whether a guest mapping holds vaddr, once a mapping change under way is done: on Windows a partial
+	// unmap unmaps the whole view and maps its other parts back (a view cannot be split), all under the
+	// exclusive lock, and an access to those parts meanwhile faults on unmapped memory.
+	[[nodiscard]] bool IsMappedAfterChanges(uint64_t vaddr) {
+		std::shared_lock lock(m_mutex);
+		const auto       it = FindMappedContainingUnlocked(vaddr);
+		return it != m_mapped.end();
+	}
+
 	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
