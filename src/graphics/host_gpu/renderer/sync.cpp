@@ -14,6 +14,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -187,7 +188,12 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 		    video_out.SubmitFlipFromGpu(buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
-			buffer.GetContext().GetGpuResources().NoteGpuFlip();
+			// KYTY_GPU_FLIP_FRAMES=0: the old behaviour (no frame advance on GPU flips), for A/B tests.
+			static const bool gpu_flip_frames = [] {
+				const char* value = std::getenv("KYTY_GPU_FLIP_FRAMES");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (gpu_flip_frames) buffer.GetContext().GetGpuResources().NoteGpuFlip();
 			return request_id;
 		}
 		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
