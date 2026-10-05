@@ -18,6 +18,12 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <x86intrin.h>
+#include <thread>
+#include <mutex>
+#include <functional>
+#include <cstdlib>
+#include <cstdarg>
 #include <algorithm>
 #include <cstdio>
 #include <limits>
@@ -659,11 +665,15 @@ void CreatePipelineInternal(
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
+	CompileTrace("begin GFX VS=%llu PS=%llu build=%d", static_cast<unsigned long long>(vertex_program.id),
+	             static_cast<unsigned long long>(ps_active ? pixel_program.id : 0), static_cast<int>(build));
 	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build,
 	                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
 		                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
 		                                                                            &pipeline.pipeline);
 	                              });
+	CompileTrace("end GFX VS=%llu result=%d", static_cast<unsigned long long>(vertex_program.id),
+	             static_cast<int>(result));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -677,6 +687,28 @@ void CreatePipelineInternal(
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+}
+
+// KYTY_COMPILE_TRACE=<file>: one unbuffered line before and after every pipeline creation, so the
+// pipeline a driver crash happened in is the last "begin" without its "end" (amdvlk64.dll aborted
+// with 0xc0000409 while Demon's Souls loaded Boletaria, X86).
+static void CompileTrace(const char* format, ...) {
+	static FILE* file = [] {
+		const char* path = std::getenv("KYTY_COMPILE_TRACE");
+		FILE*       f    = path != nullptr && *path != 0 ? std::fopen(path, "w") : nullptr;
+		if (f != nullptr) std::setvbuf(f, nullptr, _IONBF, 0);
+		return f;
+	}();
+	if (file == nullptr) return;
+	static std::mutex mutex;
+	char              line[512];
+	va_list           args;
+	va_start(args, format);
+	std::vsnprintf(line, sizeof(line), format, args);
+	va_end(args);
+	std::scoped_lock lock(mutex);
+	std::fprintf(file, "%llu %zx %s\n", static_cast<unsigned long long>(__rdtsc()),
+	             std::hash<std::thread::id> {}(std::this_thread::get_id()) & 0xffff, line);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -732,6 +764,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
+	CompileTrace("begin CS hash=%016llx wave=%u build=%d",
+	             static_cast<unsigned long long>(input_info.stage.program->shader_hash),
+	             static_cast<unsigned>(input_info.stage.program->wave_size), static_cast<int>(build));
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	const auto result =
@@ -740,6 +775,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                         return graphics.device.createComputePipelines(cache, 1, &create, nullptr,
 		                                                                      &pipeline.pipeline);
 	                         });
+	CompileTrace("end CS hash=%016llx result=%d",
+	             static_cast<unsigned long long>(input_info.stage.program->shader_hash), static_cast<int>(result));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
