@@ -260,6 +260,8 @@ static bool ClaimedElsewhere(const GraphicContext& graphics, vk::Result result) 
 	return result == vk::Result::ePipelineCompileRequired && graphics.pipeline_binary_writer != nullptr;
 }
 
+static void CompileTrace(const char* format, ...); // KYTY_COMPILE_TRACE, below
+
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says.
 template <typename Info, typename Create>
 static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
