@@ -1003,6 +1003,32 @@ bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<co
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
 }
 
+void TrimGuestWorkingSet(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t Page  = 4096;
+	const uint64_t     begin = (vaddr + Page - 1) & ~(Page - 1);
+	const uint64_t     end   = (vaddr + size) & ~(Page - 1);
+	if (g_guest_address_space == nullptr || size == 0 || UINT64_MAX - vaddr < size || end <= begin) {
+		return;
+	}
+	// VirtualUnlock on pages that are not locked removes them from the working set (and reports
+	// ERROR_NOT_LOCKED). A physical page stays resident while any view of it is in the working set,
+	// so the backing view the emulator's own reads use is released too (floppa-ps5 texture_ram=trim).
+	(void)VirtualUnlock(reinterpret_cast<void*>(begin), end - begin);
+	std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
+	if (const auto* backing = TryGetBackingPointer(begin, end - begin)) {
+		(void)VirtualUnlock(const_cast<uint8_t*>(backing), end - begin);
+	} else if (TryGetBackingPieces(begin, end - begin, pieces)) {
+		for (const auto& [piece, bytes]: pieces) {
+			(void)VirtualUnlock(const_cast<uint8_t*>(piece), bytes);
+		}
+	}
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
+
 bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);

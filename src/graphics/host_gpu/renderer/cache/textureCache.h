@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
+#include "common/tickHistory.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -198,6 +199,7 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void TrimUploadedTexture(Image& image, bool cpu_written_only);
 	void UploadStencil(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
@@ -270,6 +272,8 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
+	uint64_t              m_trimmed_bytes = 0; // KYTY_TEXTURE_RAM_TRIM total
+	Common::TickHistory   m_tick_history;
 	struct PendingDownload {
 		uint64_t address = 0, size = 0, tick = 0;
 	};

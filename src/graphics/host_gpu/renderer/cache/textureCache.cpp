@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "async-upload.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -22,10 +23,13 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
@@ -213,7 +217,10 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		// Nothing is collected below half the budget: on cards of 8 GB or less the trigger used to be 0,
+		// and images unused for a few frames were deleted with video memory mostly free (floppa-ps5
+		// 8dc9e84: GoW Sons of Sparta re-created ~48 sprite sheets in one frame on an RX 6650 XT).
+		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, budget / 2));
 	}
 }
 
@@ -1337,6 +1344,44 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 	return plan;
 }
 
+// KYTY_TEXTURE_RAM_TRIM=1: after a full upload of a read-only texture of 1 MiB or more that the guest
+// CPU wrote, its guest pages leave the working set (they stay valid and come back on the next touch).
+// The GPU holds the texture; the RAM copy was kept only because it was touched. On a 16 GB PC Demon's
+// Souls ran out of RAM loading Boletaria without it (X76-X81); floppa-ps5's texture_ram=trim freed
+// ~5.3 GB there (X84). An image re-uploaded within 64 frames is left alone: its pages would come
+// straight back. With KYTY_ASYNC_UPLOAD=2 the trim runs on the upload worker after the staging copy.
+void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_RAM_TRIM");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	const uint64_t frame        = m_frame.load(std::memory_order_relaxed);
+	const bool     recently     = image.frame_uploaded_last != UINT64_MAX && frame - image.frame_uploaded_last < 64;
+	image.frame_uploaded_last  = frame;
+	if (!enabled || !cpu_written_only || recently || image.info.data.size < (1u << 20) ||
+	    image.usage.render_target || image.usage.depth_target || image.usage.storage || image.IsGpuModified() ||
+	    image.depth_id) {
+		return;
+	}
+	const uint64_t address = image.info.data.address;
+	const uint64_t size    = image.info.data.size;
+	m_trimmed_bytes += size;
+	static uint64_t next_report = 2ull << 30;
+	if (m_trimmed_bytes >= next_report) {
+		next_report = m_trimmed_bytes + (2ull << 30);
+		std::printf("Texture RAM trim: %llu MiB of uploaded read-only textures released from RAM so far\n",
+		            static_cast<unsigned long long>(m_trimmed_bytes >> 20));
+	}
+	if (kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2) {
+		AsyncUpload::Get().PushCall(
+		    [](void*, uint64_t vaddr, uint64_t bytes) { LibKernel::Memory::TrimGuestWorkingSet(vaddr, bytes); },
+		    nullptr, address, size, address, size);
+		AsyncUpload::Get().Kick();
+	} else {
+		LibKernel::Memory::TrimGuestWorkingSet(address, size);
+	}
+}
+
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
@@ -1547,7 +1592,9 @@ void TextureCache::InitializeImage(ImageId id) {
 				            image.usage.render_target ? 1 : 0, image.usage.depth_target ? 1 : 0,
 				            image.IsGpuModified() ? 1 : 0, static_cast<unsigned long long>(image.serial));
 			}
+			const bool cpu_written_only = !image.IsBufferModified();
 			UploadImage(image, *source, source_offset);
+			TrimUploadedTexture(image, cpu_written_only);
 			if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
 			    PartialDirtyCandidate(image)) {
 				UpdatePartialHashes(image, true);
@@ -3174,6 +3221,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	m_tick_history.Record(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -3185,11 +3233,18 @@ void TextureCache::RunGarbageCollector() {
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// Below the critical mark an image must also have been unused for a while: 3 s under pressure
+		// (oldest first, until usage is under the mark), 30 s otherwise. Near the budget the frame age
+		// alone still applies.
+		uint64_t below = tick - age;
+		if (!aggressive) {
+			below = std::min(below, m_tick_history.TickSecondsAgo(pressured ? 3.0 : 30.0));
+		}
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+		m_lru_cache.ForEachItemBelow(below, [&](ImageId id) {
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});

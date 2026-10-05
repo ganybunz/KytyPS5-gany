@@ -120,6 +120,10 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
 // The same for a range that spans mappings: one (pointer, bytes) piece per mapping, in order.
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+// The pages of guest [vaddr, vaddr + size) leave this process's working set, in both the guest view and
+// the backing view; they keep their contents (the pagefile holds them once Windows needs the RAM, the
+// next touch reads them back). For read-only texture data the GPU already holds (KYTY_TEXTURE_RAM_TRIM).
+void TrimGuestWorkingSet(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);
 // Avoid false-sharing read faults only when exact ownership proves clean.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);

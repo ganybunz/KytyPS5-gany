@@ -232,6 +232,8 @@ public:
 	uint64_t         transit_group      = 0;
 	// Unique per image object: a deleted image's slot id goes to later images.
 	uint64_t         serial             = 0;
+	// TextureCache frame of the last full upload (KYTY_TEXTURE_RAM_TRIM cooldown; UINT64_MAX: never).
+	uint64_t         frame_uploaded_last = UINT64_MAX;
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
 
