@@ -72,6 +72,10 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
+	// Reduced texture quality: the host image leaves out this many top levels (0: all levels).
+	// Guest layout fields still describe the full guest texture; host level L holds guest level
+	// L + host_mip_skip. Only for sampled-only, never GPU-written textures (TextureCache).
+	uint32_t                     host_mip_skip = 0;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }

@@ -829,6 +829,9 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	// Reduced texture quality applies only to images this shader filter-samples or gathers.
+	desc.allow_reduced = !storage && !resource.exact_texels && !resource.depth_compare &&
+	                     resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);

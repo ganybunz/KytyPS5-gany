@@ -127,8 +127,17 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		range->layer_count = 1;
 	}
 
+	const uint32_t host_levels = HostLevels();
+	if (range && info.host_mip_skip != 0) {
+		// Ranges name guest levels; the host image starts at guest level host_mip_skip.
+		const auto skip   = info.host_mip_skip;
+		const auto first  = range->base_level > skip ? range->base_level - skip : 0u;
+		const auto last   = std::max(range->base_level + range->level_count, skip + 1) - skip;
+		range->base_level  = std::min(first, host_levels - 1);
+		range->level_count = std::max(std::min(last, host_levels) - range->base_level, 1u);
+	}
 	const bool partial =
-	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+	    range && (range->base_level != 0 || range->level_count != host_levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
@@ -138,11 +147,11 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	barriers.clear();
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
-			subresource_states.resize(info.resources.levels * info.resources.layers, state);
+			subresource_states.resize(host_levels * info.resources.layers, state);
 		}
 
 		const uint32_t base_level  = partial ? range->base_level : 0;
-		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
+		const uint32_t level_count = partial ? range->level_count : host_levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
@@ -301,6 +310,8 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	// Reduced images are never GPU-written: nothing of theirs is ever read back.
+	EXIT_IF(info.host_mip_skip != 0);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -708,7 +719,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.flags         = ImageCreateFlags(graphics, info);
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
-	create.mipLevels     = info.resources.levels;
+	create.mipLevels     = HostLevels();
+	if (info.host_mip_skip != 0) {
+		EXIT_IF(info.host_mip_skip >= info.resources.levels || info.IsVolume());
+		create.extent.width  = std::max(info.extent.width >> info.host_mip_skip, 1u);
+		create.extent.height = std::max(info.extent.height >> info.host_mip_skip, 1u);
+	}
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;

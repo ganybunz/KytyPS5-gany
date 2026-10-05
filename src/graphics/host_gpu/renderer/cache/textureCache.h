@@ -39,6 +39,9 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		// The shader only filter-samples or gathers the image: it may use a reduced-quality host
+		// image (TextureQuality). Every other lookup gets, or promotes to, the full image.
+		bool          allow_reduced = false;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -273,6 +276,14 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	uint64_t              m_trimmed_bytes = 0; // KYTY_TEXTURE_RAM_TRIM total
+	// Reduced texture quality: whether a new image for `desc` may leave out its top level, and the
+	// guest addresses a lookup needed at full quality (never reduced again).
+	[[nodiscard]] bool               MayReduce(const ImageDesc& desc);
+	// Frees reduced images among `ids` that this lookup cannot use; true when one was freed.
+	bool                             PromoteReduced(const ImageIds& ids, const ImageDesc& desc, bool exact_format);
+	std::unordered_set<uint64_t>     m_full_quality_addresses;
+	uint64_t                         m_reduced_images  = 0;
+	uint64_t                         m_promoted_images = 0;
 	Common::TickHistory   m_tick_history;
 	struct PendingDownload {
 		uint64_t address = 0, size = 0, tick = 0;

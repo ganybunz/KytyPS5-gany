@@ -69,6 +69,8 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	// Levels of the host image (fewer than the guest's with reduced texture quality).
+	[[nodiscard]] uint32_t HostLevels() const noexcept { return info.resources.levels - info.host_mip_skip; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,

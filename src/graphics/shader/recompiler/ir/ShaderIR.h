@@ -134,6 +134,9 @@ struct ImageResource {
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          depth_compare     = false;
+	// Read at integer texel positions, LOD-queried, or written: the host image must have the guest's
+	// dimensions and levels (reduced texture quality applies only to filter-sampled images).
+	bool                          exact_texels      = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
 	uint32_t                      indirect_root     = NoIndirectImage;

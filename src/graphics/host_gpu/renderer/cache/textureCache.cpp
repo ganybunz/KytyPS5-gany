@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "async-upload.h"
+#include "graphics/host_gpu/renderer/textureQuality.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -902,6 +903,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
+	EXIT_IF(destination.info.host_mip_skip != 0 || source.info.host_mip_skip != 0);
 	TrackImage(destination_id);
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
@@ -939,6 +941,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
+	EXIT_IF(destination.info.host_mip_skip != 0 || source.info.host_mip_skip != 0);
 	TrackImage(destination_id);
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
@@ -1386,6 +1389,14 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
+		if (info.host_mip_skip != 0) {
+			// Reduced texture quality: guest level L goes to host level L - host_mip_skip.
+			std::erase_if(copies, [&](const vk::BufferImageCopy& region) {
+				return region.imageSubresource.mipLevel < info.host_mip_skip;
+			});
+			for (auto& region: copies) region.imageSubresource.mipLevel -= info.host_mip_skip;
+			EXIT_IF(copies.empty());
+		}
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
 		}
@@ -1813,6 +1824,9 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 
 bool TextureCache::UploadImagePartial(Image& image) {
 	const auto& info    = image.info;
+	if (info.host_mip_skip != 0) {
+		return PartialFail("reduced");
+	}
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
 	if (binding == BindingType::DepthTarget) {
@@ -2082,6 +2096,42 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 }
 
+bool TextureCache::MayReduce(const ImageDesc& desc) {
+	const auto& info = desc.info;
+	// Large mipped 2D textures (and cubes / arrays) that this lookup only filter-samples, with no
+	// metadata, depth or stencil, never needed at full quality before and not written by the GPU.
+	return TextureQuality::Reduced() && desc.type == BindingType::Texture && desc.allow_reduced &&
+	       info.type == Prospero::ImageType::kColor2D && info.samples == 1 && info.resources.levels >= 3 &&
+	       info.extent.width >= 512 && info.extent.height >= 512 && !info.HasMetadata() &&
+	       !info.HasStencil() && !info.IsDepth() &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       !m_full_quality_addresses.contains(info.data.address) &&
+	       !m_buffer_cache.HasGpuDirtyBytes(info.data.address, info.data.size);
+}
+
+// A reduced-quality image serves only filter-sampled lookups of the same texture. Any other
+// lookup over its memory replaces it with the full image, rebuilt from guest memory (reduced
+// images never hold GPU-written data), and the address stays full quality.
+bool TextureCache::PromoteReduced(const ImageIds& ids, const ImageDesc& desc, bool exact_format) {
+	bool freed = false;
+	for (const auto id: ids) {
+		auto* reduced = m_slot_images.try_get(id);
+		if (reduced == nullptr || !reduced->registered || reduced->info.host_mip_skip == 0 ||
+		    (desc.type == BindingType::Texture && desc.allow_reduced &&
+		     SameBacking(reduced->info, desc.info, exact_format))) {
+			continue;
+		}
+		if (reduced->binding.is_bound || reduced->binding.is_target) {
+			reduced->binding.needs_rebind = true;
+		}
+		m_full_quality_addresses.insert(reduced->info.data.address);
+		FreeImage(id, "reduced-promote");
+		m_promoted_images++;
+		freed = true;
+	}
+	return freed;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
@@ -2109,6 +2159,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	{
 		std::scoped_lock lock {m_lock};
 		ImageIds candidates;
+		if (m_reduced_images != 0) {
+			PromoteReduced(FindImagesInRegion(desc.info.data.address, desc.info.data.size, false), desc,
+			               exact_format);
+		}
 		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0) {
 			// Every exact match starts on the requested first page. Traversing
 			// that page preserves the original order (including the last match)
@@ -2172,7 +2226,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
+			auto info = desc.info;
+			if (MayReduce(desc)) {
+				info.host_mip_skip = 1;
+				m_reduced_images++;
+			}
+			result         = InsertImage(info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
