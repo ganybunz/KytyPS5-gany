@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <iterator>
 #include <cstdint>
 #include <x86intrin.h>
 
@@ -85,13 +86,31 @@ private:
 // readback's copy, in a synchronous download, in shader translation and pipeline creation. Steady-clock ns.
 enum Wait : uint32_t { WaitGpu, WaitReadback, WaitDownload, WaitCompile, Waits };
 inline int64_t g_waits_ns[Waits] {};
+// The same waits without double counting (KYTY_FRAME_LOG): g_wait_self_ns[k] is time in a k wait minus
+// the waits nested in it, g_wait_any_ns time inside any wait (outermost scopes only). The inclusive
+// g_waits_ns nest (a download encloses GPU and readback waits) and are not to be added up.
+inline int64_t  g_wait_self_ns[Waits] {};
+inline int64_t  g_wait_any_ns = 0;
+inline uint32_t g_wait_depth  = 0;
+inline int64_t  g_wait_child_ns[16] {};
 class WaitScope {
 public:
 	explicit WaitScope(Wait wait): m_wait(wait), m_on(g_render) {
-		if (m_on) m_start = std::chrono::steady_clock::now();
+		if (m_on) {
+			m_start = std::chrono::steady_clock::now();
+			if (g_wait_depth < std::size(g_wait_child_ns)) g_wait_child_ns[g_wait_depth] = 0;
+			++g_wait_depth;
+		}
 	}
 	~WaitScope() {
-		if (m_on) g_waits_ns[m_wait] += (std::chrono::steady_clock::now() - m_start).count();
+		if (!m_on) return;
+		const int64_t ns = (std::chrono::steady_clock::now() - m_start).count();
+		g_waits_ns[m_wait] += ns;
+		--g_wait_depth;
+		const int64_t children = g_wait_depth < std::size(g_wait_child_ns) ? g_wait_child_ns[g_wait_depth] : 0;
+		g_wait_self_ns[m_wait] += ns - children;
+		if (g_wait_depth == 0) g_wait_any_ns += ns;
+		else if (g_wait_depth - 1 < std::size(g_wait_child_ns)) g_wait_child_ns[g_wait_depth - 1] += ns;
 	}
 	WaitScope(const WaitScope&)            = delete;
 	WaitScope& operator=(const WaitScope&) = delete;

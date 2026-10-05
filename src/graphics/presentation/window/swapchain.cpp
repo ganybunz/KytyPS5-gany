@@ -22,6 +22,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -875,6 +876,28 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
 		default: break;
+	}
+	// The texture-cache image a flip shows is copied raw (vkCmdCopyImage) into a frame of the flip's pixel
+	// format: print each change of that image or of either format, so a run whose colours are wrong can
+	// be compared with one whose colours are right.
+	{
+		static const VulkanImage* last_image  = nullptr;
+		static vk::Format         last_source = vk::Format::eUndefined, last_frame = vk::Format::eUndefined;
+		static uint32_t           printed     = 0;
+		if ((&image.backing != last_image || image.backing.format != last_source || frame_format != last_frame) &&
+		    printed < 256) {
+			++printed;
+			last_image  = &image.backing;
+			last_source = image.backing.format;
+			last_frame  = frame_format;
+			std::printf("Present source: image=%p addr=0x%" PRIx64 " size=0x%" PRIx64 " %ux%u source_format=%d "
+			            "frame_format=%d guest_format=%d tile=%u pitch=%u\n",
+			            static_cast<const void*>(&image.backing), image.info.data.address, image.info.data.size,
+			            image.backing.extent.width, image.backing.extent.height, static_cast<int>(image.backing.format),
+			            static_cast<int>(frame_format), static_cast<int>(info.pixel_format),
+			            static_cast<uint32_t>(image.info.tile_mode), image.info.pitch);
+			std::fflush(stdout);
+		}
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);

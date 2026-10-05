@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -85,16 +86,21 @@ inline void Flip() {
 	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                     std::memory_order_relaxed);
 	g_flips.store(flip + 1, std::memory_order_release);
-	// KYTY_FRAME_LOG=<path>: one CSV line per frame (flip to flip on the render thread), so frame-time
-	// percentiles and every hitch can be read without a hitch threshold. The wait columns are the render
-	// thread's waits as LiveCensus times them; they nest (download_wait encloses waits that also count in
-	// gpu_wait and readback_wait), so they are not to be added up.
+	// KYTY_FRAME_LOG=<path>: one CSV line per frame (flip to flip on the render thread), flushed every
+	// frame, so frame-time percentiles and every hitch can be read without a hitch threshold.
+	// *_wait_ms / compile_ms: the render thread's waits as LiveCensus times them, inclusive; they nest
+	// (download_wait encloses waits that also count in gpu_wait and readback_wait) and are not to be added
+	// up. *_self_ms: the same without the waits nested in them, and any_wait_ms the time in any wait: these
+	// add up (any_wait_ms is the sum of the four self columns).
+	// KYTY_PHASE_FILE=<path>: a test script writes a phase name there; each line carries the name the
+	// file held when the frame ended, so phases and frames share one timeline.
 	static FILE* frame_log = [] {
 		const char* path = std::getenv("KYTY_FRAME_LOG");
 		FILE*       file = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
 		if (file != nullptr) {
 			std::fprintf(file, "frame,end_ms,frame_ms,idle_ms,gpu_wait_ms,readback_wait_ms,download_wait_ms,compile_ms,"
-			                   "sync_downloads,async_readbacks,region_syncs,upload_kib,full_upload_kib\n");
+			                   "sync_downloads,async_readbacks,region_syncs,upload_kib,full_upload_kib,any_wait_ms,"
+			                   "gpu_self_ms,readback_self_ms,download_self_ms,compile_self_ms,phase\n");
 		}
 		return file;
 	}();
@@ -103,10 +109,34 @@ inline void Flip() {
 		static constexpr std::array counted {C::SyncDownloads, C::AsyncReadbacks, C::RegionSyncs, C::UploadBytes,
 		                                     C::FullUploadBytes};
 		static std::chrono::steady_clock::time_point  start = std::chrono::steady_clock::now(), last {};
-		static int64_t                                last_idle = 0;
-		static std::array<int64_t, LiveCensus::Waits> last_waits {};
+		static int64_t                                last_idle = 0, last_any = 0;
+		static std::array<int64_t, LiveCensus::Waits> last_waits {}, last_self {};
 		static std::array<uint64_t, counted.size()>   last_counts {};
-		const auto                                    now = std::chrono::steady_clock::now();
+		// The phase file, read again only when its size or time changes (one stat a frame).
+		static const char* phase_path = std::getenv("KYTY_PHASE_FILE");
+		static char        phase[32]  = "-";
+		static int64_t     phase_stamp = -1;
+		if (phase_path != nullptr && phase_path[0] != '\0') {
+			std::error_code ec;
+			const auto      when  = std::filesystem::last_write_time(phase_path, ec);
+			const auto      size  = ec ? 0 : std::filesystem::file_size(phase_path, ec);
+			const int64_t   stamp = ec ? -1 : static_cast<int64_t>(when.time_since_epoch().count()) ^ static_cast<int64_t>(size);
+			if (stamp != phase_stamp) {
+				phase_stamp = stamp;
+				if (FILE* in = stamp == -1 ? nullptr : std::fopen(phase_path, "r")) {
+					char line[32] {};
+					if (std::fgets(line, sizeof(line), in) != nullptr) {
+						size_t n = 0;
+						for (; line[n] != '\0' && line[n] != '\r' && line[n] != '\n' && line[n] != ',' && n + 1 < sizeof(phase); ++n)
+							phase[n] = line[n];
+						phase[n] = '\0';
+						if (n == 0) std::strcpy(phase, "-");
+					}
+					std::fclose(in);
+				}
+			}
+		}
+		const auto now = std::chrono::steady_clock::now();
 		if (last != std::chrono::steady_clock::time_point {}) {
 			std::array<uint64_t, counted.size()> delta {};
 			for (size_t i = 0; i < counted.size(); ++i) delta[i] = LiveCounters::Value(counted[i]) - last_counts[i];
@@ -116,14 +146,22 @@ inline void Flip() {
 			             static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
 			for (size_t i = 0; i < LiveCensus::Waits && i < 4; ++i)
 				std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_waits_ns[i] - last_waits[i]) / 1e6);
-			std::fprintf(frame_log, ",%llu,%llu,%llu,%llu,%llu\n", static_cast<unsigned long long>(delta[0]),
+			std::fprintf(frame_log, ",%llu,%llu,%llu,%llu,%llu", static_cast<unsigned long long>(delta[0]),
 			             static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(delta[2]),
 			             static_cast<unsigned long long>(delta[3] >> 10u), static_cast<unsigned long long>(delta[4] >> 10u));
-			if (flip % 120 == 0) std::fflush(frame_log);
+			std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_wait_any_ns - last_any) / 1e6);
+			for (size_t i = 0; i < LiveCensus::Waits && i < 4; ++i)
+				std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_wait_self_ns[i] - last_self[i]) / 1e6);
+			std::fprintf(frame_log, ",%s\n", phase);
+			std::fflush(frame_log);
 		}
 		last      = now;
 		last_idle = g_render_idle_ns;
-		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
+		last_any  = LiveCensus::g_wait_any_ns;
+		for (size_t i = 0; i < LiveCensus::Waits; ++i) {
+			last_waits[i] = LiveCensus::g_waits_ns[i];
+			last_self[i]  = LiveCensus::g_wait_self_ns[i];
+		}
 		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
 	if (SlowLog::HitchThreshold() > 0.0) {
