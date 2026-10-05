@@ -933,6 +933,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
 			if (!any) std::printf("  none\n");
 		}
+		// The memory the registers point at (the object a bad pointer came from: its fields and lists).
+		{
+			const std::pair<const char*, uint64_t> registers[] {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx}, {"rsi", info->rsi},
+			    {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},   {"r9", info->r9},   {"r10", info->r10},
+			    {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+			for (const auto& [name, value]: registers) {
+				const auto begin = (value & ~uint64_t {7}) - 0x40;
+				if (value < 0x10000 || value >= 0x10000000000ull || !IsReadableRange(begin, 0xc0)) continue;
+				const auto* words = reinterpret_cast<const uint64_t*>(begin);
+				std::printf("[%s-0x40..+0x80]:", name);
+				for (int i = 0; i < 24; i++) std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", words[i]);
+				std::printf("\n");
+			}
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// The host frames, by their unwind tables (the emulator's resolve with its linker map;
 		// guest code has none, which ends the walk), and the state of the faulting page.
