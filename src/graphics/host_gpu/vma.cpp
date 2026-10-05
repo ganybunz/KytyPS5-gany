@@ -248,6 +248,17 @@ void GraphicContext::PrintMemoryStatistics() const {
 	}
 	std::printf("\n");
 	std::fflush(stdout);
+	static bool reported = false;
+	const char* report   = std::getenv("KYTY_VMA_REPORT");
+	const auto  heaps    = GetPhysicalDeviceMemoryProperties().memoryHeapCount;
+	for (uint32_t i = 0; !reported && report != nullptr && i < heaps; i++) {
+		if (budgets[i].budget != 0 && budgets[i].usage * 100 >= budgets[i].budget * 95 &&
+		    (GetPhysicalDeviceMemoryProperties().memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			reported = true;
+			WriteVmaReport(report);
+			std::printf("Memory: VMA report written to %s\n", report);
+		}
+	}
 }
 
 void GraphicContext::ReportMemoryFallback(const char* what, uint64_t bytes) const {
