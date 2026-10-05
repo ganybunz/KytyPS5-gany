@@ -79,7 +79,21 @@ void Install(Program* program) {
 		std::memcpy(call_bytes.data(), reinterpret_cast<const void*>(call), call_bytes.size());
 		std::memcpy(poll_bytes.data(), reinterpret_cast<const void*>(poll), poll_bytes.size());
 	}
-	if (!(at_offsets && Matches(call_bytes, poll_bytes)) && !FindSites(*program, &call, &poll)) {
+	bool usa = false;
+	if (!(at_offsets && Matches(call_bytes, poll_bytes))) {
+		const auto usa_call = program->base_vaddr + CallOffsetUsa, usa_poll = program->base_vaddr + PollOffsetUsa;
+		if (program->mapped_size >= PollOffsetUsa + PollBytesUsa.size() && Readable(usa_call, call_bytes.size()) &&
+		    Readable(usa_poll, poll_bytes.size())) {
+			std::memcpy(call_bytes.data(), reinterpret_cast<const void*>(usa_call), call_bytes.size());
+			std::memcpy(poll_bytes.data(), reinterpret_cast<const void*>(usa_poll), poll_bytes.size());
+			if (MatchesUsa(call_bytes, poll_bytes)) {
+				call = usa_call;
+				poll = usa_poll;
+				usa  = true;
+			}
+		}
+	}
+	if (!usa && !(at_offsets && Matches(call_bytes, poll_bytes)) && !FindSites(*program, &call, &poll)) {
 		std::printf("Demon's Souls idle wait: code signature differs; retaining guest code\n");
 		return;
 	}

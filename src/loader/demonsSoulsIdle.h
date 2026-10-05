@@ -28,8 +28,23 @@ inline constexpr std::array<uint8_t, 24> PollBytes {0x55, 0x48, 0x89, 0xe5, 0x41
                                                     0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec,
                                                     0x88, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x35, 0x25};
 
+// The same call and poll in the USA release PPSA01342 01.004.000: the job-table structure has the
+// pointer at +0xb0 instead of +0x90 and the poll a 0xc8-byte frame instead of 0x88, so neither the
+// fixed offsets nor the search above find it. Found by a wildcard scan of that eboot (one site;
+// 0x86e000 is the page where 51% of its guest CPU samples were spinning, floppa-ps5 X72).
+inline constexpr uint64_t                CallOffsetUsa = 0x86e963, PollOffsetUsa = 0x86ecd0;
+inline constexpr std::array<uint8_t, 24> CallBytesUsa {0xe8, 0x68, 0x03, 0x00, 0x00, 0x84, 0xc0, 0x74,
+                                                       0xcf, 0x4c, 0x8b, 0x7d, 0xc8, 0x49, 0x8b, 0xb7,
+                                                       0xb0, 0x00, 0x00, 0x00, 0x48, 0x85, 0xf6, 0x74};
+inline constexpr std::array<uint8_t, 24> PollBytesUsa {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                                       0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec,
+                                                       0xc8, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x35, 0xcd};
+
 inline bool Matches(std::span<const uint8_t> call, std::span<const uint8_t> poll) {
 	return std::ranges::equal(call, CallBytes) && std::ranges::equal(poll, PollBytes);
+}
+inline bool MatchesUsa(std::span<const uint8_t> call, std::span<const uint8_t> poll) {
+	return std::ranges::equal(call, CallBytesUsa) && std::ranges::equal(poll, PollBytesUsa);
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
