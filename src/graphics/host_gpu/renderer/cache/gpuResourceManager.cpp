@@ -128,21 +128,23 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
+	const auto map = [this, vaddr, size] {
+		m_texture_cache.MapMemory(vaddr, size);
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		++m_mapping_epoch;
+		if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) ++m_bda_ranges_epoch;
+	};
 	if (m_gpu) {
 		// A pending readback writes its backing when it finishes, which a new mapping aliasing
 		// mapped memory would show; memory nothing else maps has no readback pending.
 		const bool aliased = !LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, size);
-		m_gpu->SendCommandSync([this, vaddr, size, aliased] {
+		m_gpu->SendCommandSync([this, map, aliased] {
 			if (aliased) m_buffer_cache.DrainGuestReadback();
-			m_texture_cache.MapMemory(vaddr, size);
+			map();
 		});
 	} else {
-		m_texture_cache.MapMemory(vaddr, size);
-	}
-	{
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Add(vaddr, size);
-		++m_mapping_epoch;
+		map();
 	}
 }
 
@@ -186,11 +188,13 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 			                                            std::chrono::steady_clock::now() - start)
 			                                            .count()));
 		}
+		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		const auto epoch = ++m_mapping_epoch;
+		if (registered) ++m_bda_ranges_epoch;
 		if (size == 0) return;
 		constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
 		for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last; ++g) {
@@ -222,7 +226,7 @@ bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t 
 
 void GpuResourceManager::RefreshBdaRanges() {
 	const auto registered = m_buffer_cache.RegistrationEpoch();
-	if (m_bda_mapping_epoch == m_mapping_epoch && m_bda_registration_epoch == registered) return;
+	if (m_bda_mapping_epoch == m_bda_ranges_epoch && m_bda_registration_epoch == registered) return;
 	LiveCounters::Add(LiveCounters::BdaRebuilds);
 	std::vector<RangeSet::Range> ranges;
 	m_buffer_cache.CollectMappedRegisteredRanges(m_mapped_ranges, ranges);
@@ -247,7 +251,7 @@ void GpuResourceManager::RefreshBdaRanges() {
 			start = finish;
 		}
 	}
-	m_bda_mapping_epoch = m_mapping_epoch;
+	m_bda_mapping_epoch = m_bda_ranges_epoch;
 	m_bda_registration_epoch = registered;
 }
 

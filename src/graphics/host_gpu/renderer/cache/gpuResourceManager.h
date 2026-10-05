@@ -79,6 +79,10 @@ private:
 	// unmaps that many 64 KiB pool layers within frames, so a proof a few frames old counted as stale.
 	static constexpr uint64_t UnmapGranuleBits = 14, UnmapLeafBits = 16;
 	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_unmap_epochs;
+	// Mapping changes over a registered buffer: the only ones that change RefreshBdaRanges' list (registered
+	// buffers' mapped parts). Every map and unmap rebuilt it before (0.4 ms over ~2200 buffers): dozens a frame
+	// while the game streams textures in and out (rolling in Boletaria). GPU thread.
+	uint64_t m_bda_ranges_epoch = 1;
 	uint64_t m_bda_mapping_epoch = 0, m_bda_registration_epoch = 0;
 	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_old_bda_region_requests;
 	GuestGpu*                 m_gpu = nullptr;
