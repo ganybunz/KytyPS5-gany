@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
 #include <array>
@@ -48,7 +49,13 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 
 	uint32_t address = 0;
-	if (!swizzle && state.program.bindings.buffer_word_count != 0 && IR::RuntimeBufferStride(packed)) {
+	if (!swizzle && state.program.table_mode) {
+		// Table mode: the V#'s own stride (EmitTableMode; 0 ignores the index).
+		address = !mem.idxen && (packed & IR::BufferAddTidBit) == 0u
+		              ? offset
+		              : Binary(state, OpIAdd, TypeU32(state),
+		                       Binary(state, OpIMul, TypeU32(state), index, state.table_strides.at(mem.resource)), offset);
+	} else if (!swizzle && state.program.bindings.buffer_word_count != 0 && IR::RuntimeBufferStride(packed)) {
 		// The stride of the buffer word: one module whatever the V# holds (0 ignores the index).
 		if (!mem.idxen && (packed & IR::BufferAddTidBit) == 0u) {
 			address = offset;
@@ -257,7 +264,8 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto address = BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
 		                                      ctx.Arg(inst, 3));
-		if (!include_base_low_bits || !ctx.state.program.info.buffers[mem.resource].byte_base_offset)
+		if (!include_base_low_bits || !ctx.state.program.info.buffers[mem.resource].byte_base_offset ||
+		    ctx.state.program.table_mode)
 			return address;
 		// The host descriptor is aligned down. Its whole-dword displacement is
 		// added by EmitMemoryElementIndex; preserve the remaining byte displacement
@@ -347,6 +355,18 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
+	if (resource.bda_base != 0) {
+		// Table mode: the buffer's device address (EmitTableMode). Out of bounds reads zero, as the device's bounds
+		// make a storage buffer's: the load (of the first dword, which a null buffer's address also holds) is not
+		// branched around, so loads issue together.
+		auto&      state     = ctx.state;
+		const auto in_bounds = EmitMemoryElementInBoundsExplicit(state, resource, index);
+		const auto pointer   = EmitMemoryElementPointer(state, resource,
+		                                                Select(state, TypeU32(state), in_bounds, index, ConstantU32(state, 0)));
+		const auto value     = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+		return Select(state, TypeU32(state), in_bounds, value, ConstantU32(state, 0));
+	}
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
@@ -464,7 +484,7 @@ uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem
 // buffer word (IR::BufferWord). The decode below gives the values of the specialized one
 // (LoadFormattedComponent, LoadWideBuffer) for every format.
 bool UsesRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
-	return !mem.typed && state.program.bindings.buffer_word_count != 0 &&
+	return !mem.typed && (state.program.bindings.buffer_word_count != 0 || state.program.table_mode) &&
 	       mem.resource < state.program.info.buffers.size() &&
 	       IR::RuntimeBufferFormat(state.program.info.buffers[mem.resource]) &&
 	       state.program.info.buffers[mem.resource].descriptor_format == Prospero::BufferFormat::kInvalid;
@@ -522,18 +542,22 @@ uint32_t PackedLayoutTable(EmitterState& state, uint32_t layout, const std::arra
 } // namespace
 
 // Once per buffer at the entry, instead of again at each component of each formatted load (a shader with
-// hundreds of formatted loads compiled for minutes).
+// hundreds of formatted loads compiled for minutes). Table mode: the buffer words EmitTableMode made from the
+// V#s, by resource.
 void EmitRuntimeFormats(EmitterState& state) {
 	const auto* descriptor = IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Buffers);
-	if (descriptor == nullptr) return;
-	for (uint32_t index = 0; index < state.program.bindings.buffer_word_count && index < descriptor->resources.size();
-	     index++) {
-		const auto resource = descriptor->resources[index];
+	const bool  table      = state.program.table_mode;
+	if (descriptor == nullptr && !table) return;
+	const auto count = table ? static_cast<uint32_t>(state.program.info.buffers.size())
+	                         : std::min<uint32_t>(state.program.bindings.buffer_word_count,
+	                                              static_cast<uint32_t>(descriptor->resources.size()));
+	for (uint32_t index = 0; index < count; index++) {
+		const auto resource = table ? index : descriptor->resources[index];
 		if (resource >= state.program.info.buffers.size()) continue;
 		const auto& buffer = state.program.info.buffers[resource];
 		if (!IR::RuntimeBufferFormat(buffer) || buffer.descriptor_format != Prospero::BufferFormat::kInvalid) continue;
 		auto& format  = state.runtime_formats[index];
-		format.word   = state.buffer_words[index];
+		format.word   = table ? state.table_buffer_words.at(index) : state.buffer_words[index];
 		format.layout = WordField(state, format.word, IR::BufferWord::LayoutShift, 4);
 		format.type   = WordField(state, format.word, IR::BufferWord::TypeShift, 3);
 		format.packed =
@@ -559,7 +583,9 @@ void EmitRuntimeFormats(EmitterState& state) {
 namespace {
 
 const RuntimeFormat& LoadRuntimeFormat(EmitterState& state, const IR::MemoryInfo& mem) {
-	return state.runtime_formats[ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource)];
+	return state.runtime_formats[state.program.table_mode
+	                                 ? mem.resource
+	                                 : ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource)];
 }
 
 // dst_sel of an output component: 0 zero, 1 one, 4-7 a memory component (2 and 3 reserved).
@@ -748,6 +774,13 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
+	if (resource.bda_base != 0 && !std::exchange(ctx.state.table_guarded, true)) {
+		// Table mode: out of bounds drops the store (LoadWordInBounds).
+		EmitIfCondition(ctx.state, EmitMemoryElementInBoundsExplicit(ctx.state, resource, index),
+		                [&]() { StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data); });
+		ctx.state.table_guarded = false;
+		return;
+	}
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	const auto shift   = Binary(
 	    ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
@@ -793,20 +826,24 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 	});
 }
 
+void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                       uint32_t data) {
+	if (resource.bda_base != 0) { // table mode: out of bounds drops the store (LoadWordInBounds)
+		EmitIfCondition(ctx.state, EmitMemoryElementInBoundsExplicit(ctx.state, resource, index), [&]() {
+			ctx.state.builder.AddFunction({OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data,
+			                               MemoryAccessAlignedMask, sizeof(uint32_t)});
+		});
+		return;
+	}
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	ctx.state.builder.AddFunction({OpStore, pointer, data});
+}
+
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	EmitIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    ctx.state.builder.AddFunction(
-		        {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
-	    });
-}
-
-void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
-                       uint32_t data) {
-	ctx.state.builder.AddFunction(
-	    {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
+	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	                [&]() { StoreWordInBounds(ctx, resource, index, data); });
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -964,11 +1001,24 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 		        ConstantU64(state, 0), [&]() {
 			        const auto value = Unary(state, OpBitcast, TypeScalarU64(state),
 			                                 ctx.Arg(inst, inst.NumArgs() - 2));
-			        const auto old   = state.builder.AllocateId();
+			        auto       pointer = 0u;
+			        if (resource.bda_base != 0) {
+				        // Table mode: the qword at the absolute address rounded down, as the bound range's byte offset
+				        // makes it (a base 4 mod 8 would misalign it; buffers start at pages, so it stays inside).
+				        pointer = state.builder.AllocateId();
+				        state.builder.AddFunction(
+				            {OpConvertUToPtr, TypePhysicalU64Pointer(state), pointer,
+				             Binary(state, OpBitwiseAnd, TypeDeviceAddress(state),
+				                    Binary(state, OpIAdd, TypeDeviceAddress(state), resource.bda_base,
+				                           Unary(state, OpUConvert, TypeDeviceAddress(state), byte_address)),
+				                    ConstantDeviceAddress(state, ~uint64_t {7}))});
+			        } else {
+				        pointer = EmitStorageBufferElementPointer(state, resource, index,
+				                                                  TypeStorageBufferU64ElementPointer(state));
+			        }
+			        const auto old = state.builder.AllocateId();
 			        state.builder.AddFunction(
-			            {SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
-			             EmitStorageBufferElementPointer(
-			                 state, resource, index, TypeStorageBufferU64ElementPointer(state)),
+			            {SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old, pointer,
 			             ConstantU32(state, ScopeDevice),
 			             ConstantU32(state, MemorySemanticsNone), value});
 			        EmitDeviceAtomicMemoryBarrier(state);
@@ -1416,6 +1466,41 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction({OpFunctionEnd});
 }
 
+// Table mode, at the function's entry: the slots the shader reads (IR::TablePlan::gpu) from its block (the block's
+// device address is two dwords of shader data, IR::BindingLayout::TableBlockDword), and each buffer's device
+// address, size in dwords, buffer word and stride (the renderer resolved the V#).
+void EmitTableMode(ValueEmitContext& ctx) {
+	auto&       state   = ctx.state;
+	const auto& program = state.program;
+	if (!program.table_mode) return;
+	const auto& plan    = program.table_plan;
+	const auto  address = TypeDeviceAddress(state);
+	const auto  block   = DeviceAddressFromWords(state, EmitShaderDataDwordLoad(state, program.bindings.TableBlockDword()),
+	                                             EmitShaderDataDwordLoad(state, program.bindings.TableBlockDword() + 1));
+	const auto  load    = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                           Binary(state, OpIAdd, address, block, ConstantDeviceAddress(state, uint64_t {dword} * 4))});
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+		return value;
+	};
+	state.table_slot_values.assign(plan.slots.size(), 0);
+	for (size_t slot = 0; slot < plan.slots.size(); ++slot)
+		if (plan.gpu[slot] != 0) state.table_slot_values[slot] = load(static_cast<uint32_t>(slot));
+	// Each buffer as the renderer resolved it (IR::TablePlan::BufferDword).
+	for (size_t i = 0; i < plan.buffers.size(); ++i) {
+		const auto first       = plan.BufferDword(i);
+		state.table_bases[i]   = DeviceAddressFromWords(state, load(first), load(first + 1));
+		state.table_lengths[i] = load(first + 2);
+		state.table_strides[i] = load(first + 4);
+		const auto& resource   = program.info.buffers[i];
+		if (IR::RuntimeBufferFormat(resource) && resource.descriptor_format == Prospero::BufferFormat::kInvalid)
+			state.table_buffer_words.at(i) = load(first + 3);
+	}
+	EmitRuntimeFormats(state);
+}
+
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state             = ctx.state;
 	const auto op                = inst.GetOpcode();
@@ -1444,6 +1529,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    ctx.Memory(inst).planning_only) {
 		return true;
 	}
+	if (op == IR::ValueOpcode::ReadConst && state.program.table_mode) {
+		// A slot the block does not give the shader only addresses planning-only loads (IR::EnterTableMode), which
+		// emit nothing.
+		const auto slot = inst.Arg(1).Resolve().U32();
+		ctx.Define(inst, slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
+		                     ? state.table_slot_values[slot]
+		                     : ConstantU32(state, 0));
+		return true;
+	}
 	if (op == IR::ValueOpcode::ReadConst) {
 		if (state.flattened_srt_variable == 0) {
 			ctx.Fail(inst, "requires the flattened SRT descriptor");
@@ -1466,13 +1560,8 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto access    = PrepareMemoryResourceAccess(state, mem);
 		const auto element   = EmitMemoryElementIndex(state, access, index);
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-			           const auto value = state.builder.AllocateId();
-			           state.builder.AddFunction(
-			               {OpLoad, TypeU32(state), value,
-			                EmitMemoryElementPointer(state, access, element)});
-			           return value;
-		           }));
+		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition,
+		                                            [&]() { return LoadWordInBounds(ctx, access, element); }));
 		return true;
 	}
 	const auto address_info = IR::AddressOpcodeInfoOf(op);

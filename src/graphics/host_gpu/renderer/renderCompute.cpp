@@ -356,6 +356,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
+	// A compute shader the normal path dispatched before (TableDispatchSeen) whose program allows table mode.
+	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 &&
+	    (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
+	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0)) &&
+	    TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args))
+		return;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
@@ -389,15 +395,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    cs_regs, sh_regs, input_info, indirect_args != 0 ? &unevaluated : nullptr);
 	if (!compute_program && !unevaluated.empty()) {
 		// An indirect dispatch whose resource tables do not evaluate (pointers into memory the guest has not
-		// mapped, while it loads): with no thread groups in its arguments the GPU never reads the tables.
+		// mapped, while it loads; a stale descriptor no specialization can take, such as an FMASK surface in a
+		// sampled slot, seen in the Nexus): it is skipped. With no thread groups in its arguments the GPU never
+		// reads the tables; with some it cannot run as the guest built it, and ending the game helps no one.
 		std::array<uint32_t, 3> groups {};
 		m_context.GetBufferCache().ReadMemory(indirect_args, sizeof(groups));
 		std::memcpy(groups.data(), reinterpret_cast<const void*>(indirect_args), sizeof(groups));
-		if (groups[0] != 0 && groups[1] != 0 && groups[2] != 0) EXIT("%s", unevaluated.c_str());
 		static std::atomic<uint32_t> logged {0};
-		if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
-			std::printf("Dispatch: an indirect dispatch of no thread groups skipped, its tables did not evaluate: %s",
-			            unevaluated.c_str());
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Dispatch: an indirect dispatch of %ux%ux%u thread groups skipped, its tables did not evaluate: %s",
+			            groups[0], groups[1], groups[2], unevaluated.c_str());
 		ResetBindings();
 		return;
 	}
@@ -443,18 +450,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                                     thread_group_x, thread_group_y,
 	                                                     thread_group_z, mode)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "linear_copy";
+		TableDispatchSeen(sh_ctx.GetCs(), true);
 		ResetBindings();
 		return;
 	}
 	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
 	                                                     thread_group_y, thread_group_z, mode)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "meta_clear";
+		TableDispatchSeen(sh_ctx.GetCs(), true);
 		ResetBindings();
 		return;
 	}
 	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
 	                                                      thread_group_y, thread_group_z, mode)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "image_clear";
+		TableDispatchSeen(sh_ctx.GetCs(), true);
 		ResetBindings();
 		return;
 	}
@@ -563,6 +573,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 2);
+	TableDispatchSeen(sh_ctx.GetCs(), use_thread_dimensions);
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);

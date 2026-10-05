@@ -359,6 +359,49 @@ public:
 	void NativeXprEndPacket();
 	// Graphics registers may have changed without the observer seeing it.
 	void NativeXprForgetState();
+	// A clean draw (only user data and index state changed) after a table draw whose bindings still stand:
+	// drawn the same way without the native path's lookups (KYTY_TABLE_XPR=2).
+	[[nodiscard]] bool TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+	                                 uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	// Table dispatches (KYTY_TABLE_DISPATCH): a dispatch drawn the table way, and the normal path's dispatches.
+	[[nodiscard]] bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
+	                                 uint64_t indirect_args);
+	void TableDispatchSeen(const HW::ComputeShaderInfo& cs, bool special);
+
+private:
+	// Table draws (src/local/table-xpr.inc).
+	struct TableXpr;
+	struct TablePair;
+	struct TableVariant;
+	struct TableImageSet;
+	enum class TableResult { Drawn, Native, Store };
+	std::shared_ptr<TableXpr> m_table_xpr;
+	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
+	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                      const NativeXprDirectDraw* direct);
+	[[nodiscard]] TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
+	                                             const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
+	[[nodiscard]] bool           TableValidateSet(TableImageSet& set);
+	void                         TableRuns(TablePair& pair);
+	void                         TableReset(TablePair& pair);
+	[[nodiscard]] bool           TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
+	                                      const NativeXprDrawState* draw_state);
+	[[nodiscard]] bool           TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                                         std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
+	void                         TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	[[nodiscard]] bool           TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
+	                                          const NativeXprDrawState* draw_state);
+	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
+	                bool primitive_restart_enable, const RenderState& rendering, bool storable);
+	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
+	                           uint64_t state_key);
+	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
+	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer);
+
 
 private:
 	RenderContext&                        m_context;

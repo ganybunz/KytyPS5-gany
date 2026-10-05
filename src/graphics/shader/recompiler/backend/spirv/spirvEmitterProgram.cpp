@@ -736,6 +736,7 @@ void EmitProgram(EmitterState& state) {
 		    {OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
 	}
 	EmitMemoryOffsets(state);
+	EmitTableMode(ctx);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

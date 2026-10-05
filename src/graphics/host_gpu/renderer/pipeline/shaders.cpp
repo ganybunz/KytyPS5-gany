@@ -717,7 +717,7 @@ static void CompileTrace(const char* format, ...) {
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            PipelineBuild build) {
+                            PipelineBuild build, bool native_bindings) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -736,8 +736,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (build != PipelineBuild::Optimize) {
 		std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 		AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
-		                  vk::ShaderStageFlagBits::eCompute, false);
-		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, false);
+		                  vk::ShaderStageFlagBits::eCompute, native_bindings);
+		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, native_bindings);
 		const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 		                                            ShaderRecompiler::IR::NativePushConstantSize};
 

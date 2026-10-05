@@ -63,6 +63,13 @@ extern "C" {
 // the frame: the instances of one mesh keep their records when the frame draws them in another order (a culled
 // instance shifted every later use onto another instance's record, which rebound its descriptors).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_instance_mode {0};
+// 1: table draws (src/local/table-xpr.inc) for the pairs that allow them.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_xpr_mode {0};
+// 1: table dispatches (src/local/table-xpr.inc) for the compute shaders that allow them.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {0};
+// N > 0: at most N table store requests a frame (each takes its draw to the normal path; the others draw from native
+// records meanwhile). A new area brings hundreds of pairs whose programs and pipelines compile in the background.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {32};
 }
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
@@ -1564,6 +1571,57 @@ bool RenderExecutor::NativeXprRebind(NativeXprRecord&                           
 	                                    true) == nullptr;
 }
 
+// The draw state under `state_key`: the render targets as this draw left them (a reopened rendering loads),
+// their layouts and the dynamic state.
+void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state,
+                                           const RenderState& rendering, uint64_t state_key) {
+	auto& cache    = NativeXprState();
+	auto& textures = m_context.GetTextureCache();
+	NativeXprDrawState draw_state;
+	draw_state.first_rendering = rendering;
+	draw_state.rendering       = rendering;
+	for (auto& attachment: draw_state.rendering.color_attachments) attachment.is_clear = false;
+	draw_state.rendering.depth_stencil_attachment.depth_clear   = false;
+	draw_state.rendering.depth_stencil_attachment.stencil_clear = false;
+	const auto metadata_of = [](const TextureCache::ImageDesc& desc) {
+		return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0}
+		                                                          : desc.info.metadata.range.address;
+	};
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		const auto& desc  = state.color_info[i].desc;
+		const auto& view  = desc.view_info;
+		const auto& image = textures.GetImage(state.color_info[i].image_id);
+		draw_state.targets.push_back({state.color_info[i].image_id,
+		                              rendering.color_attachments[i].image_layout,
+		                              image.binding.attachment_access,
+		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
+		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
+	}
+	if (state.depth_info.image_id) {
+		const auto& desc  = state.depth_info.desc;
+		const auto& view  = desc.view_info;
+		const auto& image = textures.GetImage(state.depth_info.image_id);
+		draw_state.targets.push_back({state.depth_info.image_id,
+		                              rendering.depth_stencil_attachment.image_layout,
+		                              image.binding.attachment_access,
+		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
+		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
+	}
+	draw_state.meta_epoch = 0;
+	draw_state.dynamic = LocalDrawRecording::Capture(
+	    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
+	    m_context.GetGraphics().attachment_feedback_loop_enabled,
+	    rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
+	        : vk::ImageAspectFlags {});
+	// Entries stay at their address (emission tracking compares pointers); a
+	// replaced state must be emitted again.
+	auto& slot = cache.states[state_key];
+	if (!slot) slot = std::make_unique<NativeXprDrawState>();
+	*slot = std::move(draw_state);
+	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
+}
+
 // Called by ExecutePreparedDraw after CommitBindings (image layouts are final)
 // for a draw whose caller requested a store.
 void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
@@ -1583,7 +1641,6 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		pair.unstorable = true;
 	};
 	if (stages.empty() || stages.size() > 2 || (stages.size() == 2) != state.ps_active) return refuse_program();
-	auto& textures = m_context.GetTextureCache();
 	// Only stages without DMA, GDS or any written resource are recorded.
 	for (const auto* prepared: stages) {
 		const auto& program = *prepared->runtime->program;
@@ -1793,50 +1850,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		}
 	}
 
-	// Render targets as this draw left them; a reopened rendering loads.
-	NativeXprDrawState draw_state;
-	draw_state.first_rendering = rendering;
-	draw_state.rendering       = rendering;
-	for (auto& attachment: draw_state.rendering.color_attachments) attachment.is_clear = false;
-	draw_state.rendering.depth_stencil_attachment.depth_clear   = false;
-	draw_state.rendering.depth_stencil_attachment.stencil_clear = false;
-	const auto metadata_of = [](const TextureCache::ImageDesc& desc) {
-		return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0}
-		                                                          : desc.info.metadata.range.address;
-	};
-	for (uint32_t i = 0; i < state.color_count; ++i) {
-		const auto& desc  = state.color_info[i].desc;
-		const auto& view  = desc.view_info;
-		const auto& image = textures.GetImage(state.color_info[i].image_id);
-		draw_state.targets.push_back({state.color_info[i].image_id,
-		                              rendering.color_attachments[i].image_layout,
-		                              image.binding.attachment_access,
-		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
-		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
-	}
-	if (state.depth_info.image_id) {
-		const auto& desc  = state.depth_info.desc;
-		const auto& view  = desc.view_info;
-		const auto& image = textures.GetImage(state.depth_info.image_id);
-		draw_state.targets.push_back({state.depth_info.image_id,
-		                              rendering.depth_stencil_attachment.image_layout,
-		                              image.binding.attachment_access,
-		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
-		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
-	}
-	draw_state.meta_epoch = 0;
-	draw_state.dynamic = LocalDrawRecording::Capture(
-	    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
-	    m_context.GetGraphics().attachment_feedback_loop_enabled,
-	    rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-	        : vk::ImageAspectFlags {});
-	// Entries stay at their address (emission tracking compares pointers); a
-	// replaced state must be emitted again.
-	auto& slot = cache.states[state_key];
-	if (!slot) slot = std::make_unique<NativeXprDrawState>();
-	*slot = std::move(draw_state);
-	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
+	NativeXprCaptureState(buffer, state, rendering, state_key);
 
 	// A relocated key: without the roots' and the unread words, with the words the try added (NativeXprTry).
 	if (!record->roots.empty() || !record->unread.empty()) {
@@ -2850,6 +2864,53 @@ struct RenderExecutor::NativeXprDirect {
 	uint32_t            first_instance = 0;
 };
 
+// What the normal path's target acquisition establishes must still hold: the image is registered,
+// GPU-owned (so CPU reads download it) and CPU-clean, and no fast clear is pending in its metadata.
+// Otherwise the normal path acquires. Then the targets in the state's layouts.
+bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer) {
+	auto&      textures   = m_context.GetTextureCache();
+	const auto meta_epoch = textures.MetaEpoch();
+	for (const auto& target: draw_state.targets) {
+		auto* image = textures.m_slot_images.try_get(target.id);
+		if (image == nullptr || image->serial != target.serial || !image->registered || image->binding.needs_rebind ||
+		    !image->SafeToDownload()) {
+			return false;
+		}
+		if (target.metadata != 0 && draw_state.meta_epoch != meta_epoch &&
+		    textures.IsMetaCleared(target.metadata, target.slice)) {
+			return false;
+		}
+	}
+	draw_state.meta_epoch = meta_epoch;
+	for (const auto& target: draw_state.targets) {
+		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
+		if (image.backing.state.layout != target.layout)
+			image.Transit(target.layout, target.access, target.range, vk_buffer);
+	}
+	return true;
+}
+
+// A deleted target image took the state's attachment views along (its slot may hold another image by
+// now), and a newer image with the same backing as a target is what the registers now select: the
+// normal path captures the state again.
+bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_state) {
+	auto& textures = m_context.GetTextureCache();
+	for (const auto& target: draw_state.targets) {
+		const auto* image = textures.m_slot_images.try_get(target.id);
+		if (image == nullptr || image->serial != target.serial) return false;
+	}
+	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
+		uint64_t proven = UINT64_MAX;
+		for (const auto& target: draw_state.targets) {
+			auto epoch = draw_state.targets_epoch;
+			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) return false;
+			proven = std::min(proven, epoch);
+		}
+		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
+	}
+	return true;
+}
+
 bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record,
                                    const NativeXprDrawState& draw_state,
                                    const PipelineCache::Pipeline& pipeline,
@@ -2929,27 +2990,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 
 	auto& textures  = m_context.GetTextureCache();
 	auto& scheduler = m_context.GetCommandScheduler();
-	// What the normal path's target acquisition establishes must still hold: the
-	// image is registered, GPU-owned (so CPU reads download it) and CPU-clean, and
-	// no fast clear is pending in its metadata. Otherwise the normal path acquires.
-	const auto meta_epoch = textures.MetaEpoch();
-	for (const auto& target: draw_state.targets) {
-		auto* image = textures.m_slot_images.try_get(target.id);
-		if (image == nullptr || image->serial != target.serial || !image->registered || image->binding.needs_rebind ||
-		    !image->SafeToDownload()) {
-			return false;
-		}
-		if (target.metadata != 0 && draw_state.meta_epoch != meta_epoch &&
-		    textures.IsMetaCleared(target.metadata, target.slice)) {
-			return false;
-		}
-	}
-	draw_state.meta_epoch = meta_epoch;
-	for (const auto& target: draw_state.targets) {
-		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
-		if (image.backing.state.layout != target.layout)
-			image.Transit(target.layout, target.access, target.range, vk_buffer);
-	}
+	if (!NativeXprEmitTargets(draw_state, vk_buffer)) return false;
 	for (const auto& dep: record.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
@@ -3078,6 +3119,11 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	if (!clean || !cache.state_key_valid) {
 		cache.state_key       = NativeXprStateKey(buffer);
 		cache.state_key_valid = true;
+	}
+	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) != 0) {
+		const auto table = TableTry(buffer, commands, index_base, index_bytes, index_type, direct);
+		if (table == TableResult::Drawn) return true;
+		if (table == TableResult::Store) return LiveCounters::Add(LiveCounters::TableStores), false;
 	}
 	NativeXprKey(buffer, cache.key);
 	// Relocation: the pair's pointer words leave the key, and which use of the rest in the frame this
@@ -3291,30 +3337,10 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		direct_draw = {*direct, offsets->vertex, offsets->instance};
 	}
 	const auto& draw_state = *cache.last_state;
-	// A deleted target image took the state's attachment views along (its slot
-	// may hold another image by now): the normal path captures the state again.
-	auto& textures = m_context.GetTextureCache();
-	for (const auto& target: draw_state.targets) {
-		const auto* image = textures.m_slot_images.try_get(target.id);
-		if (image == nullptr || image->serial != target.serial) {
-			LiveCounters::Add(LiveCounters::XprMissTarget);
-			request_store();
-			return false;
-		}
-	}
-	// A newer image with the same backing as a target is what the registers now select.
-	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
-		uint64_t proven = UINT64_MAX;
-		for (const auto& target: draw_state.targets) {
-			auto epoch = draw_state.targets_epoch;
-			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
-				LiveCounters::Add(LiveCounters::XprMissTarget);
-				request_store();
-				return false;
-			}
-			proven = std::min(proven, epoch);
-		}
-		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
+	if (!NativeXprTargetsCurrent(draw_state)) {
+		LiveCounters::Add(LiveCounters::XprMissTarget);
+		request_store();
+		return false;
 	}
 	// Records are mostly used once per frame, so their data is cold: load the
 	// arrays together instead of missing on each in turn.

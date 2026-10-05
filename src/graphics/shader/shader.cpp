@@ -85,6 +85,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
+uint64_t ShaderMapGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
 bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
 	EXIT_IF(g_shader_map == nullptr || out == nullptr);
 	std::scoped_lock lock(g_shader_map_mutex);
@@ -201,6 +205,12 @@ static void FillShaderParams(uint64_t shader_addr, const char* label, std::span<
 	params.user_data.assign(user_data.begin(), user_data.end());
 	params.hash      = ShaderCodeHash(shader_addr, code);
 	params.back_code = {};
+}
+
+uint64_t ShaderHashAt(uint64_t addr) {
+	const auto data = ShaderGetMappedData(addr, "ShaderHashAt");
+	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) return 0;
+	return ShaderCodeHash(addr, std::span {reinterpret_cast<const uint32_t*>(addr), data.code_size_bytes / sizeof(uint32_t)});
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, std::span<const uint32_t> user_data,

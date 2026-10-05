@@ -15,8 +15,10 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -176,19 +178,25 @@ public:
 		ShaderProgram pixel;
 	};
 
+	// `table_mode`: both programs in table mode (ShaderRecompiler::IR::EnterTableMode), each empty when it does not
+	// allow that.
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
 	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, ShaderVertexInputInfo& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, bool table_mode = false,
+	                    std::array<uint32_t, 2> table_portable = {});
 	// `unevaluated`: a resource table that does not evaluate returns an empty program with the error here
 	// (an indirect dispatch decides) instead of stopping the emulator.
+	// `table_mode`: the program in table mode (ShaderRecompiler::IR::EnterTableMode), empty when it does not allow
+	// it or the normal path has not prepared the shader yet.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info,
-	                                std::string*                 unevaluated = nullptr);
+	                                std::string* unevaluated = nullptr, bool table_mode = false,
+	                                uint32_t table_portable = 0);
 
 	Pipeline&
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
@@ -209,6 +217,17 @@ public:
 	                          bool native_bindings);
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
+	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
+	// (its empty program is no refusal: asked again, it is there).
+	[[nodiscard]] bool TablePending() const;
+	// When TablePending: the completion of that translation (set once it is done).
+	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
+	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
+	[[nodiscard]] const std::shared_ptr<const std::atomic<bool>>& PipelineWaiting() const { return m_pipeline_waiting; }
+	// As TryCreateGraphicsPipeline: null while a worker compiles it; its layout takes allocated descriptor sets
+	// (native bindings, for table mode programs).
+	[[nodiscard]] Pipeline* TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                                 const ShaderProgram&          compute_program);
 	// Native XPR records (src/local/native-xpr.inc): the SRT evaluation of a stage
 	// whose compiled permutation is already chosen, with the readers the normal
 	// path uses. False when the evaluation fails or would select another
@@ -326,7 +345,13 @@ private:
 	class CompileWorkers;
 	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PendingGraphicsPipeline>, GraphicsPipelineKeyHash>
 	                                m_pending_graphics_pipelines;
+	struct PendingComputePipeline;
+	std::unordered_map<uint64_t, std::shared_ptr<PendingComputePipeline>> m_pending_compute_pipelines;
 	std::unique_ptr<CompileWorkers> m_compile_workers;
+	std::shared_ptr<const std::atomic<bool>> m_pipeline_waiting; // (PipelineWaiting)
+	// Table mode programs and pipelines (src/local/table-xpr.inc): a new area brings hundreds, which ahead of the
+	// native records' pipelines in one queue kept the draws on the normal path for a minute.
+	std::unique_ptr<CompileWorkers> m_table_workers;
 	// Unoptimized pipelines whose optimized build is pending, and those it replaced (recorded commands
 	// may still use them).
 	std::vector<Pipeline*>    m_optimizing;
@@ -335,6 +360,16 @@ private:
 	std::atomic<uint32_t>     m_optimized_builds {0}; // finished by workers
 	uint32_t                  m_promoted_builds = 0;  // of those, seen by PromoteOptimized
 	std::atomic<bool>         m_stopping {false};     // optimized builds not started yet are skipped
+	// Table mode pipelines' driver cache (InitializeDriverCache), saved by m_table_cache_saver once their compiles
+	// settle: the jobs queued or running, those done and when the last one finished (steady clock ticks).
+	vk::PipelineCache     m_table_cache = nullptr;
+	std::filesystem::path m_table_cache_path;
+	size_t                m_table_cache_saved_size = 0;
+	std::mutex            m_table_cache_mutex; // (a save)
+	std::atomic<uint32_t> m_table_pipeline_jobs {0};
+	std::atomic<uint64_t> m_table_pipelines_done {0};
+	std::atomic<int64_t>  m_table_pipeline_last_done {0};
+	std::jthread          m_table_cache_saver;
 
 	Pipeline* CreateGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
@@ -343,9 +378,14 @@ private:
 	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
 	void      FinishCompileWorkers();
 	CompileWorkers& Workers();
+	CompileWorkers& TableWorkers();
 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
 	void            PromoteOptimized();
 	void InitializeDriverCache();
+	vk::PipelineCache LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit, size_t& loaded_size);
+	bool SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& file_path, size_t& saved_size);
+	vk::PipelineCache TablePipelineCache() const { return m_table_cache != nullptr ? m_table_cache : m_driver_cache; }
+	void              TablePipelineDone();
 	void InitializeStaticCache(bool create);
 	void WarmPipelines();
 #ifdef KYTY_STATIC_PRECOMPILE
@@ -370,7 +410,7 @@ void CreatePipelineInternal(
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            PipelineBuild build = PipelineBuild::Full);
+                            PipelineBuild build = PipelineBuild::Full, bool native_bindings = false);
 
 } // namespace Libs::Graphics
 

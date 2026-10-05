@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
@@ -1593,6 +1594,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// may end rendering or restart the scheduler.
 	if (m_native_xpr_verify.record != nullptr)
 		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
+	if (m_table_xpr)
+		TableStore(buffer, state, topology, primitive_restart_enable, rendering,
+		           !mesh_active && emit.indexed && vertex_bindings.count == 0);
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
 		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)
@@ -1607,6 +1611,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "native-xpr.inc"
+#include "table-xpr.inc"
 #endif
 
 bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run) {

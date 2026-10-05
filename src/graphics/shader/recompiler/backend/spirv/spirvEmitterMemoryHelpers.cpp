@@ -67,7 +67,7 @@ void EmitMemoryOffsets(EmitterState& state) {
 	for (uint32_t i = 0; i < state.program.bindings.buffer_word_count; i++) {
 		state.buffer_words[i] = EmitShaderDataDwordLoad(state, state.program.bindings.BufferWordDword() + i);
 	}
-	EmitRuntimeFormats(state);
+	if (!state.program.table_mode) EmitRuntimeFormats(state); // table mode: EmitTableMode
 }
 
 uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem) {
@@ -105,6 +105,16 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          uint32_t variable,
                                                          uint32_t pointer_type) {
+	if (state.program.table_mode) { // EmitTableMode: the buffer's device address and size (in elements)
+		MemoryResourceAccess access {.kind = mem.kind};
+		access.bda_base    = state.table_bases.at(mem.resource);
+		access.length      = pointer_type == TypeStorageBufferU64Pointer(state)
+		                         ? EmitBinaryU32(state, OpShiftRightLogical, state.table_lengths.at(mem.resource),
+		                                         ConstantU32(state, 1))
+		                         : state.table_lengths.at(mem.resource);
+		access.byte_offset = ConstantU32(state, 0);
+		return access;
+	}
 	if (variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
@@ -154,6 +164,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
+			if (state.program.table_mode) { // EmitTableMode
+				access.bda_base = state.table_bases.at(mem.resource);
+				access.length   = state.table_lengths.at(mem.resource);
+				return access;
+			}
 			access = PrepareStorageBufferResourceAccess(
 			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
 			access.index_offset =
@@ -187,8 +202,9 @@ bool DeviceStorageBufferBounds(IR::ResourceKind kind) {
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index) {
 	// The device drops out-of-bounds storage buffer loads and stores the same way
-	// (SetDeviceStorageBufferBounds): the check and its branch only held back the shader.
-	if (DeviceStorageBufferBounds(access.kind)) {
+	// (SetDeviceStorageBufferBounds): the check and its branch only held back the shader. (Table mode's
+	// device addresses check themselves the same way: LoadWordInBounds, StoreWordInBounds.)
+	if (DeviceStorageBufferBounds(access.kind) || access.bda_base != 0) {
 		return ConstantBool(state, true);
 	}
 	return EmitMemoryElementInBoundsExplicit(state, access, index);
@@ -223,6 +239,16 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
+	if (access.bda_base != 0) { // table mode: the element at its device address (loads and stores state alignment)
+		const bool wide    = pointer_type == TypeStorageBufferU64ElementPointer(state);
+		const auto bytes   = Binary(state, OpShiftLeftLogical, TypeDeviceAddress(state),
+		                            Unary(state, OpUConvert, TypeDeviceAddress(state), index),
+		                            ConstantU32(state, wide ? 3u : 2u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpConvertUToPtr, wide ? TypePhysicalU64Pointer(state) : TypePhysicalU32Pointer(state),
+		                           pointer, Binary(state, OpIAdd, TypeDeviceAddress(state), access.bda_base, bytes)});
+		return pointer;
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                           ConstantU32(state, 0), index});

@@ -19,6 +19,8 @@ namespace Libs::Graphics {
 
 // 1: reuse PreparedBindings storage across operations (fresh contents each time).
 extern "C" volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+// 1: table dispatches (src/local/table-xpr.inc, KYTY_TABLE_DISPATCH).
+extern "C" volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
 
 struct ShaderStageRuntime;
 

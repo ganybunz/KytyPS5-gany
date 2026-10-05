@@ -393,6 +393,14 @@ struct EmitterState {
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_words {}; // IR::BufferWord, when used
 	std::array<RuntimeFormat, IR::ShaderInfo::MaxBuffers> runtime_formats {}; // by buffer word
+	// Table mode (IR::Program::table_mode, EmitTableMode): each read slot's value (0: not read), each buffer's
+	// device address, size in dwords, stride and buffer word, at the function's entry.
+	std::vector<uint32_t>                            table_slot_values;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_buffer_words {}; // of runtime format buffers
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_bases {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_lengths {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_strides {};
+	bool table_guarded = false; // a table mode subword store inside its bounds check (StoreSubwordInBounds)
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -462,6 +470,7 @@ uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
 uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
@@ -685,6 +694,7 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+void EmitTableMode(ValueEmitContext& ctx);
 
 // The buffer word (IR::BufferWord) of a buffer access's resource, loaded at function entry.
 uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem);
@@ -702,6 +712,7 @@ struct MemoryResourceAccess {
 	uint32_t         index_offset     = 0;
 	uint32_t         byte_offset      = 0;
 	bool             add_index_offset = false;
+	uint32_t         bda_base         = 0; // table mode: the buffer's device address (EmitTableMode)
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);

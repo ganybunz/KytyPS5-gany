@@ -1201,6 +1201,11 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	for (uint32_t i = 0; i < count; ++i) commands[i] = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
 	CheckBuffer();
 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	if (clean && executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
+	                                    uint64_t {m_index_buffer_size} * element,
+	                                    m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
+	                                    nullptr))
+		return count * 5u;
 	// On refusal NativeXprTry has asked the normal path to store when that helps.
 	if (!executor.NativeXprTry(CurrentBuffer(), clean, {commands.data(), count}, m_index_base_addr,
 	                           uint64_t {m_index_buffer_size} * element,
@@ -1216,6 +1221,8 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 
 uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 1);
+	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
+	                               m_sh_ctx.GetPs().ps_regs.data_addr};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
 	// A draw never tried leaves the cached draw-state key behind: the next clean draw would take it.
@@ -1247,6 +1254,10 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	if (index_count == 0 || index_address == 0 || index_address % element != 0) return skip();
 	CheckBuffer();
 	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
+	const auto index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+	if (DrawStateObserver::g_shadow.last_clean &&
+	    executor.TableContinue(CurrentBuffer(), {}, index_address, uint64_t {index_count} * element, index_type, &draw))
+		return size;
 	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, index_address,
 	                           uint64_t {index_count} * element,
 	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))

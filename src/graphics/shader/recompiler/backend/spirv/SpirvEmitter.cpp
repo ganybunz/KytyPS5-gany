@@ -37,7 +37,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 		present[index]   = true;
 		expected[index]  = std::move(resources);
 	};
-	if (!program.info.buffers.empty()) {
+	if (!program.info.buffers.empty() && !program.table_mode) {
 		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -92,7 +92,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
 		     return image.indirect_search_iterations != 0u;
 	     });
-	if (uses_flattened_runtime) {
+	if (uses_flattened_runtime && !program.table_mode) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
@@ -118,7 +118,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.memory_offset_count != (program.table_mode ? 0 : program.info.buffers.size()) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||

@@ -450,6 +450,7 @@ struct BindingLayout {
 	uint32_t                       memory_offset_count = 0;
 	uint32_t                       buffer_word_count = 0; // one per buffer (BufferWord), or none
 	uint32_t                       lod_stats_count = 0;
+	uint32_t                       table_block_dwords = 0; // table mode: the block's device address (TablePlan)
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -459,8 +460,11 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t LodStatsDword() const {
 		return BufferWordDword() + buffer_word_count;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t TableBlockDword() const {
 		return LodStatsDword() + lod_stats_count;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return TableBlockDword() + table_block_dwords;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -555,6 +559,45 @@ struct ResourceBlock {
 	std::vector<uint32_t> sources;
 };
 
+// Table mode (Program::table_mode): the flattened SRT's slots, the V#s of the buffers the shader reads by device
+// address, and the T#s and S#s of its images and samplers. Slot s holds the dword at
+// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned; a descriptor is its words. An
+// operand is an immediate, a user data register or a lower slot. For each draw the renderer evaluates the slots
+// `cpu` marks (those the shader reads, `gpu`, the image and sampler words, which choose its descriptor set, and
+// what their addresses are read through) as the guest memory holds them then, and gives the shader a block: dword s
+// is slot s; from BufferDword(i), buffer i's device address (two dwords), size in dwords (0: none), buffer word
+// and stride, resolved from its V#. The shader reads the block through its device address (TableBlockDword).
+struct TablePlan {
+	struct Operand {
+		enum class Kind : uint8_t { Immediate, UserData, Slot };
+		Kind     kind  = Kind::Immediate;
+		uint32_t value = 0; // the immediate, the scalar register or the slot
+	};
+	struct Slot {
+		Operand low, high, offset;
+		int32_t immediate = 0; // dword aligned
+	};
+	struct Descriptor {
+		std::array<Operand, 8> words {};
+		uint32_t               count = 0;
+	};
+	std::vector<Slot>                   slots;
+	std::vector<std::array<Operand, 4>> buffers;
+	std::vector<Descriptor>             images, samplers;
+	std::vector<uint8_t>                gpu, cpu; // per slot
+	// Flat or global memory reads: the renderer readies their page table ranges at every use, from the block's slots
+	// and the user data (CompiledShaderInfo::bda_read_plan), as the normal path's PrepareBdaBindings does.
+	bool global_memory = false;
+
+	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word (IR::BufferWord, as
+	// IR::BufferDescriptorWord makes it) and stride, all from the V# the renderer resolved.
+	static constexpr uint32_t BufferDwords = 5;
+	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
+		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
+	}
+	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	BdaReadPlan bda_read_plan;
@@ -565,6 +608,8 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
+	bool                          table_mode          = false; // see Program::table_mode
+	TablePlan                     table_plan;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -631,6 +676,10 @@ struct Program: ResourcePlan {
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+	// Table mode (EnterTableMode): the SRT reads and the buffers' V#s come from guest memory through the BDA
+	// page table at run time, user data from push constants; no flattened SRT, buffer or shader-data binding.
+	bool                          table_mode = false;
+	TablePlan                     table_plan;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

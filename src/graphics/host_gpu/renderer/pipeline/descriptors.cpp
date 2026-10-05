@@ -1056,16 +1056,31 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto acquirable    = [&](const TextureBinding& binding) { return AcquirableImage(binding); };
 	// Resolving one image (discovery can merge or replace owners) or acquiring one (a refresh) can take
 	// another one's away: both repeat until every image holds (a stale image met only at its acquisition
-	// ended a load at 1-1 with "texture requires rediscovery").
+	// ended a load at 1-1 with "texture requires rediscovery"). Views of aliased memory that the texture cache
+	// cannot keep as one image take each other's away for ever (the Shrine, 10-05): past half the passes, an
+	// image that still does not hold is bound as a null image.
 	for (uint32_t attempt = 0;; ++attempt) {
 		for (uint32_t pass = 0; !std::ranges::all_of(images, acquirable); ++pass) {
 			if (pass + attempt == 16) EXIT("RebindImages: the images of a binding do not settle\n");
+			const bool null = pass + attempt >= 8;
 			for (uint32_t i = 0; i < program.info.images.size(); i++) {
 				if (acquirable(images[i])) continue;
 				if (auto* old_image = texture_cache.m_slot_images.try_get(images[i].image_id)) {
 					old_image->binding = {};
 				}
-				images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				if (null) {
+					static std::atomic<uint32_t> reports {0};
+					if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+						std::printf("RebindImages: shader 0x%016" PRIx64 " image %u does not settle, bound as null\n",
+						            program.shader_hash, i);
+					const auto& resource = program.info.images[i];
+					auto        desc     = NullTextureDesc(resource, resource.written ? TextureCache::BindingType::Storage
+					                                                                  : TextureCache::BindingType::Texture);
+					const auto  id       = texture_cache.FindImage(desc);
+					images[i]            = {id, nullptr, std::move(desc)};
+				} else {
+					images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				}
 				BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
 			}
 		}

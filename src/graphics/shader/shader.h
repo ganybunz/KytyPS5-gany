@@ -280,6 +280,10 @@ void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 // Offline capture: the registered data for a shader address, if any.
 bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out);
+// Moves with every registration (ShaderMapUserData): what was compiled for an address may be stale.
+[[nodiscard]] uint64_t ShaderMapGeneration();
+// The hash the pipeline cache knows the shader registered at `addr` by (the code's), 0 when none is.
+[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

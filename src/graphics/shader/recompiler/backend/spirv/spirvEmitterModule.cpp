@@ -125,6 +125,10 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
 
+uint32_t TypePhysicalU64Pointer(EmitterState& state) {
+	return TypePointer(state, StorageClassPhysicalStorageBuffer, TypeScalarU64(state));
+}
+
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, StorageClassPushConstant, TypeU32(state));
 }

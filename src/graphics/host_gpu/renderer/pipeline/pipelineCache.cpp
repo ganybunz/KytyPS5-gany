@@ -369,6 +369,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		bool                                         table_mode = false; // an empty handle: refused
 	};
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file.
@@ -377,6 +378,22 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		uint64_t                                     spirv_offset = 0;
 		size_t                                       spirv_words  = 0;
+	};
+
+	// A table mode permutation a compile worker translates (Get): the next Get of its specialization and push data
+	// start publishes it. It owns what the translation reads.
+	struct TableJob {
+		ShaderRecompiler::IR::ResourceSpecialization   specialization;
+		uint32_t                                       push_data_cursor = 0;
+		std::vector<uint32_t>                          code, back_code, user_data;
+		ShaderVertexInputInfo                          vertex;
+		ShaderPixelInputInfo                           pixel;
+		ShaderComputeInputInfo                         compute;
+		ShaderRecompiler::CompileOptions               options;
+		std::optional<ShaderRecompiler::CompileResult> result;
+		vk::ShaderModule                               module = nullptr; // the result's, made by the worker
+		std::string                                    refused;
+		std::atomic<bool>                              done {false};
 	};
 
 	struct SourceEntry {
@@ -396,7 +413,15 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t> warm_code, warm_back_code;
 		// Prefetched permutations not used yet (AdoptPrefetchedModule).
 		std::vector<PrefetchedModule> prefetched;
+		// Table mode permutations being translated.
+		std::vector<std::shared_ptr<TableJob>> table_jobs;
 	};
+	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
+	std::function<void(std::function<void()>)> push_job;
+	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
+	// completion.
+	bool                                     table_pending = false;
+	std::shared_ptr<const std::atomic<bool>> table_waiting;
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -616,10 +641,11 @@ struct PipelineCache::ProgramCache {
 	// The device half of CompilePermutation; the SPIR-V may come from a warmup worker.
 	Permutation FinishPermutation(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
 	                              ShaderRecompiler::CompileResult              result,
-	                              ShaderRecompiler::IR::ResourceSpecialization specialization) {
+	                              ShaderRecompiler::IR::ResourceSpecialization specialization,
+	                              vk::ShaderModule                             module = nullptr) {
 		DumpShaderOriginal(StageName(options.stage), options.shader_hash, params.code, result.decoded_dump);
 		auto permutation = ModulePermutation(options, result.spirv, std::move(result.program).TakeCompiledInfo(),
-		                                     std::move(specialization));
+		                                     std::move(specialization), module);
 		if (options.dump_ir) {
 			if (!options.early_dump) {
 				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());
@@ -643,10 +669,9 @@ struct PipelineCache::ProgramCache {
 		return name;
 	}
 
-	// The shader module of a program's SPIR-V (translated here, by a warmup worker or the prefetch).
-	Permutation ModulePermutation(const ShaderRecompiler::CompileOptions& options, const std::vector<uint32_t>& spirv,
-	                              ShaderRecompiler::IR::CompiledShaderInfo     program,
-	                              ShaderRecompiler::IR::ResourceSpecialization specialization) {
+	// The shader module of a program's SPIR-V, on any thread (a compile worker makes a table mode program's).
+	static vk::ShaderModule CreateModule(vk::Device device, const ShaderRecompiler::CompileOptions& options,
+	                                     const std::vector<uint32_t>& spirv) {
 		const char* stage_name = StageName(options.stage);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
@@ -670,6 +695,16 @@ struct PipelineCache::ProgramCache {
 		EXIT_IF(module == nullptr);
 		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
 		                     options.shader_hash);
+		return module;
+	}
+
+	// A program's permutation and its shader module (`module`: made already, else here); its SPIR-V translated here,
+	// by a warmup worker, the prefetch or a compile worker.
+	Permutation ModulePermutation(const ShaderRecompiler::CompileOptions& options, const std::vector<uint32_t>& spirv,
+	                              ShaderRecompiler::IR::CompiledShaderInfo     program,
+	                              ShaderRecompiler::IR::ResourceSpecialization specialization,
+	                              vk::ShaderModule                             module = nullptr) {
+		if (module == nullptr) module = CreateModule(device, options, spirv);
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(program),
@@ -678,8 +713,10 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
+	// `table_mode`: the permutation compiled in table mode (ShaderRecompiler::IR::EnterTableMode), empty
+	// when the program does not allow it.
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
@@ -741,6 +778,24 @@ struct PipelineCache::ProgramCache {
 		ShaderReadObserver::Runtime observed_runtime(input_runtime);
 		const auto& runtime = observed_runtime.Get();
 		ShaderRecompiler::IR::MaterializeReport report;
+		// Table mode reads every buffer's stride from the renderer (EmitTableMode) and decodes the formats the
+		// specialization chose, as the specialized module does (the renderer checks every use's V#s against them,
+		// TableBlocks), but for the buffers of `table_portable` (bits by buffer) whose V#s were seen to change format:
+		// those decode the buffer word's (IR::PortableFormats). Its permutation is that, whatever the base's low bits.
+		ShaderRecompiler::IR::ResourceSpecialization table_specialization;
+		const auto table_form = [&](const ShaderRecompiler::IR::ResourceSpecialization& value) {
+			table_specialization = value;
+			const auto& buffers  = entry->second.resource_plan.info.buffers;
+			for (size_t i = 0; i < table_specialization.buffers.size(); ++i) {
+				auto& buffer            = table_specialization.buffers[i];
+				buffer.byte_base_offset = false;
+				if (i < 32 && ((table_portable >> i) & 1u) != 0 && i < buffers.size() &&
+				    ShaderRecompiler::IR::RuntimeBufferFormat(buffers[i])) {
+					buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
+					buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
+				}
+			}
+		};
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
 			if (!ReportMaterialization(label, stage, params.hash, report,
@@ -748,8 +803,9 @@ struct PipelineCache::ProgramCache {
 			                               entry->second.resource_plan, runtime, resources, specialization,
 			                               &report, &entry->second.specialization_guard, &borrowed_specialization)))
 				return {};
+			if (table_mode) table_form(borrowed_specialization ? *borrowed_specialization : specialization);
 			const auto& active_specialization =
-			    borrowed_specialization ? *borrowed_specialization : specialization;
+			    table_mode ? table_specialization : borrowed_specialization ? *borrowed_specialization : specialization;
 			const auto compatible_push_data = [&](const Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
 				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
@@ -757,13 +813,13 @@ struct PipelineCache::ProgramCache {
 			};
 			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
-				        return compatible_push_data(candidate) &&
+				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
 				               candidate.specialization == active_specialization;
 			        }); };
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
 			auto& source = entry->second;
-			if (borrowed_specialization && source.guarded_permutation &&
+			if (!table_mode && borrowed_specialization && source.guarded_permutation &&
 			    source.guarded_publication == source.specialization_guard.publication &&
 			    compatible_push_data(*source.guarded_permutation)) {
 				const auto* selected = source.guarded_permutation;
@@ -773,9 +829,10 @@ struct PipelineCache::ProgramCache {
 			}
 			if (const auto permutation = find_permutation();
 			    permutation != entry->second.permutations.end()) {
+				if (!permutation->handle) return {}; // table mode refused
 				// Only a borrowed result certifies this exact guard publication.
 				// An ineligible reference transaction must not relabel an old guard.
-				if (borrowed_specialization) {
+				if (borrowed_specialization && !table_mode) {
 					source.guarded_permutation = &*permutation;
 					source.guarded_publication = source.specialization_guard.publication;
 				}
@@ -814,6 +871,80 @@ struct PipelineCache::ProgramCache {
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
+		}
+		// Table mode: a program the normal path compiled first, in the table form of its specialization, translated
+		// by a compile worker (table_pending until then); a refused one keeps an empty permutation.
+		if (table_mode) {
+			if (entry == programs.end()) return {};
+			auto&      jobs  = entry->second.table_jobs;
+			const auto found = std::ranges::find_if(jobs, [&](const auto& job) {
+				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
+			});
+			if (found == jobs.end()) {
+				auto job              = std::make_shared<TableJob>();
+				job->specialization   = table_specialization;
+				job->push_data_cursor = push_data_cursor;
+				job->code.assign(params.code.begin(), params.code.end());
+				job->back_code.assign(params.back_code.begin(), params.back_code.end());
+				job->user_data         = params.user_data;
+				job->options           = options;
+				job->options.table_mode = true;
+				job->options.user_data = job->user_data;
+				job->options.back_code = job->back_code;
+				job->options.input_info = {};
+				if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+					job->vertex                    = input_info;
+					job->options.input_info.vertex = &job->vertex;
+				} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+					job->pixel                    = input_info;
+					job->options.input_info.pixel = &job->pixel;
+				} else {
+					job->compute                    = input_info;
+					job->options.input_info.compute = &job->compute;
+				}
+				jobs.push_back(job);
+				push_job([job, device = device] {
+					try {
+						Common::RecoverableExitScope recoverable;
+						auto translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
+						job->result     = ShaderRecompiler::CompileProgram(std::move(translated), job->options,
+						                                                   job->specialization, job->push_data_cursor);
+						job->module     = CreateModule(device, job->options, job->result->spirv);
+					} catch (const Common::RecoverableExit& refused) {
+						job->refused = refused.message;
+					}
+					job->done.store(true, std::memory_order_release);
+				});
+				table_pending = true;
+				table_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+				return {};
+			}
+			const auto job = *found;
+			if (!job->done.load(std::memory_order_acquire)) {
+				table_pending = true;
+				table_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+				return {};
+			}
+			jobs.erase(found);
+			Permutation permutation {.specialization = table_specialization, .table_mode = true};
+			if (job->result) {
+				const ShaderParams job_params {.code = job->code, .user_data = job->user_data, .hash = params.hash,
+				                               .back_code = job->back_code};
+				permutation = FinishPermutation(job_params, job->options, std::move(*job->result),
+				                                ShaderRecompiler::IR::ResourceSpecialization {table_specialization},
+				                                job->module);
+				permutation.table_mode = true;
+			} else {
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
+					std::printf("Table: %s 0x%016llx: %s", label, static_cast<unsigned long long>(params.hash),
+					            job->refused.c_str());
+			}
+			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
+			if (!stored.handle) return {};
+			publish_stage(stored.program);
+			stored.program.bindings.AdvancePushData(push_data_cursor);
+			return stored.handle;
 		}
 		// A program met for the first time that the prefetch translated: its plan, materialized for
 		// this draw, and its modules are taken over.
@@ -1107,6 +1238,13 @@ struct PipelineCache::ProgramCache {
 };
 
 // A pipeline a CompileWorkers thread creates; `done` publishes the finished object.
+struct PipelineCache::PendingComputePipeline {
+	std::unique_ptr<Pipeline> pipeline = std::make_unique<Pipeline>();
+	ShaderComputeInputInfo    input_info;
+	vk::ShaderModule          module = nullptr;
+	std::atomic<bool>         done {false};
+};
+
 struct PipelineCache::PendingGraphicsPipeline {
 	std::unique_ptr<Pipeline> pipeline = std::make_unique<Pipeline>();
 	PipelineRenderingState    rendering;
@@ -1125,8 +1263,13 @@ struct PipelineCache::PendingGraphicsPipeline {
 // Vulkan recording layer only intercepts the render thread's own calls).
 class PipelineCache::CompileWorkers {
 public:
-	explicit CompileWorkers(uint32_t count) {
-		for (uint32_t i = 0; i < count; i++) m_threads.emplace_back([this] { Run(); });
+	// background: below-normal priority off the render CPUs, and jobs still queued at shutdown are dropped.
+	explicit CompileWorkers(uint32_t count, bool background = false): m_background(background) {
+		for (uint32_t i = 0; i < count; i++)
+			m_threads.emplace_back([this] {
+				if (m_background) LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+				Run();
+			});
 	}
 	~CompileWorkers() {
 		{
@@ -1153,7 +1296,7 @@ private:
 				std::unique_lock lock(m_mutex);
 				m_wake.wait(lock, [this] { return m_stop || !m_jobs.empty(); });
 				// Queued jobs still run at shutdown: their pipelines are destroyed with the rest.
-				if (m_jobs.empty()) return;
+				if (m_jobs.empty() || (m_stop && m_background)) return;
 				job = std::move(m_jobs.front());
 				m_jobs.pop_front();
 			}
@@ -1165,6 +1308,7 @@ private:
 	std::condition_variable           m_wake;
 	std::deque<std::function<void()>> m_jobs;
 	bool                              m_stop = false;
+	const bool                        m_background;
 	std::vector<std::thread>          m_threads;
 };
 
@@ -1173,6 +1317,14 @@ PipelineCache::CompileWorkers& PipelineCache::Workers() {
 		m_compile_workers = std::make_unique<CompileWorkers>(2);
 	}
 	return *m_compile_workers;
+}
+
+PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
+	if (m_table_workers == nullptr) {
+		// As many as the shader prefetch's (background threads: they take no time the game's threads want).
+		m_table_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 2u), true);
+	}
+	return *m_table_workers;
 }
 
 // KYTY_PIPELINE_FAST_BUILD=0: a pipeline no cache holds is compiled optimized before its first use
@@ -1223,7 +1375,15 @@ void PipelineCache::PromoteOptimized() {
 	});
 }
 
+// A table mode pipeline's compile finished (the table cache saver waits for them to settle).
+void PipelineCache::TablePipelineDone() {
+	m_table_pipeline_last_done.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+	m_table_pipelines_done.fetch_add(1, std::memory_order_release);
+	m_table_pipeline_jobs.fetch_sub(1, std::memory_order_release);
+}
+
 void PipelineCache::FinishCompileWorkers() {
+	m_table_cache_saver = {}; // (stops and joins it)
 	if (auto& prefetch = m_program_cache->prefetch; prefetch != nullptr) {
 		if (prefetch->ready.load(std::memory_order_acquire))
 			PipelineCacheLog("Shader prefetch: {} of {} programs translated; the game took over {} of them ({} modules) "
@@ -1233,6 +1393,7 @@ void PipelineCache::FinishCompileWorkers() {
 		prefetch.reset();
 	}
 	m_stopping.store(true, std::memory_order_relaxed);
+	m_table_workers.reset();
 	m_compile_workers.reset();
 	if (m_unoptimized_builds != 0) {
 		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
@@ -1255,6 +1416,7 @@ static std::filesystem::path StaticInputsPath() {
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
 	InitializeDriverCache();
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
 	InitializeStaticCache(false);
@@ -1440,6 +1602,9 @@ PipelineCache::~PipelineCache() {
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
+	if (m_table_cache != nullptr) {
+		m_graphics.device.destroyPipelineCache(m_table_cache, nullptr);
+	}
 	if (m_static_cache != nullptr) {
 		m_graphics.static_pipeline_cache = nullptr;
 		m_graphics.device.destroyPipelineCache(m_static_cache, nullptr);
@@ -1559,8 +1724,47 @@ void PipelineCache::InitializeDriverCache() {
 		m_driver_cache_path = std::filesystem::path("_PipelineCache") / "local" /
 		                      m_driver_cache_key / (title_id + ".bin");
 	}
-	const auto path         = Common::PathToString(m_driver_cache_path);
-	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+	// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile up in it, so past
+	// 1 GiB (one build's warmup is ~130 MB) it starts over.
+	m_driver_cache = LoadDriverCache(m_driver_cache_path, uint64_t {1} << 30u, m_driver_cache_saved_size);
+	if (m_driver_cache == nullptr) return;
+	// Table mode pipelines (src/local/table-xpr.inc) in a cache of their own: the static precompile holds none of
+	// them (each compiles in ~0.1-4 s), they are saved once their compiles settle (not only at a clean exit), and
+	// they do not push the main cache past its limit.
+	m_table_cache_path = m_driver_cache_path;
+	m_table_cache_path.replace_extension(".table.bin");
+	m_table_cache = LoadDriverCache(m_table_cache_path, uint64_t {2} << 30u, m_table_cache_saved_size);
+	if (m_table_cache == nullptr) return;
+	m_table_cache_saver = std::jthread([this](std::stop_token stop) {
+		LocalPlatform::SetThreadName("Kyty.TableCache");
+		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+		std::mutex                  mutex;
+		std::condition_variable_any wake;
+		uint64_t                    saved = m_table_pipelines_done.load();
+		while (!stop.stop_requested()) {
+			{
+				std::unique_lock lock(mutex);
+				wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
+			}
+			// Once no table pipeline has compiled for 20 s (a burst of new pairs settled).
+			const auto done = m_table_pipelines_done.load(std::memory_order_acquire);
+			const auto last = std::chrono::steady_clock::time_point(
+			    std::chrono::steady_clock::duration(m_table_pipeline_last_done.load(std::memory_order_acquire)));
+			if (stop.stop_requested() || done == saved || m_table_pipeline_jobs.load(std::memory_order_acquire) != 0 ||
+			    std::chrono::steady_clock::now() - last < std::chrono::seconds(20))
+				continue;
+			std::lock_guard save(m_table_cache_mutex);
+			if (SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size)) saved = done;
+		}
+	});
+}
+
+// A driver pipeline cache file: the signature (GPU, driver and cache key), the payload's XXH3, the payload; one
+// past `limit` bytes starts over. Null: the cache is disabled.
+vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit,
+                                                 size_t& loaded_size) {
+	const auto path         = Common::PathToString(file_path);
+	const bool cache_exists = Common::File::IsFileExisting(file_path);
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
 	} else {
@@ -1568,12 +1772,10 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	std::vector<uint8_t> initial_data;
 	if (cache_exists) {
-		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
+		Common::File file(file_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
-		// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile
-		// up in it, so past 1 GiB (one build's warmup is ~130 MB) it starts over.
-		if (file_size > (uint64_t {1} << 30u)) {
+		if (file_size > limit) {
 			file.Close();
 			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes)", path, file_size);
 		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
@@ -1604,56 +1806,51 @@ void PipelineCache::InitializeDriverCache() {
 		}
 	}
 
+	vk::PipelineCache           cache = nullptr;
 	vk::PipelineCacheCreateInfo create {};
 	create.initialDataSize = initial_data.size();
 	create.pInitialData    = initial_data.empty() ? nullptr : initial_data.data();
-	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &cache);
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
 		                 vk::to_string(result));
 		initial_data.clear();
 		create.initialDataSize = 0;
 		create.pInitialData    = nullptr;
-		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+		result = m_graphics.device.createPipelineCache(&create, nullptr, &cache);
 	}
 	if (result != vk::Result::eSuccess) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", vk::to_string(result));
-		m_driver_cache = nullptr;
-		return;
+		return nullptr;
 	}
-	m_driver_cache_saved_size = initial_data.size();
+	loaded_size = initial_data.size();
 	if (!initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
 		                 path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	return cache;
 }
 
-bool PipelineCache::Save() {
-	Common::LockGuard lock(m_mutex);
-	const bool inputs_saved = m_program_cache->warmup.Save();
-	if (!inputs_saved) PipelineCacheLog("Shader warmup: cache save failed");
-	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
-	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
-	if (m_driver_cache == nullptr) {
-		return inputs_saved;
-	}
-
+// Written to a temporary file renamed to `file_path`, unless nothing compiled since it was loaded or saved
+// (`saved_size`). The cache stays in use: a save right after the warmup destroyed it, so nothing compiled later
+// in that session (native XPR variants, first uses, optimized builds) was cached or saved at the exit.
+bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& file_path,
+                                    size_t& saved_size) {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+		result = m_graphics.device.getPipelineCacheData(cache, &size, nullptr);
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
-		// Nothing compiled since it was loaded or saved (the window's exit and the destructor both save).
-		if (size == m_driver_cache_saved_size) return inputs_saved;
+		if (size == saved_size) return true;
 		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+		result = m_graphics.device.getPipelineCacheData(cache, &size, payload.data());
 		if (result != vk::Result::eIncomplete) {
 			break;
 		}
@@ -1668,11 +1865,11 @@ bool PipelineCache::Save() {
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+	if (!Common::File::CreateDirectories(file_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return false;
 	}
-	auto temp_path = m_driver_cache_path;
+	auto temp_path = file_path;
 	temp_path += ".tmp";
 	Common::File file;
 	uint32_t     prefix_written  = 0;
@@ -1684,17 +1881,28 @@ bool PipelineCache::Save() {
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+	    !Common::File::RenameFile(temp_path, file_path)) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}", Common::PathToString(file_path));
 		return false;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
-	// The cache stays in use: a save right after the warmup destroyed it, so nothing compiled later in that
-	// session (native XPR variants, first uses, optimized builds) was cached or saved at the exit.
-	m_driver_cache_saved_size = payload.size();
-	return inputs_saved;
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(), Common::PathToString(file_path));
+	saved_size = payload.size();
+	return true;
+}
+
+bool PipelineCache::Save() {
+	Common::LockGuard lock(m_mutex);
+	const bool inputs_saved = m_program_cache->warmup.Save();
+	if (!inputs_saved) PipelineCacheLog("Shader warmup: cache save failed");
+	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
+	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
+	bool saved = inputs_saved;
+	if (m_driver_cache != nullptr) saved &= SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+	if (m_table_cache != nullptr) {
+		std::lock_guard table(m_table_cache_mutex);
+		saved &= SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size);
+	}
+	return saved;
 }
 
 namespace {
@@ -1773,8 +1981,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, bool table_mode,
+    std::array<uint32_t, 2> table_portable) {
 	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
+	m_program_cache->table_pending = false;
+	m_program_cache->table_waiting.reset();
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
 	PrepareProgramInto(vertex_regs, context, user_config, vertex_info, vertex_params);
@@ -1820,24 +2031,26 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, table_mode, table_portable[1]);
 	}
-	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, table_mode, table_portable[0]);
 	return result;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
-                                               std::string*                 unevaluated) {
+                                               std::string* unevaluated, bool table_mode, uint32_t table_portable) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	// Reused per thread: every dispatch prepares one (its user data was a new vector each time).
 	thread_local ShaderParams params;
 	PrepareProgramInto(regs, sh, input_info, params);
 	Common::LockGuard lock(m_mutex);
+	m_program_cache->table_pending = false;
+	m_program_cache->table_waiting.reset();
 	uint32_t          push_data_cursor = 0;
 	g_unevaluated     = unevaluated;
-	const auto program = m_program_cache->Get(params, input_info, push_data_cursor);
+	const auto program = m_program_cache->Get(params, input_info, push_data_cursor, table_mode, table_portable);
 	g_unevaluated     = nullptr;
 	return program;
 }
@@ -2035,6 +2248,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		if (auto pending = m_pending_graphics_pipelines.find(key);
 		    pending != m_pending_graphics_pipelines.end()) {
 			if (!pending->second->done.load(std::memory_order_acquire)) {
+				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
 			auto finished = std::move(pending->second->pipeline);
@@ -2060,14 +2274,19 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			job->ps_input_info = *ps_input_info;
 		}
 		m_pending_graphics_pipelines.emplace(key, job);
-		Workers().Push([this, job] {
+		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
+		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
+		(table ? TableWorkers() : Workers()).Push([this, job, table] {
 			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
 			                       job->vs_input_info, job->vertex_program,
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
-			                       job->static_params, m_driver_cache, job->native_bindings);
+			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
+			                       job->native_bindings);
+			if (table) TablePipelineDone();
 			job->done.store(true, std::memory_order_release);
 		});
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
+		m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;
 	}
 
@@ -2172,6 +2391,47 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	return *iter->second;
+}
+bool PipelineCache::TablePending() const {
+	return m_program_cache->table_pending;
+}
+
+std::shared_ptr<const std::atomic<bool>> PipelineCache::TableWaiting() const {
+	return m_program_cache->table_waiting;
+}
+
+PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                                 const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	Common::LockGuard lock(m_mutex);
+	PromoteOptimized();
+	if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end())
+		return iter->second.get();
+	if (auto pending = m_pending_compute_pipelines.find(compute_program.id);
+	    pending != m_pending_compute_pipelines.end()) {
+		if (!pending->second->done.load(std::memory_order_acquire)) {
+			m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
+			return nullptr;
+		}
+		auto finished = std::move(pending->second->pipeline);
+		m_pending_compute_pipelines.erase(pending);
+		EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
+		return m_compute_pipelines.emplace(compute_program.id, std::move(finished)).first->second.get();
+	}
+	auto job        = std::make_shared<PendingComputePipeline>();
+	job->input_info = input_info;
+	job->module     = compute_program.module;
+	m_pending_compute_pipelines.emplace(compute_program.id, job);
+	m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
+	TableWorkers().Push([this, job] { // (table dispatches' pipelines)
+		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, TablePipelineCache(),
+		                       PipelineBuild::Full, true);
+		TablePipelineDone();
+		job->done.store(true, std::memory_order_release);
+	});
+	LiveCounters::Add(LiveCounters::AsyncPipelines);
+	m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+	return nullptr;
 }
 #ifdef KYTY_STATIC_PRECOMPILE
 #include "staticPrecompile.inc"

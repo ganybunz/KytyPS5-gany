@@ -20,6 +20,7 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	bool                        enable_lod_stats           = false;
+	bool                        table_mode                 = false; // IR::EnterTableMode
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

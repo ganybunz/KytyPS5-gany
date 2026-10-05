@@ -39,6 +39,9 @@ extern volatile std::atomic_uint32_t kyty_local_native_xpr_relocate_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_store_budget;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_keep_frames;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_instance_mode;
+extern volatile std::atomic_uint32_t kyty_local_table_xpr_mode;
+extern volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
+extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 #endif
 }
 
@@ -107,6 +110,12 @@ inline void InitializePerformanceSwitches() {
 	    // Frames an unused native XPR record stays (at least 2).
 	    Switch {"KYTY_NATIVE_XPR_KEEP_FRAMES", &kyty_local_native_xpr_keep_frames, 0, 1000000},
 	    Switch {"KYTY_NATIVE_XPR_INSTANCES", &kyty_local_native_xpr_instance_mode},
+	    // Table draws (src/local/table-xpr.inc), with native XPR draws; 2 also continues clean runs.
+	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
+	    // Table dispatches (src/local/table-xpr.inc).
+	    Switch {"KYTY_TABLE_DISPATCH", &kyty_local_table_dispatch_mode},
+	    // Table store requests per frame (0: no limit).
+	    Switch {"KYTY_TABLE_STORE_BUDGET", &kyty_local_table_store_budget, 0, 65536},
 #endif
 	};
 	std::string enabled;
