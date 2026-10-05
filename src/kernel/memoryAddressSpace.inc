@@ -1279,12 +1279,16 @@ public:
 		return unmapped;
 	}
 
+	// The free-range queries below only read, so they share the lock with the page trackers'
+	// protection changes (ProtectTransient, hundreds a frame on the render thread). Taken
+	// exclusively, the hundreds of queries of one hint-less guest mapping (FindGuestFreeRange)
+	// kept the render thread waiting up to 15 ms at a time while rolling in Boletaria.
 	uint64_t ReserveAligned(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 		if (size == 0) {
 			return 0;
 		}
 		alignment = std::max<uint64_t>(alignment != 0 ? alignment : PageSize(), PageSize());
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		if (search_addr == 0) {
 			auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN,
 			                                    HOST_SYSTEM_MANAGED_MAX + 1u, size, alignment);
@@ -1301,7 +1305,7 @@ public:
 			return 0;
 		}
 		alignment = std::max<uint64_t>(alignment, PageSize());
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
 	}
 
@@ -1309,7 +1313,7 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
@@ -1321,7 +1325,7 @@ public:
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
@@ -1721,8 +1725,17 @@ private:
 		if (search_start >= search_end || size > search_end - search_start) {
 			return 0;
 		}
-		for (const auto& [base, range_size]: m_free) {
-			const auto candidate = AlignUp(std::max(base, search_start), alignment);
+		// The free ranges are sorted and disjoint: the first that can hold a candidate at or past
+		// search_start is the one containing it (or the next). Scanning from the bottom of the
+		// address space walked thousands of free ranges below it, again for each guest
+		// reservation a hint-less mapping skips (FindGuestFreeRange).
+		auto it = m_free.upper_bound(search_start);
+		if (it != m_free.begin()) {
+			--it;
+		}
+		for (; it != m_free.end() && it->first < search_end; ++it) {
+			const auto& [base, range_size] = *it;
+			const auto candidate           = AlignUp(std::max(base, search_start), alignment);
 			if (candidate < search_end && size <= search_end - candidate &&
 			    GuestFreeRangeContains(base, range_size, candidate, size)) {
 				return candidate;
