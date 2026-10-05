@@ -29,6 +29,9 @@ struct RedZonePatchResult {
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
                                 uint64_t trampoline_area_size);
 void UnregisterRedZonePatchModule(void* module_ptr);
+// Guest code addresses of red-zone memory instructions no patch protects (a fault there overwrites the
+// guest's red zone with the exception frame): the exception handler reports faults at them.
+bool IsUnprotectedRedZoneSite(uint64_t address);
 
 RedZonePatchResult PatchRedZoneMemoryInstructions(uint64_t segment_addr, uint64_t segment_size,
                                                   std::span<const uintptr_t> function_starts);

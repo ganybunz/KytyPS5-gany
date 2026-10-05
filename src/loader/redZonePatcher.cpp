@@ -113,6 +113,20 @@ static ZyanStatus DecodeInstruction(ZydisDecodedInstruction& instruction,
 #endif
 #if defined(_WIN32)
 
+// The unprotected red-zone sites of every loaded module (IsUnprotectedRedZoneSite).
+static std::mutex            g_unprotected_sites_mutex;
+static std::vector<uint64_t> g_unprotected_sites;
+
+static void RecordUnprotectedRedZoneSite(uint64_t address) {
+	std::lock_guard lock(g_unprotected_sites_mutex);
+	g_unprotected_sites.insert(std::upper_bound(g_unprotected_sites.begin(), g_unprotected_sites.end(), address), address);
+}
+
+bool IsUnprotectedRedZoneSite(uint64_t address) {
+	std::lock_guard lock(g_unprotected_sites_mutex);
+	return std::binary_search(g_unprotected_sites.begin(), g_unprotected_sites.end(), address);
+}
+
 namespace {
 
 constexpr size_t GuestRedZoneSize = 128;
@@ -1249,6 +1263,22 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 						return std::nullopt;
 					}
 				}
+				// Red-zone sites right after the span go into it: on their own they may have no room for
+				// a jump (a 2-byte store before an unconditional jmp, with the span before it already
+				// patched: Demon's Souls' +0x1fd80e and +0x1fd825, a float kept at -4(rsp) across them).
+				// Only fall-through instructions that are no branch target join; behaviour is the same.
+				while (!IsControlFlowTerminator(span.instructions.back()->instruction) &&
+				       !function.branch_targets.contains(span.continuation)) {
+					const auto next     = function.instructions.find(span.continuation);
+					const auto next_rew = rewrite_sites.find(span.continuation);
+					if (next == function.instructions.end() || next_rew == rewrite_sites.end() ||
+					    !next_rew->second.protect_red_zone || next_rew->second.protected_indirect_call) {
+						break;
+					}
+					span.instructions.push_back(&next->second);
+					span.patch_size += next->second.instruction.length;
+					span.continuation += next->second.instruction.length;
+				}
 				return span;
 			};
 
@@ -1334,6 +1364,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			const auto& rewrite = rewrite_sites.at(site);
 			if (rewrite.protect_red_zone) {
 				++result.unrelocatable_memory_instruction_count;
+				RecordUnprotectedRedZoneSite(site);
 				LOGF("Windows guest red-zone: unprotected memory instruction at +0x%" PRIx64
 				     " in function +0x%" PRIx64 "\n",
 				     static_cast<u64>(site - reinterpret_cast<uintptr_t>(module->start)),

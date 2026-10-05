@@ -853,6 +853,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
 		}
+		// A fault at a red-zone memory instruction no patch protects: Windows has already written the
+		// exception frame over the guest's red zone (the values the function keeps below rsp are lost).
+		if (Loader::IsUnprotectedRedZoneSite(info->exception_address)) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+				std::printf("RED_ZONE_CLOBBER: fault at unprotected red-zone site %s (address 0x%016" PRIx64 ")\n",
+				            DescribeGuestAddress(info->exception_address).c_str(), info->access_violation_vaddr);
+				std::fflush(stdout);
+			}
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
 			return true;
