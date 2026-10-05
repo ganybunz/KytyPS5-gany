@@ -85,6 +85,47 @@ inline void Flip() {
 	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                     std::memory_order_relaxed);
 	g_flips.store(flip + 1, std::memory_order_release);
+	// KYTY_FRAME_LOG=<path>: one CSV line per frame (flip to flip on the render thread), so frame-time
+	// percentiles and every hitch can be read without a hitch threshold. The wait columns are the render
+	// thread's waits as LiveCensus times them; they nest (download_wait encloses waits that also count in
+	// gpu_wait and readback_wait), so they are not to be added up.
+	static FILE* frame_log = [] {
+		const char* path = std::getenv("KYTY_FRAME_LOG");
+		FILE*       file = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
+		if (file != nullptr) {
+			std::fprintf(file, "frame,end_ms,frame_ms,idle_ms,gpu_wait_ms,readback_wait_ms,download_wait_ms,compile_ms,"
+			                   "sync_downloads,async_readbacks,region_syncs,upload_kib,full_upload_kib\n");
+		}
+		return file;
+	}();
+	if (frame_log != nullptr) {
+		using C = LiveCounters::Id;
+		static constexpr std::array counted {C::SyncDownloads, C::AsyncReadbacks, C::RegionSyncs, C::UploadBytes,
+		                                     C::FullUploadBytes};
+		static std::chrono::steady_clock::time_point  start = std::chrono::steady_clock::now(), last {};
+		static int64_t                                last_idle = 0;
+		static std::array<int64_t, LiveCensus::Waits> last_waits {};
+		static std::array<uint64_t, counted.size()>   last_counts {};
+		const auto                                    now = std::chrono::steady_clock::now();
+		if (last != std::chrono::steady_clock::time_point {}) {
+			std::array<uint64_t, counted.size()> delta {};
+			for (size_t i = 0; i < counted.size(); ++i) delta[i] = LiveCounters::Value(counted[i]) - last_counts[i];
+			std::fprintf(frame_log, "%llu,%.3f,%.3f,%.3f", static_cast<unsigned long long>(flip),
+			             std::chrono::duration<double, std::milli>(now - start).count(),
+			             std::chrono::duration<double, std::milli>(now - last).count(),
+			             static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
+			for (size_t i = 0; i < LiveCensus::Waits && i < 4; ++i)
+				std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_waits_ns[i] - last_waits[i]) / 1e6);
+			std::fprintf(frame_log, ",%llu,%llu,%llu,%llu,%llu\n", static_cast<unsigned long long>(delta[0]),
+			             static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(delta[2]),
+			             static_cast<unsigned long long>(delta[3] >> 10u), static_cast<unsigned long long>(delta[4] >> 10u));
+			if (flip % 120 == 0) std::fflush(frame_log);
+		}
+		last      = now;
+		last_idle = g_render_idle_ns;
+		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
+		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
+	}
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,
