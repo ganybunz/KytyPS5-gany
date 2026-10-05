@@ -131,6 +131,8 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 // The shader whose resources the GPU thread evaluates (KYTY_SYNC_LOG names it on a drain).
 extern thread_local uint64_t g_srt_shader_hash;
+// GPU thread: whether the buffer cache holds GPU-written bytes in the range (a CPU read of it drains the GPU).
+bool                   IsGpuDirtyOnGpuThread(uint64_t vaddr, uint64_t size);
 bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
 // On failure, optionally return a static diagnostic string (no allocation).
 // The mapped parts of a guest range as they are, unmapped parts as zeros (a texture pool span

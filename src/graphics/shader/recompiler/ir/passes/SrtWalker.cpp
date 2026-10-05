@@ -1455,7 +1455,11 @@ static bool EvaluateLinearSrtOriginal(const LinearSrtPlan& plan,const SrtRuntime
         ~Recycle(){if(pool.size()<8)pool.push_back(std::move(values));}
     } recycle{pool,values};
     values.resize(plan.nodes.size());
-    if(!plan.function(&runtime,values.data())) return false;
+    LinearSrtPlan::current_plan = &plan;
+    LinearSrtPlan::current_node = nullptr;
+    const bool evaluated_ok = plan.function(&runtime,values.data());
+    LinearSrtPlan::current_plan = nullptr;
+    if(!evaluated_ok) return false;
     NativePreparationScratch<LocalNativeResource::OutputWorkspace> output_storage;
     auto& evaluated = output_storage.Get().evaluated;
     auto& flattened = output_storage.Get().flattened;

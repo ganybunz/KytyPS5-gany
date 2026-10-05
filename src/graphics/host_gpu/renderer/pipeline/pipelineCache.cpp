@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -35,6 +36,7 @@
 #include <bit>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +48,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -155,6 +158,53 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
+// KYTY_SYNC_LOG: an SRT read of GPU-written memory drains the GPU. Every 10 s, the most frequent ones with
+// what the plan does with the word: d = descriptor dword, f = flattened SRT word, a = argument of another
+// node (an address, a predicate or a computed value), - = unknown read node.
+void NoteDirtySrtRead(uint64_t address) {
+	using Plan = ShaderRecompiler::IR::LinearSrtPlan;
+	struct Entry {
+		uint64_t count = 0, shader = 0;
+		char     use[4] {};
+	};
+	static std::unordered_map<uint64_t, Entry> entries;
+	static auto                                last = std::chrono::steady_clock::now();
+	auto&                                      entry = entries[address];
+	entry.count++;
+	entry.shader     = Libs::LibKernel::Memory::g_srt_shader_hash;
+	const auto* plan = Plan::current_plan;
+	const auto* node = Plan::current_node;
+	if (plan != nullptr && node != nullptr && node >= plan->nodes.data() && node < plan->nodes.data() + plan->nodes.size()) {
+		const auto index = static_cast<uint32_t>(node - plan->nodes.data());
+		const bool d     = std::ranges::find(plan->descriptor_words, index) != plan->descriptor_words.end();
+		const bool f     = std::ranges::find(plan->flat_words, index) != plan->flat_words.end();
+		bool       a     = false;
+		for (const auto& other: plan->nodes) {
+			if (other.kind == Plan::Kind::Immediate || other.kind == Plan::Kind::User || other.kind == Plan::Kind::Base) continue;
+			for (const auto arg: other.args) a = a || (arg == index && &other != node);
+		}
+		entry.use[0] = d ? 'd' : '.';
+		entry.use[1] = f ? 'f' : '.';
+		entry.use[2] = a ? 'a' : '.';
+	} else {
+		entry.use[0] = '-';
+	}
+	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+		last = now;
+		std::vector<std::pair<uint64_t, Entry>> top(entries.begin(), entries.end());
+		std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second.count > y.second.count; });
+		std::printf("Dirty SRT reads in 10 s:");
+		for (size_t i = 0; i < top.size() && i < 16; i++) {
+			std::printf(" [0x%llx x%llu %s %016llx]", static_cast<unsigned long long>(top[i].first),
+			            static_cast<unsigned long long>(top[i].second.count), top[i].second.use,
+			            static_cast<unsigned long long>(top[i].second.shader));
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+		entries.clear();
+	}
+}
+
 bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
@@ -164,6 +214,10 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
 	} else {
+		static const bool sync_log = std::getenv("KYTY_SYNC_LOG") != nullptr;
+		if (sync_log && Libs::LibKernel::Memory::IsGpuDirtyOnGpuThread(address, sizeof(*value))) {
+			NoteDirtySrtRead(address);
+		}
 		std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
 	}
 	return true;

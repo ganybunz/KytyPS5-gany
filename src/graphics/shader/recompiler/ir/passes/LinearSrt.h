@@ -85,8 +85,13 @@ struct LinearSrtPlan {
 		}
 		return true;
 	}
+	// The plan and read node being evaluated on this thread (KYTY_SYNC_LOG classifies a read of GPU-written
+	// memory by what the plan does with its value).
+	static inline thread_local const LinearSrtPlan* current_plan = nullptr;
+	static inline thread_local const Node*          current_node = nullptr;
 	static bool KYTY_SYSV_ABI Read(const SrtRuntime* runtime, const Node* node,
 	                               const uint64_t* values, uint64_t* output) {
+		current_node     = node;
 		uint64_t address = 0;
 		if (!ReadAddress(node, values, address)) return false;
 		uint32_t   value = 0;

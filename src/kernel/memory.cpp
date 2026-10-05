@@ -1076,6 +1076,11 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 
 thread_local uint64_t g_srt_shader_hash = 0;
 
+bool IsGpuDirtyOnGpuThread(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() && IsGpuAddressRange(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
