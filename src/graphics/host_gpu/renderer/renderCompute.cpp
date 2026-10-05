@@ -37,6 +37,7 @@
 #include "live-counters.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -628,7 +629,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_offset = owner.Offset(indirect_args);
 	}
 
-	const bool        chain            = DemonsSouls::IsSupportedGame();
+	// KYTY_DS_COMPUTE_CHAIN=0: the Demon's Souls profile without the barrier elision between its
+	// compute dispatches (verified on PPSA01341 1.007; A/B on other releases and drivers).
+	static const bool chain_enabled = [] {
+		const char* value = std::getenv("KYTY_DS_COMPUTE_CHAIN");
+		return value == nullptr || value[0] != '0';
+	}();
+	const bool        chain            = chain_enabled && DemonsSouls::IsSupportedGame();
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
