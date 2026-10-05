@@ -1061,6 +1061,39 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
     return true;
 }
 
+// GET_LOD_STATS of another layout than the packed 0x840 bytes: zeros with a ready label (1) in the first
+// word. When the range holds GPU-written bytes the CPU write faulted and drained the GPU for its whole
+// readback window first (Demon's Souls at the title: once a frame, ~10 MB/s of downloads); the GPU
+// writes the same bytes in stream order instead.
+bool BufferCache::TryFillLodStatsOnGpu(uint64_t vaddr, uint32_t size) {
+	if (size < 4 || (vaddr | size) % 4 != 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !m_gpu_modified_ranges.Intersects(vaddr, size) || m_texture_cache.HasTrackedDataOverlap(vaddr, size) ||
+	    !m_resources || !m_resources->IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_scheduler.EndRendering();
+	auto [buffer, offset] = ObtainBuffer(vaddr, size, true, false, BufferId {});
+	if (buffer == nullptr) return false;
+	const auto command = m_scheduler.Current().Handle();
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+	                        &barrier, 0, nullptr, 0, nullptr);
+	command.fillBuffer(buffer->Handle(), offset, size, 0u);
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier,
+	                        0, nullptr, 0, nullptr);
+	const uint32_t ready = 1;
+	command.updateBuffer(buffer->Handle(), offset, sizeof(ready), &ready);
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                        &barrier, 0, nullptr, 0, nullptr);
+	return true;
+}
+
 void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	// Pack the 64-byte completion header and 256 eight-byte LOD counters.
 	// The command processor keeps other packet layouts on the existing path.

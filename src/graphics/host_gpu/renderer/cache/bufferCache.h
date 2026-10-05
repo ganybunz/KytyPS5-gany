@@ -72,6 +72,9 @@ public:
 	[[nodiscard]] StreamBuffer& GetTableUploadBuffer() noexcept { return m_table_upload; }
 	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
 	void ReportLodStats(void* dst, uint32_t size, bool reset);
+	// GET_LOD_STATS of another layout: zeros and a ready label written by the GPU when the range holds
+	// GPU-written bytes (a CPU write there drains the GPU first). False: the caller writes them.
+	[[nodiscard]] bool TryFillLodStatsOnGpu(uint64_t vaddr, uint32_t size);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }

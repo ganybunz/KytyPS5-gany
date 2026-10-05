@@ -1397,6 +1397,9 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			cp.ReportLodStats(dst, buffer_size, (buffer[3] & ((1u << 19) | (1u << 18))) != 0);
 			return 4;
 		}
+		if (cp.TryFillLodStatsOnGpu(dst, buffer_size)) {
+			return 4;
+		}
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
