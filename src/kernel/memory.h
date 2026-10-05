@@ -148,7 +148,12 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 // (address, size), in order): what can be read of a range that reaches into unmapped memory.
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
 void                   MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// `source` names the path in crash reports (PrintWriteBacksOverlapping).
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
+                                    const char* source = "image") noexcept;
+// Crash reports: the latest GPU write-backs into guest memory (WriteBacking, newest first) that overlap
+// [vaddr, vaddr + size); false when none does.
+bool                   PrintWriteBacksOverlapping(uint64_t vaddr, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);

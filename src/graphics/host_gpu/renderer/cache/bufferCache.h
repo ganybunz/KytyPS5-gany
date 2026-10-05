@@ -193,6 +193,7 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	void WriteBackGpuOwned(uint64_t address, const uint8_t* data, uint64_t size, const char* source);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 	void FinishWriteReadback(uint64_t vaddr, uint64_t size);
 	struct GuestReadback;

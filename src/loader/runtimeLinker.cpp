@@ -892,6 +892,26 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		// GPU write-backs (Memory::WriteBacking) over the pages the registers and the stack top point at:
+		// a structure the game broke may have been overwritten by stale GPU data.
+		{
+			std::vector<uint64_t> pages;
+			const auto note = [&](uint64_t value) {
+				if (value >= 0x10000 && value < 0x10000000000ull) pages.push_back(value & ~uint64_t {0xfff});
+			};
+			for (const auto value: {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+			                         info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14,
+			                         info->r15, info->access_violation_vaddr})
+				note(value);
+			if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t)))
+				for (int i = 0; i < 32; i++) note(reinterpret_cast<const uint64_t*>(info->rsp)[i]);
+			std::sort(pages.begin(), pages.end());
+			pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+			std::printf("GPU write-backs onto the pages registers and stack point at (%zu pages):\n", pages.size());
+			bool any = false;
+			for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
+			if (!any) std::printf("  none\n");
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// The host frames, by their unwind tables (the emulator's resolve with its linker map;
 		// guest code has none, which ends the walk), and the state of the faulting page.
