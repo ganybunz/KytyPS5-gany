@@ -655,15 +655,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_offset = owner.Offset(indirect_args);
 	}
 
-	// KYTY_DS_COMPUTE_CHAIN: 0 (default) keeps every barrier between compute dispatches; 1 leaves one out
-	// only when neither dispatch writes what the other reads or writes (bound buffer and image ranges;
-	// dispatches that reach memory through pointers always wait); 2 leaves it out always, as verified on
-	// PPSA01341 1.007 with NVIDIA. On the USA 1.004 build with an AMD card, 2 overlapped dependent
-	// dispatches (teal tint), and 1 still did in some runs (X103, X105b: red channel near zero for the
-	// whole run; X100 with 0 rendered right): the ranges miss some dependency, so neither is the default.
+	// KYTY_DS_COMPUTE_CHAIN: 1 (default) the Demon's Souls profile leaves out the barrier between two
+	// compute dispatches only when neither writes what the other reads or writes (bound buffer and
+	// image ranges; dispatches that reach memory through pointers always wait); 2 leaves it out
+	// always, as verified on PPSA01341 1.007 with NVIDIA (on the USA 1.004 build with an AMD card,
+	// dependent dispatches overlapped: teal tint); 0 keeps every barrier.
 	static const int chain_mode = [] {
 		const char* value = std::getenv("KYTY_DS_COMPUTE_CHAIN");
-		return value == nullptr ? 0 : std::atoi(value);
+		return value == nullptr ? 1 : std::atoi(value);
 	}();
 	const bool chain_enabled = chain_mode != 0;
 	const bool        chain            = chain_enabled && DemonsSouls::IsSupportedGame();

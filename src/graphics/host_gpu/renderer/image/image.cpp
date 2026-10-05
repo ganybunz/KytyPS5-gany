@@ -13,7 +13,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <xxhash.h>
 
 extern "C" {
@@ -151,12 +150,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	// the console, where nothing else orders the storage writes of consecutive draws: no barrier between them
 	// (each was also a render pass break: ~800 per frame in the deferred decal pass). A repeated write after
 	// any other access (an upload, a copy, the emulator's own compute) keeps its barrier.
-	// KYTY_GUEST_WRITE_BARRIERS=1 keeps those barriers (A/B on drivers other than the one it was verified on).
-	static const bool keep_guest_write_barriers = [] {
-		const char* value = std::getenv("KYTY_GUEST_WRITE_BARRIERS");
-		return value != nullptr && value[0] == '1';
-	}();
-	const bool guest = g_transit_group != 0 && !keep_guest_write_barriers;
+	const bool guest = g_transit_group != 0;
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
 			subresource_states.resize(host_levels * info.resources.layers, state);
