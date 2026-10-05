@@ -1608,6 +1608,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		path = "gpu";
 		return ObtainBuffer(vaddr, size, false, false);
 	}
+	// More than the whole staging ring holds (a texture over a streamed pool expanded to 1.35 GB while
+	// playing in Boletaria, and the upload exited): a buffer over the range, which SynchronizeBuffer
+	// fills a staging-sized piece at a time (a temporary buffer past that) and only where memory is mapped.
+	if (size > m_staging_buffer.Size()) {
+		path = "large";
+		return ObtainBuffer(vaddr, size, false, false);
+	}
 	marks[2] = Clock::now();
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
