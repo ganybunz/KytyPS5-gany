@@ -59,6 +59,9 @@ public:
 	void               EndSubmission();
 	// Once per flip: the frame count and the garbage collection (its ages count frames).
 	void               AdvanceFrame();
+	// A flip the GPU submits from its command stream (Demon's Souls presents only this way): the
+	// frame advances, and the collectors run, when the submission that holds it ends.
+	void               NoteGpuFlip() { m_gpu_flip_pending = true; }
 
 private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
@@ -82,6 +85,7 @@ private:
 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_used              = false;
+	bool                      m_gpu_flip_pending      = false;
 };
 
 } // namespace Libs::Graphics

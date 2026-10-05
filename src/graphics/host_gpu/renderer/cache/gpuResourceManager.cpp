@@ -320,6 +320,12 @@ void GpuResourceManager::EndSubmission() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	// Only CPU flips (sceVideoOutSubmitFlip) reached AdvanceFrame, so for a game that flips from the
+	// GPU the texture and buffer collectors never ran and video memory filled up until an image could
+	// not be created (Demon's Souls on an 8 GB card, X91).
+	if (std::exchange(m_gpu_flip_pending, false)) {
+		AdvanceFrame();
+	}
 }
 
 void GpuResourceManager::AdvanceFrame() {
