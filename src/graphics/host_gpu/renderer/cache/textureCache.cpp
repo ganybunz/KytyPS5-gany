@@ -2248,7 +2248,7 @@ bool TextureCache::MayReduce(const ImageDesc& desc) {
 	const auto& info = desc.info;
 	// Large mipped 2D textures (and cubes / arrays) that this lookup only filter-samples, with no
 	// metadata, depth or stencil, never needed at full quality before and not written by the GPU.
-	return TextureQuality::Reduced() && desc.type == BindingType::Texture && desc.allow_reduced &&
+	return TextureQuality::MipSkip() != 0 && desc.type == BindingType::Texture && desc.allow_reduced &&
 	       info.type == Prospero::ImageType::kColor2D && info.samples == 1 && info.resources.levels >= 3 &&
 	       info.extent.width >= 512 && info.extent.height >= 512 && !info.HasMetadata() &&
 	       !info.HasStencil() && !info.IsDepth() &&
@@ -2376,7 +2376,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (!result) {
 			auto info = desc.info;
 			if (MayReduce(desc)) {
-				info.host_mip_skip = 1;
+				info.host_mip_skip = TextureQuality::MipSkip();
 				m_reduced_images++;
 			}
 			result         = InsertImage(info);

@@ -1,21 +1,26 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTUREQUALITY_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTUREQUALITY_H_
 
+#include <cstdint>
 #include <cstdlib>
 #include <string_view>
 
 namespace Libs::Graphics::TextureQuality {
 
-// KYTY_TEXTURE_QUALITY=reduced: large read-only textures that shaders only filter-sample are kept on
-// the GPU without their largest mip level, a quarter of their video memory. Anything that needs the
-// exact texels promotes the texture back to full quality from guest memory, so no guest data is
-// lost; close-up detail is softer. For 8 GB cards (Demon's Souls filled one; floppa-ps5 46e2a7df).
-[[nodiscard]] inline bool Reduced() {
-	static const bool reduced = [] {
+// Read-only, filter-sampled textures may omit their top mip levels to reduce GPU and upload memory.
+// Any lookup that needs a different view promotes the image back to full quality from guest memory.
+// "reduced" skips one level; "very_reduced" skips two, for tighter-memory Demon's Souls runs.
+// The default stays full quality.
+[[nodiscard]] inline uint32_t MipSkip() {
+	static const uint32_t mip_skip = [] {
 		const char* value = std::getenv("KYTY_TEXTURE_QUALITY");
-		return value != nullptr && std::string_view(value) == "reduced";
+		if (value == nullptr) return 0u;
+		const std::string_view quality {value};
+		if (quality == "reduced") return 1u;
+		if (quality == "very_reduced") return 2u;
+		return 0u;
 	}();
-	return reduced;
+	return mip_skip;
 }
 
 } // namespace Libs::Graphics::TextureQuality
