@@ -1648,7 +1648,9 @@ namespace {
 // Within a subresource, blocks are laid out row-major (block index = by * blocks_per_row + bx) and
 // these families swizzle inside a block with in-block coordinate bits only, so the rows of blocks
 // over the dirty ranges detile like a shorter surface of the same width (no shader change).
-// Render-target and depth blocks XOR the block row's parity into the in-block offset: whole.
+// Render-target blocks XOR the block row's parity into the in-block offset: their bands start and end on
+// even block rows (RowBandParityAligned), so a band's first row has the parity the shorter surface gives
+// it (the Play build bands them in groups of 128 rows, 3e6ecc8a). Depth blocks: whole.
 [[nodiscard]] bool RowBandable(const GpuTileInfo& tile) {
 	if (tile.tail || tile.depth != 1) {
 		return false;
@@ -1657,9 +1659,14 @@ namespace {
 		case TileBlockFamily::Standard256B:
 		case TileBlockFamily::Standard4KB:
 		case TileBlockFamily::Standard64KB:
-		case TileBlockFamily::Prt64KB: return true;
+		case TileBlockFamily::Prt64KB:
+		case TileBlockFamily::RenderTarget64KB: return true;
 		default: return false;
 	}
+}
+
+[[nodiscard]] bool RowBandParityAligned(const GpuTileInfo& tile) {
+	return tile.family == TileBlockFamily::RenderTarget64KB;
 }
 
 struct RowBand {
@@ -1907,6 +1914,20 @@ bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
 			const uint32_t rows      = tile.tiled_height / block.block_height;
 			if (rows > 1 && row_bytes * rows == tile.tiled_size) {
 				DirtyRowBands(dirty, begin, end, row_bytes, rows, bands);
+				if (RowBandParityAligned(tile)) {
+					// Even first rows (and ends, merged where they meet) keep the block-row parity.
+					std::vector<RowBand> aligned;
+					for (auto band: bands) {
+						band.first &= ~1u;
+						band.last = std::min(rows, (band.last + 1u) & ~1u);
+						if (!aligned.empty() && band.first <= aligned.back().last) {
+							aligned.back().last = std::max(aligned.back().last, band.last);
+						} else {
+							aligned.push_back(band);
+						}
+					}
+					bands = std::move(aligned);
+				}
 				if (bands.size() <= MaxBandsPerSubresource) {
 					for (const auto& band: bands) {
 						// Rows past the subresource's last element row are padding only.
