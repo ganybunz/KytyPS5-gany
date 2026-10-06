@@ -1066,6 +1066,11 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
 // readback window first (Demon's Souls at the title: once a frame, ~10 MB/s of downloads); the GPU
 // writes the same bytes in stream order instead.
 bool BufferCache::TryFillLodStatsOnGpu(uint64_t vaddr, uint32_t size) {
+	static const bool enabled = [] { // KYTY_LOD_FILL_GPU=0: the CPU write as before (A/B)
+		const char* value = std::getenv("KYTY_LOD_FILL_GPU");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) return false;
 	if (size < 4 || (vaddr | size) % 4 != 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_gpu_modified_ranges.Intersects(vaddr, size) || m_texture_cache.HasTrackedDataOverlap(vaddr, size) ||
 	    !m_resources || !m_resources->IsMapped(vaddr, size)) {

@@ -38,8 +38,13 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 	// into m0): dst[i] = src[i % period] (PPSA01341 1.007 eb74563..., PPSA01342 1.004 2a12b35...), and
 	// PPSA01342's dst[i] = src[i & mask] (dc18751...), the same user data, i < count; parameters count
 	// and period or mask. Only the linear subset is replaced (period >= count; mask keeping every i).
-	const bool modulo = program.shader_hash == 0xeb7456322124ecc7ULL || program.shader_hash == 0x2a12b35175b11703ULL;
-	const bool masked = program.shader_hash == 0xdc18751cb6791ef9ULL;
+	// KYTY_DS_LINEAR_COPY=0: only PPSA01341's kernel (A/B of the PPSA01342 ones).
+	static const bool usa = [] {
+		const char* value = std::getenv("KYTY_DS_LINEAR_COPY");
+		return value == nullptr || value[0] != '0';
+	}();
+	const bool modulo = program.shader_hash == 0xeb7456322124ecc7ULL || (usa && program.shader_hash == 0x2a12b35175b11703ULL);
+	const bool masked = usa && program.shader_hash == 0xdc18751cb6791ef9ULL;
 	if (!IsSupportedGame() || !(modulo || masked) ||
 	    data.size() != 12 || program.user_data_base != 0 || input.dispatch_thread_dimensions ||
 	    mode != 0x41 || input.threads_num[0] != 64 || input.threads_num[1] != 1 ||
