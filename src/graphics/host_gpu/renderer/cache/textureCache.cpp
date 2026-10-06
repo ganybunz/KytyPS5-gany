@@ -1591,7 +1591,17 @@ void TextureCache::InitializeImage(ImageId id) {
 				const char* value = std::getenv("KYTY_BUFFER_PARTIAL");
 				return value == nullptr || value[0] != '0';
 			}();
-			if (buffer_partial) {
+			const auto& dirty = image.BufferDirtyRanges();
+			// If one known dirty range covers the complete image, UploadImagePartial will necessarily
+			// reject it at its share limit. Avoid building picks/bands for that attempt; the normal full
+			// upload below still reads and uploads every byte, preserving the guest result.
+			const bool whole_image_dirty = dirty.size() == 1 && dirty.front().first <= image.info.data.address &&
+			                               dirty.front().second >= image.info.data.End();
+			if (!buffer_partial) {
+				partial_outcome = "buffer_partial_disabled";
+			} else if (whole_image_dirty) {
+				partial_outcome = "buffer_full_range";
+			} else {
 				g_partial_fail = "";
 				partial_attempt = true;
 				uploaded = UploadImagePartial(image, true);
@@ -1599,8 +1609,6 @@ void TextureCache::InitializeImage(ImageId id) {
 				if (!uploaded) {
 					LiveCounters::Add(LiveCounters::PartialFallbacks);
 				}
-			} else {
-				partial_outcome = "buffer_partial_disabled";
 			}
 		} else if (image.IsBufferModified() && image.IsCpuDirty()) {
 			partial_outcome = "cpu_dirty_gate";
