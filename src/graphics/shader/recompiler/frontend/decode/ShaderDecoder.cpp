@@ -187,6 +187,9 @@ std::string FormatExp(const Instruction& inst) {
 
 bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
+		// Taken only while a debugger sets the conditional-debug system flag, never on a retail console:
+		// it falls through (the Play build's 5b541375; Astro Bot after the opening video).
+		case Opcode::S_CBRANCH_CDBGSYS: return false;
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
 		case Opcode::S_CBRANCH_VCCZ:
@@ -535,6 +538,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_VCCNZ:
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
+		case Opcode::S_CBRANCH_CDBGSYS:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
