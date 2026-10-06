@@ -1,0 +1,202 @@
+#include "graphics/host_gpu/renderer/resolutionControl.h"
+
+#include "loader/systemContent.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+
+namespace Libs::Graphics::ResolutionControl {
+
+namespace {
+
+constexpr double MinScale = 0.1;
+constexpr double MaxScale = 8.0;
+// Frames between adjustments: the title's controller needs a few frames to answer.
+constexpr uint32_t Period = 8;
+
+std::atomic<uint32_t> g_target_width {0};
+std::atomic<double>   g_scale {1.0};
+
+// GPU command thread only.
+struct Widths {
+	std::array<uint32_t, 8> width {};
+	std::array<uint32_t, 8> binds {};
+	uint32_t                frames = 0;
+	uint32_t                outside = 0; // consecutive periods outside the target band
+	uint32_t                last_logged_width = 0;
+} g_widths;
+
+// Titles whose dynamic resolution was verified to follow this steering without side effects
+// (game speed, animation, audio). Changing the reference clock is guest-visible: other titles may
+// use it for anything, so render_resolution does nothing for them.
+struct Profile {
+	const char* title_id;
+	const char* version; // the version it was verified with
+};
+constexpr std::array<Profile, 1> Profiles {{{"PPSA21564", "01.007.000"}}}; // ASTRO BOT
+
+// 0: title not known yet, 1: steering this title, 2: not steering this title.
+std::atomic<int> g_title_state {0};
+
+bool TitleSupported() {
+	const auto state = g_title_state.load(std::memory_order_acquire);
+	if (state != 0) {
+		return state == 1;
+	}
+	std::string title, version;
+	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty()) {
+		return false;
+	}
+	(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
+	const auto profile = std::ranges::find_if(
+	    Profiles, [&](const Profile& p) { return title == p.title_id; });
+	int expected = 0;
+	if (!g_title_state.compare_exchange_strong(expected, profile != Profiles.end() ? 1 : 2)) {
+		return expected == 1;
+	}
+	if (profile == Profiles.end()) {
+		std::printf("Resolution control: render_resolution ignored: no verified profile for %s\n",
+		            title.c_str());
+		return false;
+	}
+	if (version != profile->version) {
+		std::printf("Resolution control: %s version %s (verified with %s)\n", title.c_str(),
+		            version.c_str(), profile->version);
+	}
+	return true;
+}
+
+// The configured width, else KYTY_RENDER_RESOLUTION (auto|1080p|1440p|2160p; this fork has no
+// emulator-settings.ini, so the environment is read once on first use).
+uint32_t TargetWidth() {
+	static const uint32_t from_env = [] {
+		const char* value = std::getenv("KYTY_RENDER_RESOLUTION");
+		if (value == nullptr) {
+			return 0u;
+		}
+		const std::string text {value};
+		uint32_t          width = 0;
+		if (text == "1080p") {
+			width = 1920;
+		} else if (text == "1440p") {
+			width = 2560;
+		} else if (text == "2160p" || text == "4k") {
+			width = 3840;
+		} else if (text != "auto" && !text.empty()) {
+			std::printf("KYTY_RENDER_RESOLUTION: unknown value '%s' (auto, 1080p, 1440p, 2160p)
+", value);
+		}
+		if (width != 0) {
+			std::printf("Resolution control: render_resolution %u pixels wide (titles with a verified "
+			            "profile only)
+",
+			            width);
+		}
+		return width;
+	}();
+	const auto configured = g_target_width.load(std::memory_order_relaxed);
+	return configured != 0 ? configured : from_env;
+}
+
+std::mutex g_clock_mutex;
+uint64_t   g_last_real     = 0;
+uint64_t   g_last_reported = 0;
+
+} // namespace
+
+void Configure(uint32_t target_width) {
+	g_target_width.store(target_width, std::memory_order_relaxed);
+	if (target_width != 0) {
+		std::printf("Resolution control: render_resolution %u pixels wide (titles with a verified "
+		            "profile only)\n",
+		            target_width);
+	}
+}
+
+bool Active() {
+	return TargetWidth() != 0 && TitleSupported();
+}
+
+void NoteColorTarget(uint32_t width, uint32_t height) {
+	// Screen-sized 16:9 targets only (dynamic-resolution passes); shadow maps, cube faces and
+	// small post-process chains do not count.
+	if (width < 1280 || height == 0 || width * 9 < height * 16 * 97 / 100 ||
+	    width * 9 > height * 16 * 103 / 100) {
+		return;
+	}
+	auto& w = g_widths;
+	for (size_t i = 0; i < w.width.size(); i++) {
+		if (w.width[i] == width || w.width[i] == 0) {
+			w.width[i] = width;
+			w.binds[i]++;
+			return;
+		}
+	}
+}
+
+void EndGuestFrame() {
+	const auto target = TargetWidth();
+	if (target == 0 || !TitleSupported()) {
+		return;
+	}
+	auto& w = g_widths;
+	if (++w.frames < Period) {
+		return;
+	}
+	w.frames = 0;
+	// The size most draws render at is the title's current dynamic resolution.
+	uint32_t width = 0, binds = 0;
+	for (size_t i = 0; i < w.width.size(); i++) {
+		if (w.binds[i] > binds || (w.binds[i] == binds && w.width[i] > width)) {
+			width = w.width[i];
+			binds = w.binds[i];
+		}
+	}
+	w.width = {};
+	w.binds = {};
+	if (width == 0) {
+		return;
+	}
+	// Titles resize in a few fixed steps (ASTRO BOT: 1920, 2432, 3328, 3840 wide), and every
+	// switch recreates their render targets (a visible hitch), so a step near the target is
+	// held rather than chased: the band spans from 7% under to 5% over the target. Only two
+	// periods in a row outside it move the clock, and in small steps.
+	auto       scale = g_scale.load(std::memory_order_relaxed);
+	const bool high  = width > target * 105 / 100;
+	const bool low   = width < target * 93 / 100;
+	w.outside        = (high || low) ? w.outside + 1 : 0;
+	if (w.outside >= 2) {
+		w.outside = 0;
+		scale     = high ? std::min(scale * 1.2, MaxScale) : std::max(scale / 1.2, MinScale);
+	}
+	g_scale.store(scale, std::memory_order_relaxed);
+	if (width != w.last_logged_width) {
+		w.last_logged_width = width;
+		std::printf("Resolution control: title renders %u wide (target %u), clock scale %.2f\n", width,
+		            target, scale);
+	}
+}
+
+uint64_t Adjust(uint64_t clock) {
+	if (!Active()) {
+		return clock;
+	}
+	std::scoped_lock lock {g_clock_mutex};
+	if (g_last_real == 0) {
+		g_last_real     = clock;
+		g_last_reported = clock;
+		return clock;
+	}
+	const auto elapsed = clock > g_last_real ? clock - g_last_real : 0;
+	g_last_real        = clock;
+	g_last_reported += static_cast<uint64_t>(static_cast<double>(elapsed) *
+	                                         g_scale.load(std::memory_order_relaxed));
+	return g_last_reported;
+}
+
+} // namespace Libs::Graphics::ResolutionControl

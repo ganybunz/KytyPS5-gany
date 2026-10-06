@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/resolutionControl.h"
 #include "graphics/presentation/videoOut.h"
 #include "live-trace.h"
 #include "kernel/eventQueue.h"
@@ -52,7 +53,8 @@ uint64_t ReadReferenceClock() {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}
-	return value;
+	// Titles size their dynamic resolution from these timestamps (see ResolutionControl).
+	return ResolutionControl::Adjust(value);
 }
 
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
@@ -188,6 +190,7 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 		    video_out.SubmitFlipFromGpu(buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
+			ResolutionControl::EndGuestFrame();
 			// KYTY_GPU_FLIP_FRAMES=0: the old behaviour (no frame advance on GPU flips), for A/B tests.
 			static const bool gpu_flip_frames = [] {
 				const char* value = std::getenv("KYTY_GPU_FLIP_FRAMES");

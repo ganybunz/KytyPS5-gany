@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/resolutionControl.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -357,6 +358,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	if (ResolutionControl::Active()) {
+		ResolutionControl::NoteColorTarget(std::max(r.desc.info.extent.width >> r.guest_mip_level, 1u),
+		                                   std::max(r.desc.info.extent.height >> r.guest_mip_level, 1u));
+	}
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 }
