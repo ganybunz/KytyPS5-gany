@@ -1451,7 +1451,10 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		if (plan.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
 		}
-		upload(plan.regions, linear);
+		// The upload helper adjusts mip levels and buffer offsets in-place. Keep the
+		// cached transfer plan immutable so later refreshes can reuse its regions.
+		auto copies = plan.regions;
+		upload(copies, linear);
 		return;
 	}
 
