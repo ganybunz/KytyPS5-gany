@@ -53,6 +53,7 @@ struct ResolvedPathInfo {
 
 static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
+static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, SubmissionState>     g_submissions;
 static std::unordered_map<uint32_t, std::string>         g_files;
 static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
@@ -92,15 +93,6 @@ static bool WriteGuest(uint64_t addr, const T& value) {
 	return WriteGuestBytes(addr, &value, sizeof(T));
 }
 
-static uint32_t ComputeFileId(const char* guest_path) {
-	uint32_t hash = 2166136261u;
-	for (auto* p = reinterpret_cast<const uint8_t*>(guest_path); p != nullptr && *p != 0; ++p) {
-		hash ^= *p;
-		hash *= 16777619u;
-	}
-	return hash & static_cast<uint32_t>(std::numeric_limits<int32_t>::max());
-}
-
 static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 	if (addr == 0) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
@@ -124,12 +116,6 @@ static void RegisterHostPathLocked(uint32_t file_id, const std::string& host_pat
                                    uint64_t file_size, bool is_dir) {
 	g_files[file_id]      = host_path;
 	g_file_sizes[file_id] = is_dir ? 0 : file_size;
-}
-
-static void RegisterHostPath(uint32_t file_id, const std::string& host_path, uint64_t file_size,
-                             bool is_dir) {
-	std::scoped_lock lock(g_mutex);
-	RegisterHostPathLocked(file_id, host_path, file_size, is_dir);
 }
 
 static bool TryGetHostPath(uint32_t file_id, std::string* out) {
@@ -213,7 +199,6 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	if (!found) {
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.file_id         = AprShared::ComputeFileId(guest_path);
 		info.host_path       = Common::PathToString(real_path);
 
 		if (Common::File::IsDirectoryExisting(real_path)) {
@@ -232,6 +217,9 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
+				// One id per path. Ids hashed from the path collided (13 pairs among Demon's Souls' 250K
+				// files, which the game resolves at start-up): one file of a pair read the other's bytes.
+				info.file_id = it->second.file_id = g_next_file_id++;
 				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
@@ -240,8 +228,6 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
 		}
-	} else if (info.result == OK) {
-		AprShared::RegisterHostPath(info.file_id, info.host_path, info.file_size, info.is_dir);
 	}
 
 	if (info.result != OK) {
