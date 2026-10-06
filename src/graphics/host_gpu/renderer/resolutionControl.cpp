@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -36,9 +37,13 @@ struct Widths {
 // use it for anything, so render_resolution does nothing for them.
 struct Profile {
 	const char* title_id;
-	const char* version; // the version it was verified with
+	const char* version; // version this profile is scoped to
+	const char* opt_in_env; // optional per-title switch for unverified experiments
 };
-constexpr std::array<Profile, 1> Profiles {{{"PPSA21564", "01.007.000"}}}; // ASTRO BOT
+constexpr std::array<Profile, 2> Profiles {{{
+	{"PPSA21564", "01.007.000", nullptr}, // ASTRO BOT
+	{"PPSA01342", "01.004.000", "KYTY_DS_DYNAMIC_RESOLUTION"}, // Demon's Souls (opt-in trial only)
+}}};
 
 // 0: title not known yet, 1: steering this title, 2: not steering this title.
 std::atomic<int> g_title_state {0};
@@ -55,23 +60,40 @@ bool TitleSupported() {
 	(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
 	const auto profile = std::ranges::find_if(
 	    Profiles, [&](const Profile& p) { return title == p.title_id; });
+	const char* reason = nullptr;
+	if (profile == Profiles.end()) {
+		reason = "no verified profile";
+	} else if (profile->opt_in_env != nullptr) {
+		if (version != profile->version) {
+			reason = "game version differs from the verified profile";
+		} else if (const char* enabled = std::getenv(profile->opt_in_env);
+		           enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+			reason = "profile requires its opt-in switch";
+		}
+	}
 	int expected = 0;
-	if (!g_title_state.compare_exchange_strong(expected, profile != Profiles.end() ? 1 : 2)) {
+	if (!g_title_state.compare_exchange_strong(expected, reason == nullptr ? 1 : 2)) {
 		return expected == 1;
 	}
-	if (profile == Profiles.end()) {
-		std::printf("Resolution control: render_resolution ignored: no verified profile for %s\n",
-		            title.c_str());
+	if (reason != nullptr) {
+		if (profile != Profiles.end() && profile->opt_in_env != nullptr) {
+			std::printf("Resolution control: render_resolution ignored for %s version %s: %s; "
+			            "set %s=1 to test\n",
+			            title.c_str(), version.c_str(), reason, profile->opt_in_env);
+		} else {
+			std::printf("Resolution control: render_resolution ignored for %s version %s: %s\n",
+			            title.c_str(), version.c_str(), reason);
+		}
 		return false;
 	}
-	if (version != profile->version) {
-		std::printf("Resolution control: %s version %s (verified with %s)\n", title.c_str(),
+	if (profile != Profiles.end() && version != profile->version) {
+		std::printf("Resolution control: %s version %s (profile verified with %s)\n", title.c_str(),
 		            version.c_str(), profile->version);
 	}
 	return true;
 }
 
-// The configured width, else KYTY_RENDER_RESOLUTION (auto|1080p|1440p|2160p; this fork has no
+// The configured width, else KYTY_RENDER_RESOLUTION (auto|720p|1080p|1440p|2160p; this fork has no
 // emulator-settings.ini, so the environment is read once on first use).
 uint32_t TargetWidth() {
 	static const uint32_t from_env = [] {
@@ -81,14 +103,16 @@ uint32_t TargetWidth() {
 		}
 		const std::string text {value};
 		uint32_t          width = 0;
-		if (text == "1080p") {
+		if (text == "720p") {
+			width = 1280;
+		} else if (text == "1080p") {
 			width = 1920;
 		} else if (text == "1440p") {
 			width = 2560;
 		} else if (text == "2160p" || text == "4k") {
 			width = 3840;
 		} else if (text != "auto" && !text.empty()) {
-			std::printf("KYTY_RENDER_RESOLUTION: unknown value '%s' (auto, 1080p, 1440p, 2160p)\n", value);
+			std::printf("KYTY_RENDER_RESOLUTION: unknown value '%s' (auto, 720p, 1080p, 1440p, 2160p)\n", value);
 		}
 		if (width != 0) {
 			std::printf("Resolution control: render_resolution %u pixels wide (titles with a verified "

@@ -10,12 +10,12 @@
 // recording time), so stretching that clock makes the GPU look slower and the title renders
 // fewer pixels; shrinking it does the opposite. This watches the size of the render targets the
 // title draws into most and adjusts the stretch until that size matches the configured one.
-// With no resolution configured, or for a title without a verified profile (only ASTRO BOT
-// PPSA21564 has one), the clock is left alone.
+// With no resolution configured, or for a title without a profile, the clock is left alone.
+// ASTRO BOT has a verified profile; Demon's Souls 01.004 has a test-only opt-in profile.
 namespace Libs::Graphics::ResolutionControl {
 
-// Width the title's main passes should render at, 0 when not steering. Set once at boot from
-// emulator-settings.ini (render_resolution=auto|1080p|1440p|2160p) or KYTY_RENDER_RESOLUTION.
+// Width the title's main passes should render at, 0 when not steering. Set from
+// KYTY_RENDER_RESOLUTION=auto|720p|1080p|1440p|2160p or by the renderer configuration API.
 void     Configure(uint32_t target_width);
 [[nodiscard]] bool Active();
 
