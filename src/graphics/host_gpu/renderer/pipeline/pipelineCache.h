@@ -25,6 +25,10 @@
 
 namespace Libs::Graphics {
 
+// Pipelines created since start, and the steady-clock tick the latest finished at (shaders.cpp).
+[[nodiscard]] uint64_t PipelineCreations();
+[[nodiscard]] int64_t  PipelineLastCreation();
+
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -370,6 +374,10 @@ private:
 	std::atomic<uint64_t> m_table_pipelines_done {0};
 	std::atomic<int64_t>  m_table_pipeline_last_done {0};
 	std::jthread          m_table_cache_saver;
+	// The main driver cache, saved once its compiles settle too (not only at a clean exit): a crash, a kill or a
+	// power loss lost every pipeline the session compiled, and the next start compiled them again in play.
+	std::mutex            m_driver_cache_mutex;
+	std::jthread          m_driver_cache_saver;
 
 	Pipeline* CreateGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,

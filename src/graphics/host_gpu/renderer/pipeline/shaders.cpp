@@ -18,6 +18,8 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <chrono>
 #include <x86intrin.h>
 #include <thread>
 #include <mutex>
@@ -261,6 +263,21 @@ static bool ClaimedElsewhere(const GraphicContext& graphics, vk::Result result) 
 }
 
 static void CompileTrace(const char* format, ...); // KYTY_COMPILE_TRACE, below
+
+// Pipelines created since start and when the latest finished (PipelineCache's driver-cache saver reads them).
+static std::atomic<uint64_t> g_pipeline_creations {0};
+static std::atomic<int64_t>  g_pipeline_last_creation {0};
+static void NotePipelineCreated() {
+	g_pipeline_last_creation.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+	                               std::memory_order_release);
+	g_pipeline_creations.fetch_add(1, std::memory_order_release);
+}
+uint64_t PipelineCreations() {
+	return g_pipeline_creations.load(std::memory_order_acquire);
+}
+int64_t PipelineLastCreation() {
+	return g_pipeline_last_creation.load(std::memory_order_acquire);
+}
 
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says.
 template <typename Info, typename Create>
@@ -676,6 +693,7 @@ void CreatePipelineInternal(
 	                              });
 	CompileTrace("end GFX VS=%llu result=%d", static_cast<unsigned long long>(vertex_program.id),
 	             static_cast<int>(result));
+	NotePipelineCreated();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -779,6 +797,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                         });
 	CompileTrace("end CS hash=%016llx result=%d",
 	             static_cast<unsigned long long>(input_info.stage.program->shader_hash), static_cast<int>(result));
+	NotePipelineCreated();
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&

@@ -1762,6 +1762,31 @@ void PipelineCache::InitializeDriverCache() {
 	// 1 GiB (one build's warmup is ~130 MB) it starts over.
 	m_driver_cache = LoadDriverCache(m_driver_cache_path, uint64_t {1} << 30u, m_driver_cache_saved_size);
 	if (m_driver_cache == nullptr) return;
+	// Saved once no pipeline has compiled for 20 s (a burst of new pipelines settled): Demon's Souls' largest
+	// compute pipelines compile in ~20 s each on amdvlk (T1b), and a session that did not end with a clean
+	// window close compiled them again in play next time (minute-long freezes). KYTY_DRIVER_CACHE_AUTOSAVE=0: off.
+	if (const char* value = std::getenv("KYTY_DRIVER_CACHE_AUTOSAVE"); value == nullptr || value[0] != '0') {
+		m_driver_cache_saver = std::jthread([this](std::stop_token stop) {
+			LocalPlatform::SetThreadName("Kyty.DriverCache");
+			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+			std::mutex                  mutex;
+			std::condition_variable_any wake;
+			uint64_t                    saved = PipelineCreations();
+			while (!stop.stop_requested()) {
+				{
+					std::unique_lock lock(mutex);
+					wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
+				}
+				const auto done = PipelineCreations();
+				const auto last = std::chrono::steady_clock::time_point(
+				    std::chrono::steady_clock::duration(PipelineLastCreation()));
+				if (stop.stop_requested() || done == saved || std::chrono::steady_clock::now() - last < std::chrono::seconds(20))
+					continue;
+				std::lock_guard save(m_driver_cache_mutex);
+				if (SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size)) saved = done;
+			}
+		});
+	}
 	// Table mode pipelines (src/local/table-xpr.inc) in a cache of their own: the static precompile holds none of
 	// them (each compiles in ~0.1-4 s), they are saved once their compiles settle (not only at a clean exit), and
 	// they do not push the main cache past its limit.
@@ -1931,7 +1956,10 @@ bool PipelineCache::Save() {
 	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
 	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
 	bool saved = inputs_saved;
-	if (m_driver_cache != nullptr) saved &= SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+	if (m_driver_cache != nullptr) {
+		std::lock_guard driver(m_driver_cache_mutex);
+		saved &= SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+	}
 	if (m_table_cache != nullptr) {
 		std::lock_guard table(m_table_cache_mutex);
 		saved &= SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size);
