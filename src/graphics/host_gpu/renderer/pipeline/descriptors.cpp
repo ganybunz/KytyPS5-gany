@@ -519,6 +519,31 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	}
 }
 
+// Whether a chain of `levels` mips stores the first physical.levels mips exactly where a chain of
+// physical.levels does (the added mips fall into the existing mip tail), so a view past the
+// descriptor's last mip addresses memory of the same image (the Play build's 041874f6).
+static bool ExtraMipsKeepLayout(const TileSurfaceDescription& physical, uint32_t levels) {
+	if (levels <= physical.levels || levels > 16) {
+		return false;
+	}
+	auto extended   = physical;
+	extended.levels = levels;
+	TileSurfaceLayout stored {};
+	TileSurfaceLayout view {};
+	if (!TileGetTiledTextureLayout(physical, stored) || !TileGetTiledTextureLayout(extended, view) ||
+	    stored.first_tail_level != view.first_tail_level ||
+	    stored.block_slice_size != view.block_slice_size || stored.total_size != view.total_size) {
+		return false;
+	}
+	return std::equal(std::begin(stored.mips), std::begin(stored.mips) + physical.levels, std::begin(view.mips),
+	                  [](const TileMipLayout& a, const TileMipLayout& b) {
+		                  return a.offset == b.offset && a.size == b.size && a.width == b.width &&
+		                         a.height == b.height && a.padded_width == b.padded_width &&
+		                         a.padded_height == b.padded_height && a.tail_x == b.tail_x &&
+		                         a.tail_y == b.tail_y;
+	                  });
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -644,11 +669,28 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto max_mip      = resource.r128 ? last_level : descriptor.MaxMip();
-	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
+	auto       levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	const bool dynamic_storage =
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-	const auto view_last_level =
+	auto view_last_level =
 	    !multisampled && !dynamic_storage ? std::min(last_level, max_mip) : last_level;
+	// A view past the last mip (Astro Bot: a downsample of a 1920x1080 six-mip chain writes mip 6)
+	// takes the levels it names when they leave the stored mips in place (they fall in the mip tail).
+	if (!multisampled && base_level <= last_level && last_level > max_mip) {
+		const auto view_type = TextureType(descriptor);
+		const bool view_volume = view_type == Prospero::ImageType::kColor3D;
+		const bool view_layered = view_type == Prospero::ImageType::kColor1DArray ||
+		                          view_type == Prospero::ImageType::kColor2DArray;
+		const auto view_depth = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+		const TileSurfaceDescription physical {
+		    descriptor.Format(), descriptor.TileMode(),
+		    view_volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D, width, height,
+		    view_volume ? view_depth : 1u, levels, view_layered ? view_depth : 1u};
+		if (ExtraMipsKeepLayout(physical, static_cast<uint32_t>(last_level) + 1u)) {
+			levels          = static_cast<uint32_t>(last_level) + 1u;
+			view_last_level = last_level;
+		}
+	}
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
@@ -656,14 +698,21 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// A stale descriptor in a slot the shader does not sample (seen while a level loads) can be
 	// invalid; a sampled view of it is bound as null like an unrepresentable one, a storage view
 	// (written back) still has to be exact.
-	const auto bind_null = [&](const std::string& report) -> TextureBinding {
-		if (storage) {
+	// past_chain: a storage view whose mips all lie past the descriptor's last mip (and past what the
+	// stored layout holds) writes mips the image does not have; it binds a null storage image (logged).
+	const auto bind_null = [&](const std::string& report, bool past_chain = false) -> TextureBinding {
+		if (storage && !past_chain) {
 			EXIT("%s\n", report.c_str());
 		}
 		if (m_unrepresentable_textures.insert(address).second) {
+			if (storage) {
+				std::printf("TextureCache: %s, storage view past the mip chain bound as null\n", report.c_str());
+				std::fflush(stdout);
+			}
 			LOGF("TextureCache: %s, bound as null\n", report.c_str());
 		}
-		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
 	};
@@ -681,7 +730,8 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		    static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
 		    static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, address,
 		    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
-		    descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]));
+		    descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]),
+		    !multisampled && base_level > max_mip);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
