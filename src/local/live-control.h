@@ -107,6 +107,8 @@ inline void Flip() {
 	// idle_ms is time the emulated GPU command thread waited for guest work, not physical GPU idle time.
 	// full_upload_kib is guest image bytes counted by whole-image InitializeImage uploads; it is neither
 	// elapsed upload time nor a measurement of host VRAM/PCIe traffic.
+	// sync_reads_* and rb_queue_* are counts of GPU-owned guest reads and readback-copy path selections;
+	// rb_queue_* count readback batches, not guest load instructions.
 	// *_wait_ms / compile_ms: the render thread's waits as LiveCensus times them, inclusive; they nest
 	// (download_wait encloses waits that also count in gpu_wait and readback_wait) and are not to be added
 	// up. *_self_ms: the same without the waits nested in them, and any_wait_ms the time in any wait: these
@@ -119,14 +121,18 @@ inline void Flip() {
 		if (file != nullptr) {
 			std::fprintf(file, "frame,end_ms,frame_ms,idle_ms,gpu_wait_ms,readback_wait_ms,download_wait_ms,compile_ms,"
 			                   "sync_downloads,async_readbacks,region_syncs,upload_kib,full_upload_kib,any_wait_ms,"
-			                   "gpu_self_ms,readback_self_ms,download_self_ms,compile_self_ms,linear_copies,copy_forwards,phase\n");
+			                   "gpu_self_ms,readback_self_ms,download_self_ms,compile_self_ms,linear_copies,copy_forwards,"
+			                   "sync_reads_render,sync_reads_guest,srt_watched_reads,rb_queue_done,rb_queue_inflight,"
+			                   "rb_queue_verified,rb_queue_mismatch,phase\n");
 		}
 		return file;
 	}();
 	if (frame_log != nullptr) {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::SyncDownloads, C::AsyncReadbacks, C::RegionSyncs, C::UploadBytes,
-		                                     C::FullUploadBytes, C::LinearCopies, C::CopyForwards};
+		                                     C::FullUploadBytes, C::LinearCopies, C::CopyForwards, C::SyncReadsRender,
+		                                     C::SyncReadsGuest, C::SrtWatchedReads, C::RbQueueDone, C::RbQueueInflight,
+		                                     C::RbQueueVerified, C::RbQueueMismatch};
 		static std::chrono::steady_clock::time_point  start = std::chrono::steady_clock::now(), last {};
 		static int64_t                                last_idle = 0, last_any = 0;
 		static std::array<int64_t, LiveCensus::Waits> last_waits {}, last_self {};
@@ -171,8 +177,12 @@ inline void Flip() {
 			std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_wait_any_ns - last_any) / 1e6);
 			for (size_t i = 0; i < LiveCensus::Waits && i < 4; ++i)
 				std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_wait_self_ns[i] - last_self[i]) / 1e6);
-			std::fprintf(frame_log, ",%llu,%llu,%s\n", static_cast<unsigned long long>(delta[5]),
-			             static_cast<unsigned long long>(delta[6]), phase);
+			std::fprintf(frame_log, ",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%s\n",
+			             static_cast<unsigned long long>(delta[5]), static_cast<unsigned long long>(delta[6]),
+			             static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]),
+			             static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]),
+			             static_cast<unsigned long long>(delta[11]), static_cast<unsigned long long>(delta[12]),
+			             static_cast<unsigned long long>(delta[13]), phase);
 			std::fflush(frame_log);
 		}
 		last      = now;
@@ -190,7 +200,9 @@ inline void Flip() {
 		                                     C::XprMissRefused, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
 		                                     C::UploadBytes, C::AsyncImageBytes, C::FullUploadBytes,
 		                                     C::BufferRegistrations, C::RegionSyncs, C::SyncDownloads, C::AsyncReadbacks,
-		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines};
+		                                     C::ReadbackParts, C::ReadbackRegions, C::RbQueueDone, C::RbQueueInflight,
+		                                     C::RbQueueVerified, C::RbQueueMismatch, C::SyncReadsRender, C::SyncReadsGuest,
+		                                     C::SrtWatchedReads, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines};
 		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile"};
 		static std::chrono::steady_clock::time_point     last {};
 		static int64_t                                   last_idle = 0;
