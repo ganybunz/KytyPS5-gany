@@ -73,6 +73,15 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+bool SmallUploadRingEnabled() {
+	const auto* value = std::getenv("KYTY_RAM_SMALL_UPLOAD_RING");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+uint64_t UploadRingSize() {
+	return SmallUploadRingEnabled() ? 128 * MiB : 512 * MiB;
+}
+
 // AsyncUpload call (context: the guest address): an image span with unmapped parts (a streamed
 // texture pool) into staging, the mapped parts as they are and the rest as zeros.
 void ReadMappedOrZeroCall(void* context, uint64_t destination, uint64_t size) {
@@ -1145,7 +1154,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize()),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
       m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,

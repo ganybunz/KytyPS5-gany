@@ -2606,8 +2606,11 @@ public:
     scheduler.Begin(registers, user_config, shaders);
     GpuResourceManager resources(m_runtime_context, scheduler);
     auto &cache = resources.GetBufferCache();
-    constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
-        {MemoryUsage::Upload, 512ull << 20},
+    const auto *small_upload_flag = std::getenv("KYTY_RAM_SMALL_UPLOAD_RING");
+    const bool small_upload_ring =
+        small_upload_flag != nullptr && std::strcmp(small_upload_flag, "1") == 0;
+    const std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
+        {MemoryUsage::Upload, small_upload_ring ? (128ull << 20) : (512ull << 20)},
         {MemoryUsage::Stream, 64ull << 20},
         {MemoryUsage::Download, 32ull << 20},
         {MemoryUsage::DeviceLocal, 128ull << 20},
