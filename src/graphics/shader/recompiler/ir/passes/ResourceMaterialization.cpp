@@ -815,6 +815,17 @@ struct ImageRemap {
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
+// KYTY_PORTABLE_DISABLE=<formats,stride,tables,null>: portable modules without some of their parts, to find
+// one a driver gets wrong (bisection; the static precompile assumes all of them).
+bool PortableFeature(std::string_view feature) {
+	if (!PortableShaders()) return false;
+	static const std::string disabled = [] {
+		const char* value = std::getenv("KYTY_PORTABLE_DISABLE");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	return disabled.find(feature) == std::string::npos;
+}
+
 bool PortableShaders() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PORTABLE_SHADERS");
@@ -831,7 +842,7 @@ static Decoder::ImageDimension NullImageDimension(Decoder::ImageDimension declar
 		case Decoder::ImageDimension::Dim1D:
 		case Decoder::ImageDimension::Dim1DArray:
 		case Decoder::ImageDimension::Dim2DArray:
-		case Decoder::ImageDimension::Dim3D: return PortableShaders() ? declared : Decoder::ImageDimension::Dim2D;
+		case Decoder::ImageDimension::Dim3D: return PortableFeature("null") ? declared : Decoder::ImageDimension::Dim2D;
 		default: return Decoder::ImageDimension::Dim2D;
 	}
 }
@@ -858,7 +869,7 @@ void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& 
 			image.dimension = layers;
 		}
 	}
-	if (!PortableShaders()) {
+	if (!PortableFeature("stride")) {
 		return;
 	}
 	for (size_t i = 0; i < specialization.buffers.size() && i < info.buffers.size(); i++) {
@@ -871,7 +882,7 @@ void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& 
 
 bool PortableFormats(const ShaderInfo& info, ResourceSpecialization& specialization) {
 	bool changed = false;
-	if (!PortableShaders()) {
+	if (!PortableFeature("formats")) {
 		return changed;
 	}
 	for (size_t i = 0; i < specialization.buffers.size() && i < info.buffers.size(); i++) {
@@ -1065,7 +1076,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	// Portable modules: a table's candidates padded with null images to a power of two, its key
 	// mapping found through a header word (IndirectMappingHeader), so the module depends on neither
 	// its exact size nor its key count.
-	const bool portable = PortableShaders();
+	const bool portable = PortableFeature("tables");
 	auto&      padded   = workspace.padded_candidates;
 	padded.clear();
 	for (const auto& table: snapshot.indirect_images) {

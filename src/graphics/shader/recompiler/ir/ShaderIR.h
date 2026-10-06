@@ -426,6 +426,7 @@ struct BufferWord {
 // compiled ahead from the game files (tools/local/static-precompile). Buffers take those values
 // from their buffer words (BufferWord) in the shader data.
 bool PortableShaders();
+bool PortableFeature(std::string_view feature); // KYTY_PORTABLE_DISABLE
 
 inline constexpr uint32_t BufferAddTidBit = 1u << 20u;
 
