@@ -42,6 +42,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <fstream>
 #include <functional>
 #include <condition_variable>
@@ -2212,6 +2213,20 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
+	// KYTY_DEPTH_BOUNDS_LOG=1: each new depth-bounds pair a draw asks for (the bounds are part of the pipeline,
+	// so every pair is a pipeline of its own; upstream 98401022 made them dynamic). First 64 pairs.
+	static const bool log_depth_bounds = std::getenv("KYTY_DEPTH_BOUNDS_LOG") != nullptr;
+	if (log_depth_bounds && depth.depth_bounds_test_enable) {
+		static std::mutex                                 bounds_mutex;
+		static std::set<std::pair<uint32_t, uint32_t>> bounds_seen;
+		const std::pair<uint32_t, uint32_t> key {std::bit_cast<uint32_t>(depth.depth_min_bounds),
+		                                         std::bit_cast<uint32_t>(depth.depth_max_bounds)};
+		std::lock_guard lock(bounds_mutex);
+		if (bounds_seen.insert(key).second && bounds_seen.size() <= 64) {
+			std::printf("Depth bounds: pair %zu [%g, %g]\n", bounds_seen.size(), depth.depth_min_bounds,
+			            depth.depth_max_bounds);
+		}
+	}
 	static_params.stencil_test_enable      = depth.stencil_test_enable;
 	static_params.stencil_front            = depth.stencil_static_front;
 	static_params.stencil_back             = depth.stencil_static_back;
