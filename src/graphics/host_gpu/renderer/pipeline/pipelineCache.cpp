@@ -565,7 +565,7 @@ struct PipelineCache::ProgramCache {
 				Common::RecoverableExitScope recoverable;
 				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
 				if (!group.plan) group.plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
-				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
+				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization, translated.program.stage);
 				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
 				                                               record.push_cursor);
 				const auto bytes  = result.spirv.size() * sizeof(uint32_t);
@@ -1060,7 +1060,7 @@ struct PipelineCache::ProgramCache {
 		auto translated    = ShaderRecompiler::TranslateProgram(job->record.code, options);
 		job->plan          = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		// Recorded before buffer words (or without them): the permutation the game now selects.
-		ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, job->record.specialization);
+		ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, job->record.specialization, translated.program.stage);
 		job->result        = ShaderRecompiler::CompileProgram(std::move(translated), options, job->record.specialization,
 		                                                      job->record.push_cursor);
 		return job;
@@ -1184,7 +1184,7 @@ struct PipelineCache::ProgramCache {
 				    FinishPermutation(params, options, std::move(job->result), std::move(record.specialization)));
 			} else {
 				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
-				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
+				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization, translated.program.stage);
 				if (entry == programs.end()) {
 					auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 					entry = programs.try_emplace(std::move(key), std::move(plan)).first;

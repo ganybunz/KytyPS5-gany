@@ -823,7 +823,12 @@ bool PortableFeature(std::string_view feature) {
 		const char* value = std::getenv("KYTY_PORTABLE_DISABLE");
 		return value != nullptr ? std::string(value) : std::string();
 	}();
-	return disabled.find(feature) == std::string::npos;
+	for (size_t begin = 0; begin < disabled.size();) {
+		const auto end = std::min(disabled.find_first_of(",/", begin), disabled.size());
+		if (std::string_view(disabled).substr(begin, end - begin) == feature) return false;
+		begin = end + 1;
+	}
+	return true;
 }
 
 bool PortableShaders() {
@@ -847,7 +852,7 @@ static Decoder::ImageDimension NullImageDimension(Decoder::ImageDimension declar
 	}
 }
 
-void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& specialization) {
+void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& specialization, ShaderType stage) {
 	// What the shader cannot tell apart translates to one permutation: the swizzle of an image it
 	// only reads in a format the device converts (only stores and converted texels apply it), and a
 	// texture without layers it samples addressing layers (a one-layer view: the layer is clamped).
@@ -869,7 +874,9 @@ void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& 
 			image.dimension = layers;
 		}
 	}
-	if (!PortableFeature("stride")) {
+	const char* stage_stride = stage == ShaderType::Vertex ? "stride-vs" : stage == ShaderType::Pixel ? "stride-ps"
+	                         : stage == ShaderType::Compute ? "stride-cs" : "stride-other";
+	if (!PortableFeature("stride") || !PortableFeature(stage_stride)) {
 		return;
 	}
 	for (size_t i = 0; i < specialization.buffers.size() && i < info.buffers.size(); i++) {
@@ -1264,7 +1271,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			                static_cast<uint32_t>(format)));
 		}
 	}
-	CanonicalizeSpecialization(program.info, next_specialization);
+	CanonicalizeSpecialization(program.info, next_specialization, program.stage);
 	for (uint32_t root_index = 0; root_index < next_specialization.images.size(); root_index++) {
 		auto& root = next_specialization.images[root_index];
 		if (root.indirect_root != root_index) {

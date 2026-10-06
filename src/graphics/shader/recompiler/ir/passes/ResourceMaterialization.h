@@ -89,7 +89,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 // so a warmup record from before canonicalizes to the permutation the game now selects (but for a
 // null texture, which such a record holds as 2D; MaterializeResources now gives it the dimension
 // the shader declares).
-void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& specialization);
+void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& specialization,
+                                ShaderType stage = ShaderType::Unknown);
 
 // The portable form of a (canonical) specialization: the formatted buffers the code only loads from
 // decode the format of their buffer words (RuntimeBufferFormat) instead of the V#'s. Its module

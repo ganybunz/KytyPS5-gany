@@ -226,7 +226,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				auto& specialization = specializations[variant];
 				if (variant != 0) translated = ShaderRecompiler::TranslateProgram(seed.code, options);
 				// The module a program gets when the game meets it (ProgramCache::Get): portable formats.
-				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, specialization);
+				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, specialization, translated.program.stage);
 				(void)ShaderRecompiler::IR::PortableFormats(translated.program.info, specialization);
 				auto result =
 				    ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, push_cursor);
