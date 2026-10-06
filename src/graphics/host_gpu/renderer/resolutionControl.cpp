@@ -40,10 +40,10 @@ struct Profile {
 	const char* version; // version this profile is scoped to
 	const char* opt_in_env; // optional per-title switch for unverified experiments
 };
-constexpr std::array<Profile, 2> Profiles {{{
+constexpr std::array<Profile, 2> Profiles {{
 	{"PPSA21564", "01.007.000", nullptr}, // ASTRO BOT
 	{"PPSA01342", "01.004.000", "KYTY_DS_DYNAMIC_RESOLUTION"}, // Demon's Souls (opt-in trial only)
-}}};
+}};
 
 // 0: title not known yet, 1: steering this title, 2: not steering this title.
 std::atomic<int> g_title_state {0};
