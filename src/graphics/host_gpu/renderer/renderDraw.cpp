@@ -40,6 +40,7 @@
 #include "native-preparation-state.h"
 #include "slow-log.h"
 #include "xpr-capture.h"
+#include "speculation-state.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-draw-packet.h"
 #include "vulkan-recording.h"
@@ -1594,9 +1595,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// may end rendering or restart the scheduler.
 	if (m_native_xpr_verify.record != nullptr)
 		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
+	// (A table draw of vertices too: TableStore stores what a table try asked for.)
 	if (m_table_xpr)
-		TableStore(buffer, state, topology, primitive_restart_enable, rendering,
-		           !mesh_active && emit.indexed && vertex_bindings.count == 0);
+		TableStore(buffer, state, topology, primitive_restart_enable, rendering, !mesh_active && vertex_bindings.count == 0);
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
 		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)

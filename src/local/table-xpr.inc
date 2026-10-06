@@ -18,6 +18,13 @@
 // data and index state changed) right after a table draw whose emission is the last one in the command buffer
 // has the same pair and draw state, with its pipeline and dynamic state still bound.
 
+// Per role (RenderExecutor::Role): none proven yet.
+static constexpr std::array<uint64_t, RenderExecutor::Roles> NoRoles() {
+	std::array<uint64_t, RenderExecutor::Roles> all {};
+	all.fill(UINT64_MAX);
+	return all;
+}
+
 // A draw state's pipeline.
 struct RenderExecutor::TableVariant {
 	uint64_t                       state          = 0;
@@ -45,9 +52,11 @@ struct RenderExecutor::TableImageSet {
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
-	uint64_t              validated_frame  = UINT64_MAX;
-	uint64_t              resolution_epoch = 0;
-	uint64_t              used_frame       = 0;
+	// Proven current in that frame under those registrations, by role (RenderExecutor::Role: [0] also the frame it was
+	// made or refused in); used in that frame (by any executor).
+	std::array<uint64_t, Roles> validated_frame = NoRoles();
+	std::array<uint64_t, Roles> resolution_epoch {};
+	std::atomic<uint64_t>       used_frame {0};
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
@@ -66,15 +75,16 @@ struct RenderExecutor::TablePair {
 	// program is translated for it (ShaderVertexInputInfo::start_instance_sgpr).
 	int32_t                                                     start_instance = -1;
 	bool                                                        refused  = false;
+	const char* special = nullptr; // a dispatch's: the normal path's special path that takes it (refused)
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {}; // vertex, pixel (null: inactive)
 	std::array<std::vector<Run>, 2>                             runs;
 	std::vector<TableVariant>                                   variants;
 	uint64_t                                                    store_frame = 0;
 	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>> sets; // by T#/S# words
-	TableImageSet*                                              last_set = nullptr;
+	std::array<TableImageSet*, Roles>                           last_set {}; // by role
 	// ShaderMapGeneration under which the shaders at vs and ps were proven those the programs were compiled
-	// from (the game registers shaders often; code replaced at an address resets the pair).
-	uint64_t                                                    generation = UINT64_MAX;
+	// from (the game registers shaders often; code replaced at an address resets the pair), by role.
+	std::array<uint64_t, Roles>                                 generation = NoRoles();
 	// A dispatch's (TableDispatch): its program's input and pipeline, and the normal path's dispatches seen.
 	std::unique_ptr<ShaderComputeInputInfo> compute;
 	ShaderProgram                           compute_program;
@@ -95,6 +105,9 @@ struct RenderExecutor::TableXpr {
 	std::unordered_map<uint64_t, Pair> pairs;          // by shader addresses
 	std::unordered_map<uint64_t, Pair> dispatches;     // by the compute stage's registers (TableDispatchKey)
 	uint64_t collected  = 0;                           // the frame unused image sets were last dropped
+	// Moves when a pair is reset or a set leaves (sets are replaced): an executor reading this catalog drops its last
+	// pair, state and set (RenderExecutor::m_catalog) when it moved since it saw it (seen_epoch, its own table's).
+	uint64_t epoch = 0, seen_epoch = 0;
 	// The next prepared draw of the pair under this state stores (TableStore); the frame's store requests so far.
 	Pair*    store       = nullptr;
 	uint64_t store_state = 0, store_frame = 0;
@@ -111,6 +124,7 @@ struct RenderExecutor::TableXpr {
 	size_t                    last_variant = 0;
 	const NativeXprDrawState* last_state   = nullptr;
 	const TableImageSet*      last_set     = nullptr; // the set the last emission bound
+	uint64_t                  images_epoch = 0;       // TextureCache::ImagesEpoch after it
 	// The game buffer the last arguments came from, and the indices' by their address (each mesh has its own): used
 	// again while no registration changed and the guest wrote none of its region (ObtainBuffer then returns the same
 	// buffer; it streams CPU-dirty ranges).
@@ -146,50 +160,91 @@ struct RenderExecutor::TableXpr {
 // TablePair::portable); the next draw or dispatch compiles them again.
 void RenderExecutor::TableReset(TablePair& pair) {
 	auto& table = *m_table_xpr;
+	EXIT_IF(Role() != 0);
 	for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 	if (table.store == &pair) table.store = nullptr;
 	if (table.last_pair == &pair) table.last_pair = nullptr;
 	table.last_set = nullptr;
-	pair = {.vs = pair.vs, .ps = pair.ps, .generation = pair.generation, .sightings = pair.sightings,
-	        .portable = pair.portable};
+	++table.epoch;
+	// (The key's start instance SGPR too: without it every later draw of the pair failed TableTry's key check.)
+	pair = {.vs = pair.vs, .ps = pair.ps, .start_instance = pair.start_instance, .generation = pair.generation,
+	        .sightings = pair.sightings, .portable = pair.portable};
+}
+
+RenderExecutor::TableXpr& RenderExecutor::OwnTable() {
+	if (!m_table_xpr) m_table_xpr = std::make_shared<TableXpr>();
+	return *m_table_xpr;
+}
+
+// What this executor held of another's catalog (its last pair, state and set), dropped when the owner reset a pair or
+// let a set go since.
+void RenderExecutor::DropStaleCatalog() {
+	auto* catalog = CatalogTable();
+	auto& table   = OwnTable();
+	if (Role() == 0 || catalog == nullptr || catalog->epoch == table.seen_epoch) return;
+	table.seen_epoch = catalog->epoch;
+	table.last_pair  = nullptr;
+	table.last_state = nullptr;
+	table.last_set   = nullptr;
 }
 
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
-	if (!m_table_xpr) m_table_xpr = std::make_shared<TableXpr>();
+	auto& table = OwnTable();
+	// (Another executor's catalog is read under its lock.)
+	std::shared_lock<std::shared_mutex> catalog_read;
+	if (Role() != 0) catalog_read = CatalogRead();
+	DropStaleCatalog();
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
-	auto&       table = *m_table_xpr;
-	auto&       cache = *m_native_xpr;
-	const auto& sh    = buffer.GetShaders();
-	const auto& vs    = sh.GetVs();
+	auto*       catalog = CatalogTable();
+	auto&       cache   = *m_native_xpr;
+	const auto& sh      = buffer.GetShaders();
+	const auto& vs      = sh.GetVs();
 	// The vertex program is the ES stage's (ShaderGetInputInfoVS), without tessellation.
-	if (vs.es_regs.data_addr == 0 || vs.ls_regs.data_addr != 0 || vs.hs_regs.data_addr != 0) return TableResult::Native;
+	if (vs.es_regs.data_addr == 0 || vs.ls_regs.data_addr != 0 || vs.hs_regs.data_addr != 0)
+		return Spec::Refuse("table: stages"), TableResult::Native;
 	const auto frame      = m_context.FrameNumber();
 	const auto vs_address = vs.es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
 	const std::array<uint64_t, 3> pair_key {vs_address, ps_address, static_cast<uint32_t>(vs.start_instance_user_sgpr)};
-	auto& pair = table.pairs[XXH3_64bits(pair_key.data(), sizeof(pair_key))];
-	if (pair.vs == 0) {
-		pair.vs             = vs_address;
-		pair.ps             = ps_address;
-		pair.start_instance = vs.start_instance_user_sgpr;
+	const auto                    pair_hash = XXH3_64bits(pair_key.data(), sizeof(pair_key));
+	// (Another executor's catalog: what it learned, none of it made here.)
+	const auto found = catalog == nullptr || Role() == 0 ? decltype(catalog->pairs.end()) {} : catalog->pairs.find(pair_hash);
+	if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) return Spec::Refuse("table store"), TableResult::Native;
+	auto* own = Role() != 0 ? nullptr : &table.pairs;
+	auto  it  = own != nullptr ? own->find(pair_hash) : found;
+	if (own != nullptr && it == own->end()) {
+		const auto write    = CatalogWrite();
+		it                  = own->try_emplace(pair_hash).first;
+		auto& fresh         = it->second;
+		fresh.vs            = vs_address;
+		fresh.ps            = ps_address;
+		fresh.start_instance = vs.start_instance_user_sgpr;
 	}
+	auto& pair = it->second;
 	if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != vs.start_instance_user_sgpr)
-		return TableResult::Native;
-	if (const auto generation = ShaderMapGeneration(); generation != pair.generation) {
+		return Spec::Refuse("table: pair key"), TableResult::Native;
+	if (const auto generation = ShaderMapGeneration(); generation != pair.generation[Role()]) {
 		if (pair.programs[0] != nullptr &&
 		    (ShaderHashAt(vs_address) != pair.programs[0]->shader_hash ||
 		     (pair.programs[1] != nullptr && ShaderHashAt(ps_address) != pair.programs[1]->shader_hash))) {
-			pair.portable = {};
+			if (Role() != 0) return Spec::Refuse("table: shaders changed"), TableResult::Native;
+			const auto write = CatalogWrite();
+			pair.portable    = {};
 			TableReset(pair);
 		}
-		pair.generation = generation;
+		pair.generation[Role()] = generation;
 	}
-	if (pair.respecialize) TableReset(pair);
-	if (pair.refused) return TableResult::Native;
+	if (pair.respecialize) {
+		if (Role() != 0) return Spec::Refuse("table: shaders changed"), TableResult::Native;
+		const auto write = CatalogWrite();
+		TableReset(pair);
+	}
+	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
 	// A store at most once a frame per pair, within the frame's budget (kyty_local_table_store_budget): while its
 	// programs and pipeline compile, the pair's draws keep the native path.
 	const auto request_store = [&] {
+		if (Spec::Current() != nullptr) return Spec::Refuse("table store"), TableResult::Native;
 		if (pair.waiting) {
 			if (!pair.waiting->load(std::memory_order_acquire)) return TableResult::Native;
 			pair.waiting.reset();
@@ -207,13 +262,14 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		return TableResult::Store;
 	};
 	const auto variant = std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
-	if (variant != pair.variants.end() && variant->refused) return TableResult::Native;
+	if (variant != pair.variants.end() && variant->refused) return Spec::Refuse("table: variant refused"), TableResult::Native;
 	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr)
 		return LiveCounters::Add(LiveCounters::TableStoreVariant), request_store();
 	// The draw state (TableStore captures it).
 	if (cache.last_state == nullptr || cache.last_state_key != cache.state_key) {
-		const auto state_it = cache.states.find(cache.state_key);
-		if (state_it == cache.states.end()) return request_store();
+		const auto& states   = Catalog().NativeXprState().states;
+		const auto  state_it = states.find(cache.state_key);
+		if (state_it == states.end()) return request_store();
 		cache.last_state_key = cache.state_key;
 		cache.last_state     = state_it->second.get();
 	}
@@ -225,9 +281,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
                                    uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
-	auto& table = *m_table_xpr;
+	std::shared_lock<std::shared_mutex> catalog_read;
+	if (Role() != 0) catalog_read = CatalogRead();
+	DropStaleCatalog();
+	auto& table = OwnTable();
 	if (table.last_pair == nullptr || buffer.IsInvalid() || index_base == 0 || index_bytes == 0 ||
-	    commands.size() > 64 || table.last_pair->generation != ShaderMapGeneration() ||
+	    commands.size() > 64 || table.last_pair->generation[Role()] != ShaderMapGeneration() ||
 	    table.last_pair->start_instance != buffer.GetShaders().GetVs().start_instance_user_sgpr)
 		return false;
 	auto&       variant = table.last_pair->variants[table.last_variant];
@@ -235,7 +294,9 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	if (emit.command != buffer.Handle() || emit.generation != buffer.GraphicsGeneration() ||
 	    emit.state != table.last_state || emit.pipeline != variant.pipeline)
 		return false;
-	Common::LockGuard lock(m_context.GetMutex());
+	// (The GPU thread's: a speculation's thread does not take it.)
+	std::optional<Common::LockGuard> lock;
+	if (Role() == 0) lock.emplace(m_context.GetMutex());
 	if (!NativeXprTargetsCurrent(*table.last_state)) return false;
 	if (TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes, index_type,
 	              direct) != TableResult::Drawn)
@@ -253,6 +314,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
                                                                const TableVariant*       variant,
                                                                const NativeXprDrawState* draw_state,
                                                                std::span<const uint32_t> words) {
+	if (Spec::Current() != nullptr) return Spec::Refuse("table image set"), nullptr;
 	auto       set      = std::make_unique<TableImageSet>();
 	auto&      textures = m_context.GetTextureCache();
 	auto&      buffers  = m_context.GetBufferCache();
@@ -260,10 +322,15 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	const auto& sh      = buffer.GetShaders();
 	const auto& ctx     = buffer.GetRegisters();
 	set->words.assign(words.begin(), words.end());
-	set->validated_frame  = m_context.FrameNumber();
+	set->validated_frame[0] = m_context.FrameNumber();
 	const auto publish = [&] {
-		auto& slot = pair.sets[XXH3_64bits(words.data(), words.size() * sizeof(uint32_t))];
-		if (slot) NativeXprRetireSet(slot->pool, slot->set);
+		const auto write = CatalogWrite();
+		auto&      slot  = pair.sets[XXH3_64bits(words.data(), words.size() * sizeof(uint32_t))];
+		if (slot) {
+			NativeXprRetireSet(slot->pool, slot->set);
+			pair.last_set.fill(nullptr);
+			++m_table_xpr->epoch;
+		}
 		slot = std::move(set);
 		return slot.get();
 	};
@@ -406,9 +473,16 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		else item.write.pBufferInfo = buffer_infos.data() + item.start;
 		writes.push_back(item.write);
 	}
+	// Written now, not queued in order with the recorded commands (the recording stream's descriptor writes): a
+	// speculation's thread binds the set once it is published, which was before the stream wrote it. No recorded
+	// command names the set: a new one, or one retired at a tick completed since.
 	if (!writes.empty())
-		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-	set->resolution_epoch = textures.ResolutionEpoch();
+		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		                                                    , LocalVulkanRecording::DirectDispatch()
+#endif
+		);
+	set->resolution_epoch[0] = textures.ResolutionEpoch();
 	LiveCounters::Add(LiveCounters::TableEvaluations);
 	return publish();
 }
@@ -418,13 +492,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	auto&      textures = m_context.GetTextureCache();
 	const auto frame    = m_context.FrameNumber();
-	if (set.validated_frame == frame && set.resolution_epoch == textures.ResolutionEpoch()) return true;
+	if (set.validated_frame[Role()] == frame && set.resolution_epoch[Role()] == textures.ResolutionEpoch()) return true;
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 7);
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr || image->serial != dep.serial) return false;
 		// The guest rewrote it (a texture streaming in): upload it as the normal path's FindTexture does.
 		if (image->IsCpuDirty()) {
+			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
 			(void)textures.FindTexture(dep.id, dep.desc);
 			image = textures.m_slot_images.try_get(dep.id);
@@ -437,8 +512,8 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		}
 		if (!textures.IsSampledImageCurrent(dep.id, dep.desc)) return false; // (and its LRU, as FindTexture's)
 	}
-	set.validated_frame  = frame;
-	set.resolution_epoch = textures.ResolutionEpoch();
+	set.validated_frame[Role()]  = frame;
+	set.resolution_epoch[Role()] = textures.ResolutionEpoch();
 	return true;
 }
 
@@ -446,7 +521,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 // slots (a pointer read from memory may hold anything: what is read through it must be mapped), and the T#/S# words
 // they make (TableXpr::words, the set's key) and the pixel stage's LOD statistics words. False: something unmapped.
 bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
-	auto&      table     = *m_table_xpr;
+	auto&      table     = OwnTable();
 	const auto stages    = pair.programs[1] != nullptr ? 2u : 1u;
 	auto&      resources = m_context.GetGpuResources();
 	if (const auto epoch = resources.MappingEpoch(); epoch != table.mapping_epoch) {
@@ -472,6 +547,7 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		};
 		// A level's addresses are known together: their lines load at once (the guest's tables are cold).
 		const auto& runs = pair.runs[st];
+		if (table.addresses.size() < runs.size()) table.addresses.resize(runs.size());
 		for (size_t begin = 0, end = 0; begin < runs.size(); begin = end) {
 			for (end = begin; end < runs.size() && runs[end].level == runs[begin].level; ++end) {
 				const auto& run  = runs[end];
@@ -520,38 +596,43 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, TablePair& pair,
                                                         const TableVariant*       variant,
                                                         const NativeXprDrawState* draw_state) {
-	auto&       table = *m_table_xpr;
+	auto&       table = OwnTable();
 	const auto& words = table.words;
 	const auto  frame = m_context.FrameNumber();
-	auto*       set   = pair.last_set;
+	auto*       set   = pair.last_set[Role()];
 	if (set == nullptr || set->words != words) {
 		const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
 		set              = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
-		if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
+		if (set == nullptr || (set->refused && frame >= set->validated_frame[0] + TableImageSet::RetryFrames))
 			set = TableResolveSet(buffer, pair, variant, draw_state, words);
-		pair.last_set = set;
+		pair.last_set[Role()] = set;
 		if (set == nullptr) return nullptr; // (a program still translating)
 	}
-	set->used_frame = frame;
-	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), nullptr;
+	set->used_frame.store(frame, std::memory_order_relaxed);
+	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
 	if (!TableValidateSet(*set)) {
+		if (Spec::Current() != nullptr) return Spec::Refuse("table: set validation"), nullptr;
 		// Resolved again at the next draw that uses it.
+		const auto write = CatalogWrite();
 		if (table.last_set == set) table.last_set = nullptr;
-		pair.last_set = nullptr;
+		pair.last_set.fill(nullptr);
+		++table.epoch;
 		const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
 		NativeXprRetireSet(set->pool, set->set);
 		if (found != pair.sets.end() && found->second.get() == set) pair.sets.erase(found);
 		return nullptr;
 	}
-	// Unused image sets leave once a second.
-	if (frame >= table.collected + 60) {
-		table.collected = frame;
+	// Unused image sets leave once a second (the catalog's owner drops them).
+	if (Role() == 0 && frame >= table.collected + 60) {
+		const auto write = CatalogWrite();
+		table.collected  = frame;
 		for (auto* pairs: {&table.pairs, &table.dispatches})
 			for (auto& [key, held]: *pairs)
 				std::erase_if(held.sets, [&](auto& item) {
-					if (item.second->used_frame + 60 >= frame) return false;
-					if (held.last_set == item.second.get()) held.last_set = nullptr;
+					if (item.second->used_frame.load(std::memory_order_relaxed) + 60 >= frame) return false;
+					held.last_set.fill(nullptr);
 					if (table.last_set == item.second.get()) table.last_set = nullptr;
+					++table.epoch;
 					NativeXprRetireSet(item.second->pool, item.second->set);
 					return true;
 				});
@@ -566,7 +647,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
                                  std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
 	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	auto&      table        = *m_table_xpr;
+	auto&      table        = OwnTable();
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto&      textures     = m_context.GetTextureCache();
 	auto&      upload       = buffer_cache.GetTableUploadBuffer();
@@ -667,7 +748,9 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			const bool  formatted = resource.formatted;
 			if ((resource.written || resource.atomic) != (n < plan.buffers.size())) continue;
 			if (!specialized(resource, words4)) {
+				if (Role() != 0) return Spec::Refuse("table: another format"), false;
 				if (ShaderRecompiler::IR::RuntimeBufferFormat(resource) && i < 32 && ((pair.portable[st] >> i) & 1u) == 0) {
+					const auto write = CatalogWrite();
 					pair.portable[st] |= 1u << i;
 					pair.respecialize = true;
 				}
@@ -700,6 +783,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			}
 			auto& held    = *entries[i].second;
 			bool  current = held.words == words4 && (held.special == 0 || held.special == table.special_generation);
+			// (A speculation's guest memory writes wait for its commit: such a range is resolved, ObtainBuffer decides.)
+			if (const auto* spec = Spec::Current();
+			    current && held.size != 0 && spec != nullptr && spec->JournalIntersects(held.address, held.size))
+				current = false;
 			if (current && held.size != 0 && held.registration != buffer_cache.RegistrationEpoch()) {
 				// Buffers were registered or unregistered since: it holds while none covered its tracker regions.
 				for (auto region = held.address / TRACKER_REGION_SIZE, last = (held.address + held.size - 1) / TRACKER_REGION_SIZE;
@@ -726,14 +813,19 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					// The shader reads whole dwords from the device address; a buffer an image starts at is made from
 					// the image by ObtainBuffer only (SynchronizeBufferFromImage).
 					if (address % 4 != 0 || (formatted && textures.HasImageStartingAt(address))) return false;
-					const bool cpu_written = buffer_cache.IsRegionCpuModified(address, size) &&
+					// (A speculation's: the guest's writes, not those its commit makes current; with none of its own
+					// guest memory writes pending over the range, read as no GPU work wrote it.)
+					auto* const spec        = Spec::Current();
+					const bool  cpu_written = buffer_cache.IsRegionCpuDirty(address, size) &&
 					                         !buffer_cache.IsRegionGpuModified(address, size);
-					if (cpu_written && size <= BufferCache::CACHING_PAGESIZE) {
+					if (cpu_written && size <= BufferCache::CACHING_PAGESIZE &&
+					    (spec == nullptr || !spec->JournalIntersects(address, size))) {
 						// As ObtainBuffer: a small range the guest wrote is read from a copy in the ring (this use only,
 						// nothing held), not uploaded into its buffer.
 						auto [mapped, offset] = upload.Map(size, 16, false);
 						if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
 							upload.Commit();
+							if (spec != nullptr) spec->NoteCleanRead(address, size);
 							const auto [word, stride]      = word_of(words4);
 							block[plan.BufferDword(i)]     = static_cast<uint32_t>(upload.BufferDeviceAddress() + offset);
 							block[plan.BufferDword(i) + 1] = static_cast<uint32_t>((upload.BufferDeviceAddress() + offset) >> 32u);
@@ -751,6 +843,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner ||
 					    buffer_cache.IsRegionCpuModified(address, size))
 						return false;
+					if (Spec::Current() != nullptr && buffer_cache.IsRegionCpuDirty(address, size)) fresh.cpu_epoch = 0;
 					fresh.device       = owner->BufferDeviceAddress() + offset;
 					fresh.dwords       = static_cast<uint32_t>(std::min<uint64_t>(size / 4, UINT32_MAX));
 					fresh.address      = address;
@@ -759,6 +852,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				}
 				held = fresh;
 			}
+			// (A speculation's: the buffer of the range its device address is in.)
+			if (auto* spec = Spec::Current(); spec != nullptr && held.size != 0) spec->NoteBufferRange(held.address, held.size);
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 			block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
@@ -779,7 +874,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
 	const auto global = [&](uint32_t st) { return pair.programs[st] != nullptr && pair.programs[st]->table_plan.global_memory; };
 	if (!global(0) && !global(1)) return;
-	auto&                                               table = *m_table_xpr;
+	auto&                                               table = OwnTable();
 	thread_local ShaderRecompiler::IR::ResourceSnapshot snapshot;
 	thread_local std::vector<GuestRange>                ranges, stage_ranges;
 	ranges.clear();
@@ -802,8 +897,6 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk_buffer,
                                   const NativeXprDrawState* draw_state) {
 	auto& textures = m_context.GetTextureCache();
-	// As CommitBindings': the transitions all precede the one draw or dispatch.
-	const TransitGroup transit_group;
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
@@ -821,11 +914,25 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		if (dep.storage && !image->SafeToDownload()) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			if (image->info.IsVolume()) return false;
-			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer)
-				if (layer >= 32 || textures.IsMetaCleared(dep.desc.info.metadata.range.address, layer)) return false;
+			const auto address = dep.desc.info.metadata.range.address;
+			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer) {
+				if (layer >= 32) return false;
+				if (!textures.IsMetaCleared(address, layer)) continue;
+				// The normal path's FindTexture clears its layers first. A speculation's packet is a hole that does:
+				// the work after it finds them cleared (speculation-state.h).
+				if (auto* spec = Spec::Current())
+					for (uint32_t at = layer; at < std::min(dep.range.base_layer + dep.range.layer_count, 32u); ++at)
+						if (textures.IsMetaCleared(address, at)) spec->ConsumeMeta(address, at);
+				return Spec::Refuse("table: cleared texture"), false;
+			}
 		}
-		image->Transit(dep.layout, dep.access, dep.whole ? std::nullopt : std::optional {dep.range}, vk_buffer);
 	}
+	// As CommitBindings': the transitions all precede the one draw or dispatch.
+	const TransitGroup transit_group;
+	for (const auto& dep: set.images)
+		if (!dep.target)
+			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, dep.whole ? std::nullopt : std::optional {dep.range},
+			                                       vk_buffer);
 	return true;
 }
 
@@ -834,7 +941,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
                                                       std::span<const uint64_t> commands, uint64_t index_base,
                                                       uint64_t index_bytes, vk::IndexType index_type,
                                                       const NativeXprDirectDraw* direct) {
-	auto&       table  = *m_table_xpr;
+	auto&       table  = OwnTable();
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
@@ -842,11 +949,13 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
-	if (!TableEvaluate(pair, user_data)) return TableResult::Native;
+	if (!TableEvaluate(pair, user_data)) return Spec::Refuse("table: evaluation"), TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	const auto* set = TableSet(buffer, pair, &variant, &draw_state);
-	if (set == nullptr) return TableResult::Native;
+	if (auto* spec = Spec::Current(); spec != nullptr && set != nullptr)
+		spec->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
+	if (set == nullptr) return Spec::Refuse("table: no set"), TableResult::Native;
 
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 3);
@@ -866,16 +975,22 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	};
 	const auto obtain = [&](TableXpr::HeldBuffer& held, uint64_t address, uint64_t size,
 	                        auto&& prepare) -> std::pair<Buffer*, uint64_t> {
+		const auto* spec = Spec::Current(); // (its guest memory writes wait for its commit: ObtainBuffer decides)
 		if (held.buffer != nullptr && address >= held.begin && address + size <= held.end &&
 		    held.registration == buffer_cache.RegistrationEpoch() && held.cpu_epoch != 0 &&
-		    cpu_epoch(held.begin, held.end - held.begin) == held.cpu_epoch)
+		    cpu_epoch(held.begin, held.end - held.begin) == held.cpu_epoch &&
+		    (spec == nullptr || !spec->JournalIntersects(address, size))) {
+			if (auto* noting = Spec::Current()) noting->NoteBufferRange(address, size);
 			return {held.buffer, held.buffer->Offset(address)};
+		}
 		held = {};
 		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
 		const auto result = buffer_cache.ObtainBuffer(address, size, false);
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
-		if (result.first != nullptr && buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) == result.first) {
+		const auto owner  = Spec::Current() != nullptr ? buffer_cache.RegisteredBuffer(address, size)
+		                                               : buffer_cache.FindBuffer(address, size);
+		if (result.first != nullptr && buffer_cache.GetBufferIfLive(owner) == result.first) {
 			// The buffer within the tracker region of the address (one region's epoch proves it) when none of it is
 			// CPU-dirty, else the range. (The epoch before the dirty check: a write after it moves the epoch.)
 			const auto region = address & ~(TRACKER_REGION_SIZE - 1);
@@ -887,7 +1002,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 					begin = address;
 					end   = address + size;
 				}
-				if (epoch != 0 && !buffer_cache.IsRegionCpuModified(begin, end - begin))
+				if (epoch != 0 && !buffer_cache.IsRegionCpuDirty(begin, end - begin))
 					held = {begin, end, epoch, buffer_cache.RegistrationEpoch(), result.first};
 			}
 		}
@@ -899,7 +1014,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
 	// (RebindBuffers). Such a draw takes the normal path; the next use finds the buffers registered.
 	const auto registration = buffer_cache.RegistrationEpoch();
-	if (!TableBlocks(pair, user_data, blocks, &writes)) return TableResult::Native;
+	if (!TableBlocks(pair, user_data, blocks, &writes)) return Spec::Refuse("table: blocks"), TableResult::Native;
 	TablePrepareBda(pair, user_data);
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
@@ -917,9 +1032,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		first += count;
 	}
 	auto&      emit       = cache.emit;
-	const bool same_index = emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
-	                        emit.index_base == index_base && emit.index_bytes == index_bytes &&
-	                        emit.index_type == index_type;
+	const bool indexed    = direct == nullptr || direct->indexed; // (a draw of vertices binds no indices)
+	const bool same_index = !indexed || (emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
+	                                     emit.index_base == index_base && emit.index_bytes == index_bytes &&
+	                                     emit.index_type == index_type);
 	std::pair<Buffer*, uint64_t> indices {};
 	if (!same_index) {
 		indices = obtain(table.indices[(index_base * 0x9e3779b97f4a7c15ull) >> 51u], index_base, index_bytes, [&] {
@@ -931,15 +1047,24 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	if (buffer_cache.RegistrationEpoch() != registration)
 		return LiveCounters::Add(LiveCounters::TableRegistered), TableResult::Native;
+	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
+	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 4);
-	if (buffer.IsInvalid()) return TableResult::Native;
+	if (buffer.IsInvalid()) return Spec::Refuse("table: buffer"), TableResult::Native;
 	const auto vk_buffer    = buffer.Handle();
 	const bool same_command = emit.command == vk_buffer && emit.generation == buffer.GraphicsGeneration();
-	if (!NativeXprEmitTargets(draw_state, vk_buffer)) return TableResult::Native;
-	// The set's images in their layouts (a DCC image with a fast clear pending takes the normal path, whose
-	// FindTexture applies it first).
-	if (!TableTransit(*set, vk_buffer, &draw_state)) return TableResult::Native;
+	// The targets and the set's images as the last table draw in this command buffer left them (the same state and
+	// set), no image's state, registration, metadata or bytes changed since: in place, nothing to check or transit.
+	auto&      texture_cache = m_context.GetTextureCache();
+	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
+	                      table.images_epoch == texture_cache.ImagesEpoch() && Spec::Current() == nullptr;
+	if (!in_place) {
+		if (!NativeXprEmitTargets(draw_state, vk_buffer)) return Spec::Refuse("table: targets"), TableResult::Native;
+		// The set's images in their layouts (a DCC image with a fast clear pending takes the normal path, whose
+		// FindTexture applies it first).
+		if (!TableTransit(*set, vk_buffer, &draw_state)) return Spec::Refuse("table: transit"), TableResult::Native;
+	}
 	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
@@ -991,8 +1116,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const uint32_t vertex_offset  = variant.fetch_embedded && index_offset == 0 ? word(vertex.info.vertex_offset_sgpr)
 		                                                                            : index_offset;
 		const uint32_t first_instance = variant.fetch_embedded ? word(vertex.info.instance_offset_sgpr) : 0u;
-		vk_buffer.drawIndexed(direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset),
-		                      first_instance);
+		if (indexed)
+			vk_buffer.drawIndexed(direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset),
+			                      first_instance);
+		else
+			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}
 	for (uint32_t group = 0; group < groups; ++group)
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
@@ -1006,13 +1134,16 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
-	emit.index_base  = index_base;
-	emit.index_bytes = index_bytes;
-	emit.index_type  = index_type;
+	if (indexed) {
+		emit.index_base  = index_base;
+		emit.index_bytes = index_bytes;
+		emit.index_type  = index_type;
+	}
 	table.last_pair    = &pair;
 	table.last_variant = static_cast<size_t>(&variant - pair.variants.data());
 	table.last_state   = &draw_state;
 	table.last_set     = set;
+	table.images_epoch = texture_cache.ImagesEpoch();
 	LiveCounters::Add(LiveCounters::TableDraws, std::max<size_t>(commands.size(), 1));
 	return TableResult::Drawn;
 }
@@ -1054,7 +1185,7 @@ void RenderExecutor::TableRuns(TablePair& pair) {
 	}
 }
 
-// After a prepared draw (`storable`: an indexed draw without vertex buffers) of a pair the table path asked to
+// After a prepared draw (`storable`: a draw without vertex buffers) of a pair the table path asked to
 // store: the pair's table mode programs (with this draw's specializations), the pipeline for this draw state,
 // compiled by a worker, and the draw state.
 void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
@@ -1088,7 +1219,8 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
 			std::printf("Table: VS 0x%llx PS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair->vs),
 			            static_cast<unsigned long long>(pair->ps), reason);
-		pair->refused = true;
+		const auto write = CatalogWrite();
+		pair->refused    = true;
 	};
 	if (!table_state.programs.vertex || vertex == nullptr || !vertex->table_mode)
 		return refuse("no table mode vertex program");
@@ -1097,8 +1229,11 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		return refuse("no table mode pixel program");
 	const std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {vertex, pixel};
 	if (pair->programs[0] == nullptr) {
-		pair->programs = programs;
-		TableRuns(*pair);
+		{
+			const auto write = CatalogWrite();
+			pair->programs   = programs;
+			TableRuns(*pair);
+		}
 		const auto count = [](const ShaderRecompiler::IR::CompiledShaderInfo* program, bool cpu) -> size_t {
 			if (program == nullptr) return 0;
 			const auto& plan = program->table_plan;
@@ -1116,6 +1251,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	} else if (pair->programs != programs) {
 		// Another specialization (the pixel program's export of another draw state's targets): this state's draws
 		// keep the native path.
+		const auto write = CatalogWrite();
 		const auto found = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
 		if (found == pair->variants.end()) pair->variants.push_back({.state = table.store_state, .refused = true});
 		return;
@@ -1125,11 +1261,14 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	    state.ps_active ? &table_state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    table_state.programs.vertex, table_state.programs.pixel, true);
 	if (pipeline == nullptr) pair->waiting = pipelines.PipelineWaiting();
-	auto variant = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
-	if (variant == pair->variants.end()) variant = pair->variants.insert(variant, {.state = table.store_state});
-	variant->pipeline       = pipeline;
-	variant->mapping        = mapping;
-	variant->fetch_embedded = table_state.vs_input_info.fetch_embedded;
+	{
+		const auto write   = CatalogWrite();
+		auto       variant = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
+		if (variant == pair->variants.end()) variant = pair->variants.insert(variant, {.state = table.store_state});
+		variant->pipeline       = pipeline;
+		variant->mapping        = mapping;
+		variant->fetch_embedded = table_state.vs_input_info.fetch_embedded;
+	}
 	NativeXprCaptureState(buffer, state, rendering, table.store_state);
 }
 
@@ -1139,60 +1278,90 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 // whose program allows table mode, is dispatched as table draws are drawn: its slots in a block, its read-only V#s
 // resolved once, its written ones obtained as written at every dispatch (the buffer cache tracks the GPU's writes),
 // its images and samplers in a set; the barriers and the compute chain as the normal path's DispatchDirect. Shaders
-// a special path of the normal path took (linear copies, clears), thread-dimension dispatches, frame capture and
-// frame generation stay on the normal path.
+// a special path of the normal path took (linear copies, clears), indirect thread-dimension dispatches, frame
+// capture and frame generation stay on the normal path.
 
-// The compute stage's registers that select the program (ShaderGetStaticInputInfoCS reads them).
-static uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs) {
+// The compute stage's registers that select the program (ShaderGetStaticInputInfoCS reads them), and whether the
+// dispatch counts threads (another program: ShaderComputeInputInfo::dispatch_thread_dimensions).
+static uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool thread_dimensions) {
 	const auto& r = cs.cs_regs;
 	const std::array<uint64_t, 4> key {r.data_addr, uint64_t {r.num_thread_x} | uint64_t {r.num_thread_y} << 32u,
 	                                   uint64_t {r.num_thread_z} | uint64_t {r.lds_size} << 32u,
 	                                   uint64_t {r.wave_size} | uint64_t {r.user_sgpr} << 8u |
 	                                       uint64_t {r.tidig_comp_cnt} << 16u | uint64_t {r.tgid_x_en} << 24u |
 	                                       uint64_t {r.tgid_y_en} << 25u | uint64_t {r.tgid_z_en} << 26u |
-	                                       uint64_t {r.tg_size_en} << 27u | uint64_t {r.scratch_en} << 28u};
+	                                       uint64_t {r.tg_size_en} << 27u | uint64_t {r.scratch_en} << 28u |
+	                                       uint64_t {thread_dimensions} << 29u};
 	return XXH3_64bits(key.data(), sizeof(key));
 }
 
 // The normal path dispatched (`special`: one of its special paths took the dispatch).
-void RenderExecutor::TableDispatchSeen(const HW::ComputeShaderInfo& cs, bool special) {
-	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) == 0) return;
-	if (!m_table_xpr) m_table_xpr = std::make_shared<TableXpr>();
-	auto& pair = m_table_xpr->dispatches[TableDispatchKey(cs)];
-	pair.vs    = cs.cs_regs.data_addr;
-	if (special) pair.refused = true;
-	++pair.sightings;
+void RenderExecutor::TableDispatchSeen(const HW::ComputeShaderInfo& cs, const char* special, bool thread_dimensions) {
+	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) == 0 || Role() != 0) return;
+	auto&      dispatches = OwnTable().dispatches;
+	const auto key        = TableDispatchKey(cs, thread_dimensions);
+	auto       it         = dispatches.find(key);
+	if (it == dispatches.end() || (special != nullptr && !it->second.refused)) {
+		const auto write = CatalogWrite();
+		it               = dispatches.try_emplace(key).first;
+		it->second.vs    = cs.cs_regs.data_addr;
+		if (special != nullptr) {
+			it->second.refused = true;
+			it->second.special = special;
+		}
+	}
+	++it->second.sightings;
 }
 
 bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-                                   uint64_t indirect_args) {
-	if (!m_table_xpr || FrameCapture::Active() || XprCapture::Enabled() || FrameGen::Enabled()) return false;
-	auto&       table = *m_table_xpr;
+                                   uint64_t indirect_args, bool thread_dimensions) {
+	auto* catalog = CatalogTable();
+	m_dispatch_declined = "dispatch: nothing learned";
+	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled() || FrameGen::Enabled()) return false;
+	std::shared_lock<std::shared_mutex> catalog_read;
+	if (Role() != 0) catalog_read = CatalogRead();
+	DropStaleCatalog();
 	const auto& sh    = buffer.GetShaders();
 	const auto& cs    = sh.GetCs();
-	const auto  found = table.dispatches.find(TableDispatchKey(cs));
-	if (found == table.dispatches.end() || found->second.refused || found->second.sightings < 2 ||
-	    found->second.vs != cs.cs_regs.data_addr)
-		return false;
+	const auto  found = catalog->dispatches.find(TableDispatchKey(cs, thread_dimensions));
+	// (Another executor's: a pair with its programs and pipeline had its sightings.)
+	if (found == catalog->dispatches.end()) return m_dispatch_declined = "dispatch: not seen", false;
+	if (found->second.refused)
+		return m_dispatch_declined = found->second.special != nullptr ? found->second.special : "dispatch: refused", false;
+	if ((Role() == 0 && found->second.sightings < 2) || found->second.vs != cs.cs_regs.data_addr) return false;
 	auto& pair = found->second;
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)
-	if (const auto generation = ShaderMapGeneration(); generation != pair.generation) {
+	// The dispatch executor's sets retire here too (NativeXprTry collects only the draw executor's): without it they
+	// were never reused or freed, a new pool every 1024.
+	NativeXprCollect();
+	// (Another executor's pair: its programs and pipeline as its owner made them, or the normal path's dispatch.)
+	if (Role() != 0 && (pair.programs[0] == nullptr || pair.pipeline == nullptr || pair.respecialize))
+		return Spec::Refuse("table program"), false;
+	if (const auto generation = ShaderMapGeneration(); generation != pair.generation[Role()]) {
 		if (pair.programs[0] != nullptr && ShaderHashAt(pair.vs) != pair.programs[0]->shader_hash) {
-			pair.portable = {};
+			if (Role() != 0) return Spec::Refuse("table: shaders changed"), false;
+			const auto write = CatalogWrite();
+			pair.portable    = {};
 			TableReset(pair);
 		}
-		pair.generation = generation;
+		pair.generation[Role()] = generation;
 	}
-	if (pair.respecialize) TableReset(pair);
-	if (pair.waiting) {
+	if (pair.respecialize) {
+		const auto write = CatalogWrite();
+		TableReset(pair);
+	}
+	if (pair.waiting && Role() == 0) {
 		if (!pair.waiting->load(std::memory_order_acquire)) return false;
 		pair.waiting.reset();
 	}
 	auto& pipelines = m_context.GetPipelineCache();
+	if (Spec::Current() != nullptr && (pair.programs[0] == nullptr || pair.pipeline == nullptr))
+		return Spec::Refuse("table program"), false;
 	if (pair.programs[0] == nullptr) {
 		// The table mode program of the shader the normal path prepared.
 		pair.compute = std::make_unique<ShaderComputeInputInfo>();
 		ResetNativeStageInput(*pair.compute);
+		pair.compute->dispatch_thread_dimensions = thread_dimensions;
 		pair.compute_program = pipelines.GetComputeProgram(cs, buffer.GetRegisters().GetShaderRegisters(), *pair.compute,
 		                                                   nullptr, true, pair.portable[0]);
 		const auto* program = pair.compute->stage.program;
@@ -1204,11 +1373,15 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
 				std::printf("Table: CS 0x%llx refused: no table mode program\n", static_cast<unsigned long long>(pair.vs));
-			pair.refused = true;
+			const auto write = CatalogWrite();
+			pair.refused     = true;
 			return false;
 		}
-		pair.programs[0] = program;
-		TableRuns(pair);
+		{
+			const auto write = CatalogWrite();
+			pair.programs[0] = program;
+			TableRuns(pair);
+		}
 		std::printf("Table: CS 0x%llx (0x%016llx): reads %zu slots (evaluates %zu), buffers %zu (written %zu), "
 		            "images %zu, samplers %zu\n",
 		            static_cast<unsigned long long>(pair.vs), static_cast<unsigned long long>(program->shader_hash),
@@ -1221,7 +1394,11 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		            program->table_plan.images.size(), program->table_plan.samplers.size());
 	}
 	if (pair.pipeline == nullptr) {
-		pair.pipeline = pipelines.TryCreateComputePipeline(*pair.compute, pair.compute_program);
+		const auto* pipeline = pipelines.TryCreateComputePipeline(*pair.compute, pair.compute_program);
+		{
+			const auto write = CatalogWrite();
+			pair.pipeline    = pipeline;
+		}
 		if (pair.pipeline == nullptr) {
 			pair.waiting = pipelines.PipelineWaiting();
 			return false;
@@ -1231,36 +1408,42 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	                                                          std::span<const uint32_t> {}};
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 1);
-	if (!TableEvaluate(pair, user_data)) return false;
+	if (!TableEvaluate(pair, user_data)) return m_dispatch_declined = "table: tables unmapped", false;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 2);
 	const auto* set = TableSet(buffer, pair, nullptr, nullptr);
 	if (set == nullptr) return false;
+	if (auto* spec = Spec::Current()) spec->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 3);
 	std::array<vk::DeviceAddress, 2> blocks {};
 	bool                             storage_writes = false;
 	auto&                            cache          = m_context.GetBufferCache();
 	const auto                       registration   = cache.RegistrationEpoch(); // (as TableDraw's)
-	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return false;
+	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
 	TablePrepareBda(pair, user_data);
 	vk::Buffer indirect_buffer = nullptr;
 	uint64_t   indirect_offset = 0;
 	if (indirect_args != 0) {
 		// As DispatchDirect's: the arguments' owner, made current.
 		cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
-		auto& owner     = cache.GetBuffer(cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t)));
+		const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
+		if (Spec::Current() != nullptr && Spec::Current()->refused != nullptr) return false;
+		auto& owner     = cache.GetBuffer(id);
 		indirect_buffer = owner.Handle();
 		indirect_offset = owner.Offset(indirect_args);
 	}
-	if (cache.RegistrationEpoch() != registration) return LiveCounters::Add(LiveCounters::TableRegistered), false;
+	if (cache.RegistrationEpoch() != registration)
+		return LiveCounters::Add(LiveCounters::TableRegistered), m_dispatch_declined = "table: buffers registered meanwhile", false;
+	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused dispatch.)
+	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return false;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 4);
 	// Emission, as DispatchDirect's.
 	buffer.EndRendering();
 	const bool chain     = DemonsSouls::IsSupportedGame();
 	const auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
-	if (!TableTransit(*set, vk_buffer, nullptr)) return false;
+	if (!TableTransit(*set, vk_buffer, nullptr)) return m_dispatch_declined = "table: transit", false;
 	const auto& pipeline = *pair.pipeline;
 	const auto& program  = *pair.programs[0];
 	const auto& bindings = program.bindings;
@@ -1294,6 +1477,11 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+	} else if (thread_dimensions) {
+		// Thread counts: the groups that cover them, as the normal path's.
+		const auto& r      = cs.cs_regs;
+		const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
+		vk_buffer.dispatch(groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y), groups(groups_z, r.num_thread_z));
 	} else {
 		vk_buffer.dispatch(groups_x, groups_y, groups_z);
 	}

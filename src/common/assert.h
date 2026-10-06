@@ -28,6 +28,9 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// What DbgExit runs before the process ends (output written asynchronously reaching its file).
+void SetExitDrain(void (*drain)()) noexcept;
+
 // While one is alive, EXIT on this thread throws RecoverableExit instead of ending the process: a
 // precompile tool (PipelineCache::WarmSeeds) compiling inputs the game may never use skips them.
 struct RecoverableExit {

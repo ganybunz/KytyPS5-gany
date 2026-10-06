@@ -92,6 +92,7 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 	}
 	switch (opcode) {
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 			s.last_clean = s.chain && !s.dirty;

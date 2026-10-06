@@ -33,8 +33,9 @@ double NamedThreadsCpuSeconds(const char* name);
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 
-// Below-normal priority for the calling thread, kept off the CPUs of a list (KYTY_RENDER_CPUS; null
-// or empty: any CPU): background work that must not hold up the game's threads.
+// The calling thread kept off the CPUs of a list (KYTY_RENDER_CPUS; null or empty: any CPU); with
+// below-normal priority too: background work that must not hold up the game's threads.
+void AvoidCpuList(const char* avoid_cpus);
 void MakeBackgroundThread(const char* avoid_cpus);
 
 // A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
@@ -51,6 +52,12 @@ uint64_t OpenFileForReading(const char* path);
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process
 // stays empty, and closing it would end the game: the process leaves it (it closes).
 void ReleaseRedirectedConsole();
+
+// Standard output written to a file: through a pipe a background thread empties into the file (a write to the
+// redirected log blocked the writer ~6 ms in WriteFile: the GPU thread's per-slow-frame flush took 9% of its time,
+// 10-06). DrainStdout waits until what was written so far reached the file (before the process ends).
+void AsyncStdout();
+void DrainStdout();
 
 // Collects the unwind tables of the loaded images for SampleThread (call before sampling).
 void PrepareSampling();

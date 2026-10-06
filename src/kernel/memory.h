@@ -129,6 +129,9 @@ bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, 
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// A read of the range faults (a page the GPU wrote, its bytes read back when the GPU thread reads them): a thread
+// that is not the GPU thread must not read it.
+bool                   ReadFaults(uint64_t vaddr, uint64_t size);
 // The shader whose resources the GPU thread evaluates (KYTY_SYNC_LOG names it on a drain).
 extern thread_local uint64_t g_srt_shader_hash;
 // GPU thread: whether the buffer cache holds GPU-written bytes in the range (a CPU read of it drains the GPU).

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "speculation-state.h"
 
 #include <array>
 #include <atomic>
@@ -58,6 +59,9 @@ public:
 	// Appends the (epoch, address) entries logged after `epoch`; false when the
 	// log no longer reaches back that far.
 	[[nodiscard]] bool NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out);
+	// The image (of `serial`) still registered, and no image registered or unregistered over its pages since `epoch`
+	// (a speculation's work used it: speculation.cpp).
+	[[nodiscard]] bool StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const;
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
@@ -85,6 +89,8 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
+	void TouchSpeculated(Image& image, uint64_t serial);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -104,6 +110,12 @@ public:
 	// valid while this value is unchanged.
 	[[nodiscard]] uint64_t MetaEpoch() const {
 		return m_meta_epoch.load(std::memory_order_acquire);
+	}
+	// Moves with any image's barrier state or GPU-written state, registration, metadata or CPU-written bytes: images
+	// found in place (a table draw's targets and set) stay so while it does not.
+	[[nodiscard]] uint64_t ImagesEpoch() const {
+		return ImageStateEpoch() + m_resolution_epoch.load(std::memory_order_acquire) +
+		       m_meta_epoch.load(std::memory_order_acquire) + Image::CpuDirtyEpoch();
 	}
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
@@ -160,6 +172,9 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	// Deleted images a speculation's packet may still read (Spec::PacketsPassed), destroyed once it passed.
+	std::vector<std::pair<ImageId, Spec::PacketMarks>> m_retired;
+	void                                               EraseRetired();
 	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);

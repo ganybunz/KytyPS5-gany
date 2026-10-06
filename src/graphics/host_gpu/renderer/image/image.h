@@ -7,7 +7,9 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
+#include <atomic>
 #include <compare>
+#include <immintrin.h>
 #include <limits>
 #include <optional>
 #include <span>
@@ -19,6 +21,9 @@ namespace Libs::Graphics {
 class Buffer;
 class CommandScheduler;
 struct ImageTestAccess;
+namespace Spec {
+struct ImageEntry;
+} // namespace Spec
 
 using ImageId = Common::SlotId;
 
@@ -55,6 +60,11 @@ struct ImageBinding {
 void BeginTransitGroup() noexcept;
 void EndTransitGroup() noexcept;
 
+// Moves whenever an image's barrier state (layout, access) is set outside a speculation's own view: what was found
+// in place holds while it does not.
+[[nodiscard]] uint64_t ImageStateEpoch() noexcept;
+void                   MoveImageStateEpoch() noexcept;
+
 class TransitGroup final {
 public:
 	TransitGroup() noexcept { BeginTransitGroup(); }
@@ -78,6 +88,16 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	// The whole-image barrier state the calling thread's next transition starts from (a speculative translation's
+	// own once it used the image: speculation-state.h).
+	[[nodiscard]] const VulkanImageState& CurrentState() const;
+	// A speculative translation's work uses the image as it is now (its commit puts it there first: a use without a
+	// transition needs this too); null outside one.
+	Spec::ImageEntry* SpeculativeEntry();
+	// The barrier state set to `state` (each subresource's: `subresources`, unless empty), with the barriers there
+	// from the image's (a speculative translation's work is committed where it found the image).
+	void RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
+	                  vk::CommandBuffer command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -189,7 +209,10 @@ public:
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               ClearGpuModified() noexcept {
+		m_gpu_modified = false;
+		MoveImageStateEpoch();
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	// GPU buffer writes changed guest bytes of the image, which ones unknown.
@@ -197,6 +220,7 @@ public:
 		m_buffer_modified = true;
 		m_buffer_whole    = true;
 		m_buffer_ranges.clear();
+		MoveImageStateEpoch();
 	}
 	// GPU buffer writes changed the image's guest bytes [begin, end): kept as ranges until the image is
 	// refreshed, so a write over part of it (or over an aliased smaller image) refreshes only that part
@@ -207,6 +231,7 @@ public:
 			m_buffer_whole    = false;
 			m_buffer_ranges.clear();
 		}
+		MoveImageStateEpoch();
 		if (m_buffer_whole || begin >= end) {
 			m_buffer_whole = true;
 			return;
@@ -268,6 +293,17 @@ public:
 	uint64_t         serial             = 0;
 	// TextureCache frame of the last full upload (KYTY_TEXTURE_RAM_TRIM cooldown; UINT64_MAX: never).
 	uint64_t         frame_uploaded_last = UINT64_MAX;
+	// The barrier state (backing.state, backing.subresource_states, transit_group): changed under this lock, which a
+	// speculative translation's thread reads it under (SpeculativeEntry).
+	struct StateLock {
+		explicit StateLock(const Image& owner) noexcept: image(owner) {
+			while (image.state_busy.exchange(true, std::memory_order_acquire)) _mm_pause();
+		}
+		~StateLock() { image.state_busy.store(false, std::memory_order_release); }
+		KYTY_CLASS_NO_COPY(StateLock);
+		const Image& image;
+	};
+	mutable std::atomic<bool> state_busy {false};
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
 

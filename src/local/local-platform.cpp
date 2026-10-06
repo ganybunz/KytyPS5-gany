@@ -14,7 +14,12 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <atomic>
+#include <cstdio>
+#include <fcntl.h>
+#include <io.h>
 #include <string>
+#include <thread>
 #else
 #include <cstdio>
 #include <ctime>
@@ -67,6 +72,64 @@ void ReleaseRedirectedConsole() {
 	if (GetConsoleWindow() != nullptr && GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) == FILE_TYPE_DISK &&
 	    GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_DISK)
 		(void)FreeConsole();
+}
+
+static HANDLE                g_stdout_pipe = nullptr; // (the read end)
+static std::atomic<bool>     g_stdout_busy {false};
+
+void AsyncStdout() {
+	const HANDLE original = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (original == nullptr || original == INVALID_HANDLE_VALUE || GetFileType(original) != FILE_TYPE_DISK) return;
+	// (Its own handle to the file: replacing descriptor 1 closes the one the C runtime holds.)
+	HANDLE file = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), original, GetCurrentProcess(), &file, 0, FALSE, DUPLICATE_SAME_ACCESS) == 0)
+		return;
+	HANDLE read_end = nullptr, write_end = nullptr;
+	if (CreatePipe(&read_end, &write_end, nullptr, 4u << 20u) == 0) {
+		CloseHandle(file);
+		return;
+	}
+	const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(write_end), _O_TEXT);
+	if (fd < 0) {
+		CloseHandle(read_end);
+		CloseHandle(write_end);
+		CloseHandle(file);
+		return;
+	}
+	std::fflush(stdout);
+	if (_dup2(fd, _fileno(stdout)) != 0) {
+		_close(fd);
+		CloseHandle(read_end);
+		CloseHandle(file);
+		return;
+	}
+	_close(fd);
+	(void)SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stdout))));
+	g_stdout_pipe = read_end;
+	std::thread([read_end, file] {
+		SetThreadName("Kyty.Stdout");
+		std::vector<char> buffer(256u << 10u);
+		for (;;) {
+			DWORD read = 0;
+			if (ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) == 0 || read == 0) return;
+			g_stdout_busy.store(true, std::memory_order_release);
+			for (DWORD written = 0, at = 0; at < read; at += written)
+				if (WriteFile(file, buffer.data() + at, read - at, &written, nullptr) == 0 || written == 0) break;
+			g_stdout_busy.store(false, std::memory_order_release);
+		}
+	}).detach();
+}
+
+void DrainStdout() {
+	std::fflush(stdout);
+	if (g_stdout_pipe == nullptr) return;
+	// (Bounded: a crash report must not hang the process's end. Idle twice: the writer may have just read.)
+	for (int i = 0, idle = 0; i < 2000 && idle < 2; ++i) {
+		DWORD available = 0;
+		if (PeekNamedPipe(g_stdout_pipe, nullptr, 0, nullptr, &available, nullptr) == 0) return;
+		idle = available == 0 && !g_stdout_busy.load(std::memory_order_acquire) ? idle + 1 : 0;
+		Sleep(1);
+	}
 }
 
 uint32_t ThreadId() {
@@ -285,12 +348,16 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 	return stack_high > stack_low;
 }
 
-void MakeBackgroundThread(const char* avoid_cpus) {
-	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+void AvoidCpuList(const char* avoid_cpus) {
 	DWORD_PTR process = 0, system = 0;
 	if (const auto avoid = static_cast<DWORD_PTR>(CpuListMask(avoid_cpus));
 	    avoid != 0 && GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 && (process & ~avoid) != 0)
 		(void)SetThreadAffinityMask(GetCurrentThread(), process & ~avoid);
+}
+
+void MakeBackgroundThread(const char* avoid_cpus) {
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	AvoidCpuList(avoid_cpus);
 }
 
 uint64_t OpenScratchFile() {
@@ -437,14 +504,18 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 	return found;
 }
 
-void MakeBackgroundThread(const char* avoid_cpus) {
-	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), 10);
+void AvoidCpuList(const char* avoid_cpus) {
 	cpu_set_t set;
 	if (const auto avoid = CpuListMask(avoid_cpus); avoid != 0 && sched_getaffinity(0, sizeof(set), &set) == 0) {
 		for (int cpu = 0; cpu < 64; ++cpu)
 			if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
 		if (CPU_COUNT(&set) != 0) (void)sched_setaffinity(0, sizeof(set), &set);
 	}
+}
+
+void MakeBackgroundThread(const char* avoid_cpus) {
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), 10);
+	AvoidCpuList(avoid_cpus);
 }
 
 // Handles are the file descriptor + 1 (0: none).

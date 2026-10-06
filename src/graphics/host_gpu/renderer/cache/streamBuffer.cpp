@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "device-fault.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -186,6 +187,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		DeviceFault::NoteCreated(m_device_address, size, cpu_address);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -201,6 +203,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
+	DeviceFault::NoteDestroyed(m_device_address);
 	if (m_buffer != nullptr) {
 		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {
 			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);
@@ -409,6 +412,12 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
+}
+
+void StreamBuffer::ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept {
+	for (auto* watches: {&m_current_watches, &m_previous_watches})
+		for (auto& watch: *watches)
+			if (watch.tick == pending) watch.tick = tick;
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

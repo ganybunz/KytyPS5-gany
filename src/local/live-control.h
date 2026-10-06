@@ -78,7 +78,7 @@ inline std::atomic_bool      g_process {false};
 inline int64_t g_render_idle_ns = 0;
 
 // Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
-// at least 50 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
+// at least 20 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
 // The line also has the frame's render-thread wait for guest work, what some counters did in it and its
 // wall-clock time.
 inline void Flip() {
@@ -195,7 +195,7 @@ inline void Flip() {
 		static std::array<uint64_t, counted.size()>      last_counts {};
 		const auto                                       now = std::chrono::steady_clock::now();
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(50.0, SlowLog::HitchThreshold())) {
+		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(__rdtsc()), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
 			for (size_t i = 0; i < LiveCensus::Waits; ++i)

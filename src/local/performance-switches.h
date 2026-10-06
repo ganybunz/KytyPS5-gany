@@ -24,6 +24,7 @@ extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
+extern volatile std::atomic_uint32_t kyty_local_draw_batch;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
@@ -43,6 +44,9 @@ extern volatile std::atomic_uint32_t kyty_local_table_xpr_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 #endif
+// Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
+extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -95,6 +99,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
 	    // Dispatches recorded per submission.
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
+	    // Draws recorded per submission (0: no limit).
+	    Switch {"KYTY_DRAW_BATCH", &kyty_local_draw_batch, 0, 65536},
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
@@ -117,6 +123,8 @@ inline void InitializePerformanceSwitches() {
 	    // Table store requests per frame (0: no limit).
 	    Switch {"KYTY_TABLE_STORE_BUDGET", &kyty_local_table_store_budget, 0, 65536},
 #endif
+	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
+	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 8},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

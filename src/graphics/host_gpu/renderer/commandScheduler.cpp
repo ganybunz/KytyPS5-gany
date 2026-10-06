@@ -6,6 +6,7 @@
 #include "async-upload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
+#include "device-fault.h"
 #endif
 #include "live-trace-gpu.h"
 #include "local-platform.h"
@@ -18,6 +19,8 @@
 extern "C" {
 // Dispatches recorded per submission (KYTY_DISPATCH_BATCH).
 volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
+// Draws recorded per submission (KYTY_DRAW_BATCH, 0: no limit): about 0.5 ms of translated draws.
+volatile std::atomic_uint32_t kyty_local_draw_batch {256};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
@@ -27,6 +30,7 @@ volatile std::atomic<uint32_t> kyty_local_pending_drain_mode {0};
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+static thread_local CommandScheduler::Recorder* t_recorder           = nullptr;
 
 namespace {
 
@@ -42,6 +46,7 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	if (result == vk::Result::eErrorDeviceLost) DeviceFault::Report();
 }
 
 } // namespace
@@ -186,9 +191,29 @@ void CommandScheduler::CompleteDispatch() {
 	// The boundary costs one all-commands dependency, which lets no part of the
 	// next batch begin before this one drains, so its size trades that drain
 	// against how early the queue receives work. Dispatches inside a batch keep
-	// the same chain barriers at any size.
+	// the same chain barriers at any size. (A recorder's buffers are submitted later, whole.)
+	if (t_recorder != nullptr) return;
 	const auto batch = kyty_local_dispatch_batch.load(std::memory_order_relaxed);
 	if (++m_recorded_dispatches < std::clamp(batch, 1u, 65536u)) {
+		return;
+	}
+	CheckActive();
+	m_command.EndRendering();
+	VulkanMemoryBarrier dependency {};
+	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	dependency.dstAccessMask = dependency.srcAccessMask;
+	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
+	                                   0, nullptr, 0, nullptr);
+	Flush();
+}
+
+// As CompleteDispatch for draws: a draw-heavy guest command buffer reaches the GPU in parts while it is still being
+// translated. Whole, the GPU idled through its translation (3-4.5 ms for the big passes) and ran it after, late into the
+// next frame, where the next frame's culling readbacks waited for it.
+void CommandScheduler::CompleteDraws(uint32_t draws) {
+	const auto batch = kyty_local_draw_batch.load(std::memory_order_relaxed);
+	if (t_recorder != nullptr || batch == 0 || (m_recorded_draws += draws) < batch) {
 		return;
 	}
 	CheckActive();
@@ -248,6 +273,10 @@ void CommandScheduler::Shutdown() {
 
 void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
                              HW::Shader& shaders) {
+	if (t_recorder != nullptr) {
+		BeginRecording(*t_recorder, registers, user_config, shaders);
+		return;
+	}
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
@@ -264,8 +293,9 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 }
 
 void CommandScheduler::EndRendering() {
-	if (Active() && !m_command.IsInvalid()) {
-		Current().EndRendering();
+	auto& command = t_recorder != nullptr ? *t_recorder->command : m_command;
+	if (Active() && !command.IsInvalid()) {
+		command.EndRendering();
 	}
 }
 
@@ -280,12 +310,14 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	if (t_recorder != nullptr) throw RecorderRefusal {"FlushAndWait"};
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	if (t_recorder != nullptr) throw RecorderRefusal {"Finish"};
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -296,6 +328,12 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	if (t_recorder != nullptr) {
+		// (A recorder's own work is not submitted: waiting for it would never end.)
+		if (tick >= PendingTick) throw RecorderRefusal {"Wait"};
+		m_master.Wait(tick);
+		return;
+	}
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -312,6 +350,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	if (t_recorder != nullptr) return; // (the owning thread retires them)
 	// The pending queue is empty for the large majority of draws and dispatches.
 	// Refresh() issues a Vulkan timeline query and the drain takes the operation
 	// mutex, so let an atomic count prove there is nothing to retire first. The
@@ -339,6 +378,7 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+	if (t_recorder != nullptr) throw RecorderRefusal {"DeferOperation"};
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -359,6 +399,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	if (t_recorder != nullptr) throw RecorderRefusal {"DeferPriorityOperation"};
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -442,13 +483,21 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
+bool CommandScheduler::Active() const noexcept {
+	return (t_recorder != nullptr ? *t_recorder->command : m_command).m_registers != nullptr;
+}
+
+uint64_t CommandScheduler::CurrentTick() const noexcept {
+	return t_recorder != nullptr ? t_recorder->pending_tick : m_master.CurrentTick();
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }
 
 CommandBuffer& CommandScheduler::Current() {
 	CheckActive();
-	return m_command;
+	return t_recorder != nullptr ? *t_recorder->command : m_command;
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
@@ -464,7 +513,9 @@ namespace {
 // vkEndCommandBuffer + vkQueueSubmit executed by the recording worker, in order with
 // the commands it has replayed. The tick is assigned on the producer as before.
 struct DeferredSubmit {
-	VkCommandBuffer      command;
+	VkCommandBuffer      commands[CommandScheduler::MaxSubmitEntries];
+	bool                 ended[CommandScheduler::MaxSubmitEntries]; // recorded and ended on another thread
+	uint32_t             count;
 	VkQueue              queue;
 	Common::Mutex*       queue_mutex;
 	uint32_t             waits, signals;
@@ -474,23 +525,26 @@ struct DeferredSubmit {
 	VkSemaphore          signal_semaphores[SubmitInfo::MaxSemaphores];
 	uint64_t             signal_ticks[SubmitInfo::MaxSemaphores];
 	uint64_t             tick;
-	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies this buffer reads
-	uint32_t             timestamp_slot;  // live trace
+	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies these buffers read
+	uint32_t             timestamp_slot;  // live trace (the last buffer the stream ends)
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
 	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
 	AsyncUpload::Wait(submit.upload_sequence);
 	LiveTrace::Event(LiveTrace::GpuSubmit, submit.tick, 1);
-	if (submit.timestamp_slot != UINT32_MAX && LiveTrace::g_timestamp_pool != nullptr) {
-		dispatch.vkCmdWriteTimestamp(submit.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-		                             static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool),
-		                             submit.timestamp_slot * 2u + 1u);
-		LiveTrace::g_tick_slot[submit.tick % LiveTrace::TimestampSlots].store(submit.timestamp_slot + 1u,
-		                                                                        std::memory_order_release);
-	}
-	if (dispatch.vkEndCommandBuffer(submit.command) != VK_SUCCESS) {
-		EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
+	for (uint32_t i = 0; i < submit.count; ++i) {
+		if (submit.ended[i]) continue;
+		if (submit.timestamp_slot != UINT32_MAX && i + 1 == submit.count && LiveTrace::g_timestamp_pool != nullptr) {
+			dispatch.vkCmdWriteTimestamp(submit.commands[i], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			                             static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool),
+			                             submit.timestamp_slot * 2u + 1u);
+			LiveTrace::g_tick_slot[submit.tick % LiveTrace::TimestampSlots].store(submit.timestamp_slot + 1u,
+			                                                                        std::memory_order_release);
+		}
+		if (dispatch.vkEndCommandBuffer(submit.commands[i]) != VK_SUCCESS) {
+			EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
+		}
 	}
 	VkTimelineSemaphoreSubmitInfo timeline {};
 	timeline.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
@@ -504,8 +558,8 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	info.waitSemaphoreCount   = submit.waits;
 	info.pWaitSemaphores      = submit.wait_semaphores;
 	info.pWaitDstStageMask    = submit.wait_stages;
-	info.commandBufferCount   = 1;
-	info.pCommandBuffers      = &submit.command;
+	info.commandBufferCount   = submit.count;
+	info.pCommandBuffers      = submit.commands;
 	info.signalSemaphoreCount = submit.signals;
 	info.pSignalSemaphores    = submit.signal_semaphores;
 	VkResult result;
@@ -514,37 +568,60 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 		result = dispatch.vkQueueSubmit(submit.queue, 1, &info, VK_NULL_HANDLE);
 	}
 	if (result != VK_SUCCESS) {
+		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
 	}
 	LocalVulkanRecording::NoteDeferredSubmitDone();
+}
+// A recorded buffer dropped before submission, in order with the commands replayed into it.
+void ReplayDiscard(std::span<const LocalVulkanRecording::Segment> segments,
+                   const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto command = *static_cast<const VkCommandBuffer*>(segments[0].data);
+	if (dispatch.vkResetCommandBuffer(command, 0) != VK_SUCCESS) {
+		EXIT("deferred vkResetCommandBuffer failed\n");
+	}
 }
 } // namespace
 #endif
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	if (t_recorder != nullptr) throw RecorderRefusal {"Submit"};
 	EXIT_IF(m_command.IsInvalid());
+	m_command.EndRendering();
+	// A compute chain's pending barrier closes this buffer (left pending, the next Begin recorded it into a buffer
+	// that had not begun).
+	(void)m_command.Handle();
+	const auto tick       = SubmitBuffer(m_command.m_buffer, false, m_command.m_timestamp_slot, submit);
+	m_command.m_buffer    = nullptr;
+	m_recorded_dispatches = 0;
+	m_recorded_draws      = 0;
+	return tick;
+}
+
+uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	EXIT_IF(m_graphics.queue == nullptr || entries.empty() || entries.size() > MaxSubmitEntries);
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	if (LocalVulkanRecording::DeferredSubmitEnabled()) {
-		m_command.EndRendering();
-		// A compute chain's pending barrier closes this buffer, as End() records it on the direct path
-		// (left pending, the next Begin recorded it into a buffer that had not begun).
-		(void)m_command.Handle();
-		EXIT_IF(m_graphics.queue == nullptr);
 		DeferredSubmit deferred {};
 		// This thread alone allocates ticks and the worker submits them in stream order: no queue
 		// lock here (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
 		deferred.tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), deferred.tick);
-		deferred.command         = m_command.m_buffer;
-		deferred.timestamp_slot  = m_command.m_timestamp_slot;
+		deferred.count          = static_cast<uint32_t>(entries.size());
+		deferred.timestamp_slot = UINT32_MAX;
+		for (size_t i = 0; i < entries.size(); ++i) {
+			deferred.commands[i] = entries[i].buffer;
+			deferred.ended[i]    = entries[i].ended;
+			if (!entries[i].ended) deferred.timestamp_slot = entries[i].timestamp_slot;
+		}
 		deferred.upload_sequence = AsyncUpload::SubmitSequence();
 		deferred.queue           = m_graphics.queue;
-		deferred.queue_mutex = &m_graphics.queue_mutex;
-		deferred.waits       = submit.num_wait_semaphores;
-		deferred.signals     = submit.num_signal_semaphores;
+		deferred.queue_mutex     = &m_graphics.queue_mutex;
+		deferred.waits           = submit.num_wait_semaphores;
+		deferred.signals         = submit.num_signal_semaphores;
 		for (uint32_t i = 0; i < deferred.waits; ++i) {
 			deferred.wait_semaphores[i] = submit.wait_semaphores[i];
 			deferred.wait_ticks[i]      = submit.wait_ticks[i];
@@ -561,16 +638,16 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			LocalVulkanRecording::Drain();
 			ReplaySubmit(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
 		}
-		m_command.m_buffer    = nullptr;
-		m_recorded_dispatches = 0;
 		LiveTrace::Event(LiveTrace::GpuSubmit, deferred.tick);
 		return deferred.tick;
 	}
 #endif
-	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	std::array<vk::CommandBuffer, MaxSubmitEntries> buffers {};
+	for (size_t i = 0; i < entries.size(); ++i) {
+		buffers[i] = entries[i].buffer;
+		if (!entries[i].ended) EXIT_NOT_IMPLEMENTED(buffers[i].end() != vk::Result::eSuccess);
+	}
+	auto& graphics = m_graphics;
 	AsyncUpload::Drain();
 
 	vk::Result result;
@@ -591,8 +668,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = static_cast<uint32_t>(entries.size());
+		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
@@ -606,10 +683,143 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	m_command.m_buffer = nullptr;
-	m_recorded_dispatches = 0;
 	return tick;
+}
+
+std::unique_ptr<CommandScheduler::Recorder> CommandScheduler::CreateRecorder() {
+	auto                      recorder = std::make_unique<Recorder>();
+	vk::CommandPoolCreateInfo create {};
+	create.queueFamilyIndex = m_graphics.queue_family;
+	create.flags = vk::CommandPoolCreateFlagBits::eTransient | vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.createCommandPool(&create, nullptr, &recorder->pool) != vk::Result::eSuccess);
+	recorder->command = std::unique_ptr<CommandBuffer>(new CommandBuffer(*this));
+	return recorder;
+}
+
+void CommandScheduler::DestroyRecorder(std::unique_ptr<Recorder> recorder) {
+	if (!recorder) return;
+	for (const auto& [buffer, tick]: recorder->buffers)
+		if (tick != UINT64_MAX && tick != 0) m_master.Wait(tick);
+	m_graphics.device.destroyCommandPool(recorder->pool, nullptr);
+}
+
+void CommandScheduler::SetThreadRecorder(Recorder* recorder) noexcept {
+	t_recorder = recorder;
+}
+
+CommandScheduler::Recorder* CommandScheduler::ThreadRecorder() noexcept {
+	return t_recorder;
+}
+
+void CommandScheduler::BeginRecording(Recorder& recorder, HW::Context& registers, HW::UserConfig& user_config,
+                                      HW::Shader& shaders) {
+	auto& command = *recorder.command;
+	command.Bind(registers, user_config, shaders);
+	if (!command.IsInvalid()) return;
+	// A buffer whose last submission completed, else a new one.
+	size_t index = recorder.buffers.size();
+	for (size_t i = 0; i < recorder.buffers.size(); ++i) {
+		const auto tick = recorder.buffers[i].second;
+		if (tick != UINT64_MAX && (tick == 0 || m_master.IsFree(tick))) {
+			index = i;
+			break;
+		}
+	}
+	if (index == recorder.buffers.size()) {
+		m_master.Refresh();
+		for (size_t i = 0; i < recorder.buffers.size() && index == recorder.buffers.size(); ++i)
+			if (recorder.buffers[i].second != UINT64_MAX && m_master.IsFree(recorder.buffers[i].second)) index = i;
+	}
+	if (index == recorder.buffers.size()) {
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = recorder.pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		vk::CommandBuffer buffer;
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.allocateCommandBuffers(&allocate, &buffer) != vk::Result::eSuccess);
+		recorder.buffers.emplace_back(buffer, 0);
+	}
+	recorder.buffers[index].second = UINT64_MAX;
+	recorder.open                  = index;
+	command.m_buffer               = recorder.buffers[index].first;
+	command.Begin();
+}
+
+void CommandScheduler::EndRecording(Recorder& recorder) {
+	auto& command = *recorder.command;
+	if (command.IsInvalid()) return;
+	command.EndRendering();
+	(void)command.Handle(); // (a pending compute chain barrier)
+	Recorder::Recorded recorded {.index = recorder.open, .timestamp_slot = command.m_timestamp_slot};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// Through a recording stream the commands are replayed later: the submission ends the buffer, in order.
+	const bool streamed = LocalVulkanRecording::DeferredSubmitEnabled() && !recorder.own_thread;
+#else
+	const bool streamed = false;
+#endif
+	if (!streamed) {
+		EXIT_NOT_IMPLEMENTED(command.m_buffer.end() != vk::Result::eSuccess);
+		recorded.ended = true;
+	}
+	recorder.recorded.push_back(recorded);
+	recorder.open    = SIZE_MAX;
+	command.m_buffer = nullptr;
+}
+
+uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
+	EXIT_IF(t_recorder != nullptr || !recorder.command->IsInvalid() || count > recorder.recorded.size());
+	// This scheduler's open buffer first (its commands precede the recorded ones), its next one begun after them:
+	// what is recorded into a buffer is fenced with the tick the buffer is submitted with (CurrentTick).
+	CheckActive();
+	const bool open = !m_command.IsInvalid();
+	// (One submission for the open buffer and the recorded ones after it.)
+	std::array<SubmitEntry, MaxSubmitEntries> entries {};
+	size_t                                    n = 0;
+	if (open) {
+		m_command.EndRendering();
+		(void)m_command.Handle(); // (a pending compute chain barrier closes it, as Submit's)
+		entries[n++]          = {m_command.m_buffer, false, m_command.m_timestamp_slot};
+		m_command.m_buffer    = nullptr;
+		m_recorded_dispatches = 0;
+		m_recorded_draws      = 0;
+	}
+	uint64_t tick = 0;
+	for (size_t i = 0, first = 0; i < count; ++i) {
+		const auto& recorded = recorder.recorded[i];
+		entries[n++]         = {recorder.buffers[recorded.index].first, recorded.ended, recorded.timestamp_slot};
+		if (n == MaxSubmitEntries || i + 1 == count) {
+			tick = SubmitBuffers({entries.data(), n}, {});
+			for (size_t j = first; j <= i; ++j) recorder.buffers[recorder.recorded[j].index].second = tick;
+			first = i + 1;
+			n     = 0;
+		}
+	}
+	if (n != 0) (void)SubmitBuffers({entries.data(), n}, {}); // (the open buffer alone: nothing recorded)
+	recorder.recorded.erase(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count));
+	if (open) BeginNext();
+	return tick;
+}
+
+void CommandScheduler::DiscardRecorded(Recorder& recorder) {
+	EndRecording(recorder);
+	for (const auto& recorded: recorder.recorded) {
+		const VkCommandBuffer command = recorder.buffers[recorded.index].first;
+		if (recorder.own_thread) { // (ended: begun again, the pool resets it)
+			recorder.buffers[recorded.index].second = 0;
+			continue;
+		}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		const LocalVulkanRecording::Segment segments[] {{&command, sizeof(command)}};
+		if (!recorded.ended && LocalVulkanRecording::EnqueueDeferred(ReplayDiscard, segments, false)) {
+			recorder.buffers[recorded.index].second = 0; // (reset by the stream, before any later use of it there)
+			continue;
+		}
+		if (!recorded.ended) LocalVulkanRecording::Drain();
+#endif
+		EXIT_NOT_IMPLEMENTED(vk::CommandBuffer {command}.reset() != vk::Result::eSuccess);
+		recorder.buffers[recorded.index].second = 0;
+	}
+	recorder.recorded.clear();
 }
 
 void CommandScheduler::BeginNext() {

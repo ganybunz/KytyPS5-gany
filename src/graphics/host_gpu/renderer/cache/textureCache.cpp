@@ -34,6 +34,7 @@
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
+#include "speculation-state.h"
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
@@ -302,6 +303,11 @@ void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) m_registration_pages[page] = epoch;
 }
 
+bool TextureCache::StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const {
+	return image.serial == serial && image.registered &&
+	       !RegistrationsSince(image.info.data.address, image.info.data.size, epoch);
+}
+
 bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) return true;
@@ -412,10 +418,16 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
+	// (A speculation's packet may still read it: Spec::PacketNow.)
+	const auto packet = Spec::PacketNow();
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferOperation([this, id, packet] {
+			m_retired.emplace_back(id, packet);
+			EraseRetired();
+		});
 	} else {
-		m_slot_images.erase(id);
+		m_retired.emplace_back(id, packet);
+		EraseRetired();
 	}
 }
 
@@ -440,6 +452,11 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	if (auto* spec = Spec::Current()) { // (touched when the speculative translation is committed)
+		auto& touched = spec->touched_images;
+		if (touched.empty() || touched.back().first != &image) touched.emplace_back(&image, image.serial);
+		return;
+	}
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
@@ -2075,18 +2092,22 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
 	}
-	auto& image            = m_slot_images[id];
+	auto&      image       = m_slot_images[id];
+	bool       changed     = !(image.info.metadata == desc.info.metadata);
 	image.info.metadata    = desc.info.metadata;
 	auto [entry, inserted] = m_surface_metas.try_emplace(
 	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
 	MetaFilterAdd(desc.info.metadata.range.address);
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	changed |= inserted;
 	auto& metadata = entry->second;
 	if (!inserted && metadata.type == MetaDataInfo::Type::PendingDcc) {
 		metadata.type = MetaDataInfo::Type::Dcc;
+		changed       = true;
 	} else if (metadata.type != MetaDataInfo::Type::Dcc) {
 		EXIT("TextureCache: image reuses non-DCC metadata\n");
 	}
+	// (Only when the record changed: every DCC target acquisition passes here.)
+	if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
 	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
 	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
 		return;
@@ -2388,7 +2409,7 @@ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
 	    !(image->info.resources == desc.info.resources)) {
 		return false;
 	}
-	image->frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	if (Spec::Current() == nullptr) image->frame_accessed_last = m_frame.load(std::memory_order_relaxed);
 	TouchImage(*image);
 	return true;
 }
@@ -2441,7 +2462,7 @@ bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint6
 	// The caller recorded this owner after an ordinary lookup, without an intervening
 	// registration change. A new compatible alias also changes the epoch, so it cannot
 	// silently take precedence over the cached owner. Subresource/format remaps fall back.
-	image->frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	if (Spec::Current() == nullptr) image->frame_accessed_last = m_frame.load(std::memory_order_relaxed);
 	TouchImage(*image);
 	// Nothing registered over the pages since `epoch`, so nothing since `current` either: the
 	// caller's proof moves to the current epoch (registrations stamp their pages under m_lock),
@@ -2647,6 +2668,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		FinishRefresh(image);
 	}
 	image.MarkGpuModified();
+	Spec::NoteGpuWrite(image.info.data.address, image.info.data.size);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -3014,8 +3036,19 @@ uint64_t TextureCache::PendingDownloadTick(uint64_t address, uint64_t size) {
 	return latest;
 }
 
+void TextureCache::TouchSpeculated(Image& image, uint64_t serial) {
+	std::scoped_lock lock {m_lock};
+	if (image.serial != serial || !image.registered) return;
+	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	TouchImage(image);
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source) {
 	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	if (auto* spec = Spec::Current()) {
+		spec->NoteInvalidated(address, size); // (when it is committed)
 		return;
 	}
 	std::scoped_lock lock {m_lock};
@@ -3181,12 +3214,20 @@ bool TextureCache::IsMeta(uint64_t address) {
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
                                  bool* fill_known) {
-	if (!MetaFilterMayHold(address)) return false;
+	// A speculation's answer is as after its holes; one it relies on is noted (speculation-state.h).
+	auto* spec = slice < 32 && fill_value == nullptr && fill_known == nullptr ? Spec::Current() : nullptr;
+	if (spec != nullptr)
+		if (const auto known = spec->KnownMeta(address, slice); known >= 0) return known == 1;
+	const auto not_cleared = [&] {
+		if (spec != nullptr) spec->NoteMetaRead(address, slice);
+		return false;
+	};
+	if (!MetaFilterMayHold(address)) return not_cleared();
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    slice >= 32) {
-		return false;
+		return not_cleared();
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
@@ -3194,7 +3235,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	if (fill_known != nullptr) {
 		*fill_known = found->second.fill_known;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return (found->second.clear_mask & (1u << slice)) != 0 || not_cleared();
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -3209,6 +3250,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_known = false;
+	m_meta_epoch.fetch_add(1, std::memory_order_release); // (a clear pending: cached answers ask again)
 	return true;
 }
 
@@ -3223,6 +3265,7 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_value = fill_value;
 	found->second.fill_known = true;
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	return true;
 }
 
@@ -3271,6 +3314,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	}
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
+		m_meta_epoch.fetch_add(1, std::memory_order_release);
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
 	}
@@ -3369,7 +3413,16 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+void TextureCache::EraseRetired() {
+	std::erase_if(m_retired, [&](const auto& retired) {
+		if (!Spec::PacketsPassed(retired.second)) return false;
+		m_slot_images.erase(retired.first);
+		return true;
+	});
+}
+
 void TextureCache::RunGarbageCollector() {
+	EraseRetired();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	m_tick_history.Record(tick);

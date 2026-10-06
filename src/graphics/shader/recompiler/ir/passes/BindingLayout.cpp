@@ -138,7 +138,8 @@ void EnterTableMode(Program& program) {
 			refuse("an indirect image or one of dynamic mip levels");
 		// A pixel shader may write storage images (the deferred decals: TableResolveSet binds them as CommitBindings
 		// does). Dispatches writing images the table way made the culling chain slower before the exact
-		// specializations, and no faster after them (1-1 same process 51.1 vs 51.0 fps, 10-05).
+		// specializations, and no faster after them (1-1 same process 51.1 vs 51.0 fps, 10-05); under speculation
+		// they made more lost than they saved (10-06: the images their storage writes invalidate stop the commit).
 		if (image.atomic || ((image.written || image.resource_class == ImageResourceClass::Storage) &&
 		                     program.stage != ShaderType::Pixel))
 			refuse("an image the shader writes");

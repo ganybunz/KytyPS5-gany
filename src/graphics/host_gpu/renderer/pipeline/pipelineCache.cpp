@@ -391,6 +391,7 @@ struct PipelineCache::ProgramCache {
 		ShaderComputeInputInfo                         compute;
 		ShaderRecompiler::CompileOptions               options;
 		std::optional<ShaderRecompiler::CompileResult> result;
+		ShaderRecompiler::IR::CompiledShaderInfo       info;             // the result's, taken by the worker
 		vk::ShaderModule                               module = nullptr; // the result's, made by the worker
 		std::string                                    refused;
 		std::atomic<bool>                              done {false};
@@ -638,14 +639,32 @@ struct PipelineCache::ProgramCache {
 		return FinishPermutation(params, options, std::move(result), std::move(specialization));
 	}
 
-	// The device half of CompilePermutation; the SPIR-V may come from a warmup worker.
+	// The device half of CompilePermutation.
 	Permutation FinishPermutation(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
 	                              ShaderRecompiler::CompileResult              result,
+	                              ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		auto info = std::move(result.program).TakeCompiledInfo();
+		return FinishPermutation(params, options, result, std::move(info), std::move(specialization));
+	}
+
+	// On the worker that compiled `result`: its compiled info, and its IR freed there. Both walk every instruction
+	// of the program (the BDA read plan, the destructors), up to ~0.2 s for the largest shaders, which the render
+	// thread paid when it published a worker's permutation.
+	static ShaderRecompiler::IR::CompiledShaderInfo TakeOnWorker(ShaderRecompiler::CompileResult& result) {
+		auto                        info = std::move(result.program).TakeCompiledInfo();
+		[[maybe_unused]] const auto ir   = std::move(result.program);
+		return info;
+	}
+
+	// The device half of CompilePermutation for a result whose info TakeOnWorker took (the SPIR-V and the module
+	// may come from a worker).
+	Permutation FinishPermutation(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+	                              const ShaderRecompiler::CompileResult&       result,
+	                              ShaderRecompiler::IR::CompiledShaderInfo     info,
 	                              ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                              vk::ShaderModule                             module = nullptr) {
 		DumpShaderOriginal(StageName(options.stage), options.shader_hash, params.code, result.decoded_dump);
-		auto permutation = ModulePermutation(options, result.spirv, std::move(result.program).TakeCompiledInfo(),
-		                                     std::move(specialization), module);
+		auto permutation = ModulePermutation(options, result.spirv, std::move(info), std::move(specialization), module);
 		if (options.dump_ir) {
 			if (!options.early_dump) {
 				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());
@@ -910,6 +929,7 @@ struct PipelineCache::ProgramCache {
 						job->result     = ShaderRecompiler::CompileProgram(std::move(translated), job->options,
 						                                                   job->specialization, job->push_data_cursor);
 						job->module     = CreateModule(device, job->options, job->result->spirv);
+						job->info       = TakeOnWorker(*job->result);
 					} catch (const Common::RecoverableExit& refused) {
 						job->refused = refused.message;
 					}
@@ -930,7 +950,7 @@ struct PipelineCache::ProgramCache {
 			if (job->result) {
 				const ShaderParams job_params {.code = job->code, .user_data = job->user_data, .hash = params.hash,
 				                               .back_code = job->back_code};
-				permutation = FinishPermutation(job_params, job->options, std::move(*job->result),
+				permutation = FinishPermutation(job_params, job->options, *job->result, std::move(job->info),
 				                                ShaderRecompiler::IR::ResourceSpecialization {table_specialization},
 				                                job->module);
 				permutation.table_mode = true;
@@ -1037,8 +1057,9 @@ struct PipelineCache::ProgramCache {
 	struct WarmJob {
 		LocalShaderWarmup::Record          record;
 		std::vector<uint32_t>              user_data;
-		ShaderRecompiler::IR::ResourcePlan plan;
-		ShaderRecompiler::CompileResult    result;
+		ShaderRecompiler::IR::ResourcePlan       plan;
+		ShaderRecompiler::CompileResult          result;
+		ShaderRecompiler::IR::CompiledShaderInfo info; // the result's, taken by the worker
 	};
 
 	static uint32_t WarmupThreads() {
@@ -1063,6 +1084,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, job->record.specialization, translated.program.stage);
 		job->result        = ShaderRecompiler::CompileProgram(std::move(translated), options, job->record.specialization,
 		                                                      job->record.push_cursor);
+		job->info          = TakeOnWorker(job->result);
 		return job;
 	}
 
@@ -1181,7 +1203,7 @@ struct PipelineCache::ProgramCache {
 				}
 				ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
 				entry->second.permutations.push_back(
-				    FinishPermutation(params, options, std::move(job->result), std::move(record.specialization)));
+				    FinishPermutation(params, options, job->result, std::move(job->info), std::move(record.specialization)));
 			} else {
 				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
 				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization, translated.program.stage);

@@ -26,7 +26,7 @@ enum Type : uint32_t {
 	RenderIdle    = 14, // a: 1 begin / 0 end, b: 0 empty, 1 blocked
 	ReadbackTicks = 19, // a: read address, b: size | tick the copy is recorded in << 32
 	TickDone      = 20, // a: tick the GPU completed (monitor thread)
-	RenderSlice   = 21, // a: queue | type << 8 | complete << 16 | begin << 17, b: epoch
+	RenderSlice   = 21, // a: queue | type << 8 | complete << 16 | begin << 17, b: epoch | dwords << 32
 	GpuSpan       = 22, // a: tick, b: GPU nanoseconds begin << 32... see GpuSpanNs
 	GpuSpanNs     = 23, // a: GPU begin timestamp (ns), b: GPU end timestamp (ns); follows GpuSpan
 	GpuMark       = 24, // a: mark slot, b: tag (shader address of the draw/dispatch recorded)
@@ -42,6 +42,7 @@ enum Type : uint32_t {
 	ImageUse      = 34, // a: image address, b: size (low 32 bits) | layout << 32 | 1 << 63 when written (`tracew`)
 	SlowOsCall    = 35, // a: address, b: call << 56 | TSC ticks / 1024 (24 bits) << 32 | size in 4 KiB pages
 	FaultDone     = 36, // the handled fault of the thread's last FaultSite: a: 1 write / 0 read, b: fault address
+	GuestCommand  = 37, // render thread runs a guest thread's command (SendCommand): a: 1 begin / 0 end
 };
 
 // SlowOsCall ids: address-space calls that hold the process's memory locks (a page fault anywhere

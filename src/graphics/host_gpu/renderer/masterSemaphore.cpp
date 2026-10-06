@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "live-census.h"
+#include "device-fault.h"
 
 namespace Libs::Graphics {
 
@@ -27,6 +28,8 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	// (A lost device's timeline reads UINT64_MAX: the first sign of the loss, often.)
+	if (result == vk::Result::eErrorDeviceLost || counter == UINT64_MAX) DeviceFault::Report();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -54,6 +57,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result == vk::Result::eErrorDeviceLost) DeviceFault::Report();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

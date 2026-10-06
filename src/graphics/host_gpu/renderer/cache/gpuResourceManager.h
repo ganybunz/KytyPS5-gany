@@ -79,12 +79,15 @@ private:
 	// unmaps that many 64 KiB pool layers within frames, so a proof a few frames old counted as stale.
 	static constexpr uint64_t UnmapGranuleBits = 14, UnmapLeafBits = 16;
 	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_unmap_epochs;
-	// Mapping changes over a registered buffer: the only ones that change RefreshBdaRanges' list (registered
-	// buffers' mapped parts). Every map and unmap rebuilt it before (0.4 ms over ~2200 buffers): dozens a frame
-	// while the game streams textures in and out (rolling in Boletaria). GPU thread.
-	uint64_t m_bda_ranges_epoch = 1;
-	uint64_t m_bda_mapping_epoch = 0, m_bda_registration_epoch = 0;
-	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_old_bda_region_requests;
+	uint64_t m_unmap_latest = 0; // the latest unmap's mapping epoch
+	// The spans whose part of RefreshBdaRanges' list (registered buffers' mapped parts) may have changed since it
+	// last ran: mapping changes over a registered buffer and buffers (un)registered. Only their tracker regions are
+	// collected again: the whole list (0.4 ms over ~2200 buffers) was, several times a frame while the game streams
+	// in a new area. `m_bda_rebuild`: everything (at first, or after more changes than are kept). GPU thread.
+	void                    NoteBdaSpan(uint64_t vaddr, uint64_t size);
+	std::vector<GuestRange> m_bda_spans;
+	bool                    m_bda_rebuild = true;
+	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_fresh_bda_region_requests;
 	GuestGpu*                 m_gpu = nullptr;
 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;
