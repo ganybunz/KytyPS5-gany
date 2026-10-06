@@ -1418,7 +1418,20 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		const auto plan_start = std::chrono::steady_clock::now();
 		TextureTransferPlan       local_plan;
 		const TextureTransferPlan* plan_ptr = nullptr;
-		if (PartialDirtyCandidate(image)) {
+		// Opt-in: GPU-written render/compute surfaces can be refreshed many times even when
+		// they are too small for partial-dirty uploads. Cache their immutable transfer layout
+		// to avoid rebuilding mip/layer copy regions on each buffer-backed refresh.
+		static const bool cache_buffer_upload_plans = [] {
+			const char* value = std::getenv("KYTY_BUFFER_UPLOAD_PLAN_CACHE");
+			return value != nullptr && value[0] == '1';
+		}();
+		const bool target_ds_alias =
+		    (info.extent.width == 1600 && info.extent.height == 900) ||
+		    (info.extent.width == 800 && info.extent.height == 450);
+		const bool cache_buffer_upload_plan =
+		    cache_buffer_upload_plans && image.IsBufferModified() && target_ds_alias &&
+		    info.data.size >= (uint64_t {1} << 20) && info.data.size <= (uint64_t {8} << 20);
+		if (PartialDirtyCandidate(image) || cache_buffer_upload_plan) {
 			plan_ptr = &CachedUploadPlan(image, binding);
 		} else {
 			local_plan = BuildTextureTransfer(image, binding, TransferDirection::Upload);
@@ -1637,13 +1650,18 @@ void TextureCache::InitializeImage(ImageId id) {
 		} else if (image.IsBufferModified() && image.BufferDirtyRanges().empty()) {
 			partial_outcome = "buffer_whole_gate";
 		}
-		// Opt-in one-shot diagnostic for the repeated 1600x900 Demon's Souls image aliases.
+		// Opt-in one-shot diagnostic for repeated 1600x900 and 800x450 Demon's Souls aliases.
 		// The normal upload log reports only the whole fallback, not why partial refresh was skipped.
 		static const bool trace_partial = std::getenv("KYTY_PARTIAL_TRACE") != nullptr;
-		if (trace_partial && !uploaded && image.info.extent.width == 1600 && image.info.extent.height == 900 &&
-		    image.info.data.size >= (uint64_t {6} << 20) && image.info.data.size <= (uint64_t {32} << 20)) {
+		const bool trace_1600x900 = image.info.extent.width == 1600 && image.info.extent.height == 900 &&
+		                            image.info.data.size >= (uint64_t {6} << 20) &&
+		                            image.info.data.size <= (uint64_t {32} << 20);
+		const bool trace_800x450 = image.info.extent.width == 800 && image.info.extent.height == 450 &&
+		                           image.info.data.size >= (uint64_t {1} << 20) &&
+		                           image.info.data.size <= (uint64_t {8} << 20);
+		if (trace_partial && !uploaded && (trace_1600x900 || trace_800x450)) {
 			static std::mutex trace_mutex;
-			static std::array<std::pair<uint64_t, uint8_t>, 32> trace_seen {};
+			static std::array<std::pair<uint64_t, uint8_t>, 64> trace_seen {};
 			bool emit = false;
 			{
 				std::scoped_lock lock {trace_mutex};
