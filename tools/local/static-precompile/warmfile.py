@@ -161,6 +161,8 @@ def xxh3_64(data: bytes) -> int:
 # Enum name tables (parsed from headers in the repo / 3rdparty; read-only)
 # ---------------------------------------------------------------------------------------------
 def _parse_enum(path: Path, start_regex: str, item_regex: str, strip: str = '') -> dict[int, str]:
+    if not path.exists():  # a release package has no headers: the names only label printed values
+        return {}
     text = path.read_text(encoding='utf-8', errors='replace')
     m = re.search(start_regex, text)
     if not m:
