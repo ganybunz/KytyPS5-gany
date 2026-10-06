@@ -1572,10 +1572,14 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		bool uploaded = false;
+		bool        uploaded        = false;
+		const char* partial_outcome  = nullptr;
+		bool        partial_attempt = false;
 		if (image.IsPartiallyCpuDirty() && !image.IsBufferModified()) {
 			g_partial_fail = "";
+			partial_attempt = true;
 			uploaded = UploadImagePartial(image);
+			partial_outcome = uploaded ? "partial_ok" : g_partial_fail;
 			if (!uploaded) {
 				LiveCounters::Add(LiveCounters::PartialFallbacks);
 			}
@@ -1589,10 +1593,63 @@ void TextureCache::InitializeImage(ImageId id) {
 			}();
 			if (buffer_partial) {
 				g_partial_fail = "";
+				partial_attempt = true;
 				uploaded = UploadImagePartial(image, true);
+				partial_outcome = uploaded ? "partial_ok" : g_partial_fail;
 				if (!uploaded) {
 					LiveCounters::Add(LiveCounters::PartialFallbacks);
 				}
+			} else {
+				partial_outcome = "buffer_partial_disabled";
+			}
+		} else if (image.IsBufferModified() && image.IsCpuDirty()) {
+			partial_outcome = "cpu_dirty_gate";
+		} else if (image.IsBufferModified() && image.BufferDirtyRanges().empty()) {
+			partial_outcome = "buffer_whole_gate";
+		}
+		// Opt-in one-shot diagnostic for the repeated 1600x900 Demon's Souls image aliases.
+		// The normal upload log reports only the whole fallback, not why partial refresh was skipped.
+		static const bool trace_partial = std::getenv("KYTY_PARTIAL_TRACE") != nullptr;
+		if (trace_partial && !uploaded && image.info.extent.width == 1600 && image.info.extent.height == 900 &&
+		    image.info.data.size >= (uint64_t {6} << 20) && image.info.data.size <= (uint64_t {32} << 20)) {
+			static std::mutex trace_mutex;
+			static std::array<std::pair<uint64_t, uint8_t>, 32> trace_seen {};
+			bool emit = false;
+			{
+				std::scoped_lock lock {trace_mutex};
+				auto seen = std::find_if(trace_seen.begin(), trace_seen.end(), [&](const auto& item) {
+					return item.first == image.serial;
+				});
+				if (seen == trace_seen.end()) {
+					seen = std::find_if(trace_seen.begin(), trace_seen.end(), [](const auto& item) {
+						return item.first == 0;
+					});
+					if (seen != trace_seen.end()) {
+						seen->first = image.serial;
+					}
+				}
+				if (seen != trace_seen.end() && seen->second < 2) {
+					++seen->second;
+					emit = true;
+				}
+			}
+			if (emit) {
+				const auto& ranges = image.IsBufferModified() ? image.BufferDirtyRanges() : image.CpuDirtyRanges();
+				uint64_t dirty_bytes = 0;
+				for (const auto& range: ranges) {
+					dirty_bytes += range.second - range.first;
+				}
+				std::printf("[tsc %llu] PARTIAL-TRACE serial=%llu addr=0x%llx size=0x%llx layers=%u "
+				            "attempt=%d outcome=%s cpu_dirty=%d buffer_dirty=%d buffer_ranges=%zu dirty_bytes=0x%llx\n",
+				            static_cast<unsigned long long>(__rdtsc()),
+				            static_cast<unsigned long long>(image.serial),
+				            static_cast<unsigned long long>(image.info.data.address),
+				            static_cast<unsigned long long>(image.info.data.size), image.info.resources.layers,
+				            partial_attempt ? 1 : 0,
+				            partial_outcome == nullptr ? "no_partial_path" : partial_outcome,
+				            image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0, ranges.size(),
+				            static_cast<unsigned long long>(dirty_bytes));
+				std::fflush(stdout);
 			}
 		}
 		if (!uploaded) {
