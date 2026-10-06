@@ -1771,19 +1771,25 @@ void PipelineCache::InitializeDriverCache() {
 			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 			std::mutex                  mutex;
 			std::condition_variable_any wake;
-			uint64_t                    saved = PipelineCreations();
+			uint64_t                    saved      = PipelineCreations();
+			auto                        saved_time = std::chrono::steady_clock::now();
 			while (!stop.stop_requested()) {
 				{
 					std::unique_lock lock(mutex);
 					wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
 				}
 				const auto done = PipelineCreations();
+				const auto now  = std::chrono::steady_clock::now();
 				const auto last = std::chrono::steady_clock::time_point(
 				    std::chrono::steady_clock::duration(PipelineLastCreation()));
-				if (stop.stop_requested() || done == saved || std::chrono::steady_clock::now() - last < std::chrono::seconds(20))
+				// Also every 60 s through a long burst (T3b compiled for 5 minutes without a 20 s pause, then was
+				// stopped: only the first save had happened).
+				if (stop.stop_requested() || done == saved ||
+				    (now - last < std::chrono::seconds(20) && now - saved_time < std::chrono::seconds(60)))
 					continue;
 				std::lock_guard save(m_driver_cache_mutex);
 				if (SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size)) saved = done;
+				saved_time = now;
 			}
 		});
 	}
