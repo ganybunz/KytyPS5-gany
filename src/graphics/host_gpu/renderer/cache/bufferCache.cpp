@@ -1553,7 +1553,22 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		before.buffer              = buffer.Handle();
 		before.offset              = 0;
 		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		// KYTY_UPLOAD_BARRIER=transfer (opt-in): the copy waits for earlier transfers only, not all GPU work.
+		// Guest reads of these bytes recorded earlier in this command buffer were submitted before the guest
+		// CPU wrote them (labels are written at GPU completion, so the guest cannot have waited for them):
+		// on the console they may run after the write too. GPU-written bytes are never uploaded (a CPU write
+		// to them reads them back first, in an earlier command buffer). What stays ordered is the
+		// emulator's own transfers over the range (uploads, readback and forward copies, image uploads).
+		// S8: ~500 uploads a frame, each a full drain (2,157 barriers, ~5.5 ms of GPU time a frame).
+		static const bool transfer_only = [] {
+			const char* value = std::getenv("KYTY_UPLOAD_BARRIER");
+			return value != nullptr && std::string_view(value) == "transfer";
+		}();
+		if (transfer_only) {
+			before.srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		}
+		native.pipelineBarrier(transfer_only ? vk::PipelineStageFlagBits::eTransfer
+		                                     : vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
