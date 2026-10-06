@@ -376,7 +376,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	m_partial_plans.erase(image->serial);
+	m_upload_plans.erase(image->serial);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		for (const auto candidate: m_stencil_associations) {
@@ -1326,6 +1326,17 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	return plan;
 }
 
+const TextureCache::TextureTransferPlan& TextureCache::CachedUploadPlan(Image& image,
+                                                                        BindingType binding) {
+	auto& cached = m_upload_plans[image.serial];
+	if (cached.plan == nullptr || cached.binding != binding) {
+		cached.plan    = std::make_shared<TextureTransferPlan>(
+		    BuildTextureTransfer(image, binding, TransferDirection::Upload));
+		cached.binding = binding;
+	}
+	return *cached.plan;
+}
+
 TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const {
 	const auto&  info    = image.info;
 	const auto   binding = UploadBinding(image);
@@ -1405,7 +1416,15 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 
 	if (binding != BindingType::DepthTarget) {
 		const auto plan_start = std::chrono::steady_clock::now();
-		auto plan = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+		TextureTransferPlan       local_plan;
+		const TextureTransferPlan* plan_ptr = nullptr;
+		if (PartialDirtyCandidate(image)) {
+			plan_ptr = &CachedUploadPlan(image, binding);
+		} else {
+			local_plan = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+			plan_ptr  = &local_plan;
+		}
+		const auto& plan = *plan_ptr;
 		SlowLog::Scope slow([&](double ms) {
 			std::printf("SLOW UploadImage %.1f ms (plan %.1f ms) addr=0x%llx size=0x%llx regions=%zu tiles=%zu "
 			            "linear=0x%llx\n",
@@ -1926,13 +1945,7 @@ bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
 	if (info.IsVolume() || base % 256 != 0) {
 		return PartialFail("binding");
 	}
-	auto& cached = m_partial_plans[image.serial];
-	if (cached.plan == nullptr || cached.binding != binding) {
-		cached.plan    = std::make_shared<TextureTransferPlan>(
-            BuildTextureTransfer(image, binding, TransferDirection::Upload));
-		cached.binding = binding;
-	}
-	const auto& plan = *cached.plan;
+	const auto& plan = CachedUploadPlan(image, binding);
 	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() ||
 	    plan.tiles.size() != plan.regions.size()) {
 		return PartialFail("plan");

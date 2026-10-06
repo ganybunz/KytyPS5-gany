@@ -200,6 +200,7 @@ private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] const TextureTransferPlan& CachedUploadPlan(Image& image, BindingType binding);
 	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void TrimUploadedTexture(Image& image, bool cpu_written_only);
@@ -244,13 +245,13 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
-	// UploadImagePartial: the transfer plan of each large image it uploads (by Image::serial);
-	// a 256-layer mip-mapped array has 2816 subresources to plan otherwise on every refresh.
-	struct PartialPlan {
+	// Reused by partial and full uploads. A 256-layer mip-mapped array has 2816 subresources to
+	// plan; rebuilding its transfer layout on each full refresh wastes CPU even when partial falls back.
+	struct UploadPlanCache {
 		BindingType                          binding {};
 		std::shared_ptr<TextureTransferPlan> plan;
 	};
-	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
+	std::unordered_map<uint64_t, UploadPlanCache> m_upload_plans;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	std::atomic<uint64_t>                             m_meta_epoch {1};
 	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
