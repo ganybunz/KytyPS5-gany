@@ -192,8 +192,40 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	// GPU buffer writes changed guest bytes of the image, which ones unknown.
+	void MarkBufferModified() noexcept {
+		m_buffer_modified = true;
+		m_buffer_whole    = true;
+		m_buffer_ranges.clear();
+	}
+	// GPU buffer writes changed the image's guest bytes [begin, end): kept as ranges until the image is
+	// refreshed, so a write over part of it (or over an aliased smaller image) refreshes only that part
+	// (TextureCache::UploadImagePartial from the buffer). Too many ranges count as the whole image.
+	void MarkBufferModified(uint64_t begin, uint64_t end) noexcept {
+		if (!m_buffer_modified) {
+			m_buffer_modified = true;
+			m_buffer_whole    = false;
+			m_buffer_ranges.clear();
+		}
+		if (m_buffer_whole || begin >= end) {
+			m_buffer_whole = true;
+			return;
+		}
+		AddRange(m_buffer_ranges, begin, end);
+		if (m_buffer_ranges.size() > 32) {
+			m_buffer_whole = true;
+			m_buffer_ranges.clear();
+		}
+	}
+	void ClearBufferModified() noexcept {
+		m_buffer_modified = false;
+		m_buffer_whole    = false;
+		m_buffer_ranges.clear();
+	}
+	// The buffer-written ranges, when known (empty: the whole image or none).
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferDirtyRanges() const noexcept {
+		return m_buffer_whole ? s_no_ranges : m_buffer_ranges;
+	}
 
 	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
 	void               MarkStencilModified() noexcept { m_stencil_modified = true; }
@@ -260,7 +292,10 @@ private:
 	bool              m_buffer_modified  = false;
 	bool              m_stencil_modified  = false;
 	bool              m_partial_dirty     = false;
+	bool              m_buffer_whole      = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
+	inline static const std::vector<std::pair<uint64_t, uint64_t>> s_no_ranges {};
 };
 
 namespace ImageOps {

@@ -1579,6 +1579,21 @@ void TextureCache::InitializeImage(ImageId id) {
 			if (!uploaded) {
 				LiveCounters::Add(LiveCounters::PartialFallbacks);
 			}
+		} else if (image.IsBufferModified() && !image.IsCpuDirty() && !image.BufferDirtyRanges().empty()) {
+			// Only the parts GPU buffer writes changed, from the buffer (the Play build's per-64th bands do the
+			// same): ASTRO BOT's splash wrote a 1920x1080 region aliased by a 2432x1368 RGBA16F target and five
+			// more every frame, and each was uploaded whole (~57 MB a frame). KYTY_BUFFER_PARTIAL=0: whole.
+			static const bool buffer_partial = [] {
+				const char* value = std::getenv("KYTY_BUFFER_PARTIAL");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (buffer_partial) {
+				g_partial_fail = "";
+				uploaded = UploadImagePartial(image, true);
+				if (!uploaded) {
+					LiveCounters::Add(LiveCounters::PartialFallbacks);
+				}
+			}
 		}
 		if (!uploaded) {
 			const auto [source, source_offset] =
@@ -1822,7 +1837,7 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 	return true;
 }
 
-bool TextureCache::UploadImagePartial(Image& image) {
+bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
 	const auto& info    = image.info;
 	// A reduced image (KYTY_TEXTURE_QUALITY=reduced) holds guest levels host_mip_skip and up as its levels 0 and up:
 	// dirty bytes of the levels it leaves out are not uploaded, the others go to their level less the skip (as the
@@ -1831,7 +1846,10 @@ bool TextureCache::UploadImagePartial(Image& image) {
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
 	if (binding == BindingType::DepthTarget) {
-		return UploadDepthPartial(image);
+		return from_buffer ? PartialFail("depth") : UploadDepthPartial(image);
+	}
+	if (from_buffer && image.BufferDirtyRanges().empty()) {
+		return PartialFail("buffer_whole");
 	}
 	if (info.IsVolume() || base % 256 != 0) {
 		return PartialFail("binding");
@@ -1847,7 +1865,7 @@ bool TextureCache::UploadImagePartial(Image& image) {
 	    plan.tiles.size() != plan.regions.size()) {
 		return PartialFail("plan");
 	}
-	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
+	if (!from_buffer && kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
 	    !CheckPartialHashes(image)) {
 		return PartialFail("hashes");
 	}
@@ -1862,7 +1880,8 @@ bool TextureCache::UploadImagePartial(Image& image) {
 	};
 	// A fragmented dirty set uploads the whole subresource rather than many small dispatches.
 	constexpr size_t MaxBandsPerSubresource = 16;
-	const auto&          dirty    = image.CpuDirtyRanges();
+	// from_buffer: the ranges GPU buffer writes changed; their newest bytes are in the buffer, not in memory.
+	const auto&          dirty    = from_buffer ? image.BufferDirtyRanges() : image.CpuDirtyRanges();
 	const bool           bands_on = kyty_local_partial_row_bands_mode.load(std::memory_order_relaxed) != 0;
 	uint64_t             picked   = 0;
 	std::vector<Pick>    picks;
@@ -1913,10 +1932,56 @@ bool TextureCache::UploadImagePartial(Image& image) {
 		LiveCounters::Add(LiveCounters::PartialUploads);
 		return true;
 	}
-	// Stage the picked guest ranges back to back; runs that nearly touch stay one piece.
 	std::sort(picks.begin(), picks.end(), [](const Pick& left, const Pick& right) {
 		return left.begin < right.begin;
 	});
+	if (from_buffer) {
+		// The picked tiles detile straight from the image's buffer (as the whole-image upload reads it).
+		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(base, info.data.size);
+		if (source == nullptr) {
+			return PartialFail("buffer_source");
+		}
+		std::vector<GpuTileInfo>         tiles;
+		std::vector<vk::BufferImageCopy> regions;
+		tiles.reserve(picks.size());
+		regions.reserve(picks.size());
+		uint64_t linear_total = 0;
+		for (const auto& pick: picks) {
+			auto tile   = plan.tiles[pick.index];
+			auto region = plan.regions[pick.index];
+			if (pick.last_row != 0) {
+				TileBlockLayout block {};
+				(void)TileGetBlockLayout(tile.family, tile.bytes_per_element, block);
+				const uint32_t texel_height = plan.layout.surface.texture.texel_height;
+				const uint32_t block_rows   = pick.last_row - pick.first_row;
+				const uint32_t first        = pick.first_row * block.block_height;
+				const uint32_t count        = std::min(block_rows * block.block_height, tile.height - first);
+				tile.height                 = count;
+				tile.tiled_height           = block_rows * block.block_height;
+				tile.tiled_size             = pick.end - pick.begin;
+				tile.linear_size            = uint64_t {tile.pitch} * count * tile.bytes_per_element;
+				region.imageOffset.y        = static_cast<int32_t>(first * texel_height);
+				region.imageExtent.height   = std::min(count * texel_height, region.imageExtent.height - first * texel_height);
+			}
+			region.imageSubresource.mipLevel -= skip;
+			const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
+			region.bufferOffset      = linear_offset + (region.bufferOffset - tile.linear_offset);
+			tile.linear_offset       = linear_offset;
+			tile.tiled_offset        = pick.begin - base;
+			linear_total             = linear_offset + tile.linear_size;
+			tiles.push_back(tile);
+			regions.push_back(region);
+		}
+		const auto linear = m_tiler.Detile(source->Handle(), source_offset, info.data.size, linear_total, tiles);
+		for (auto& region: regions) {
+			region.bufferOffset += linear.offset;
+		}
+		image.Upload(regions, linear.buffer, linear.offset, linear.size);
+		LiveCounters::Add(LiveCounters::PartialUploads);
+		LiveCounters::Add(LiveCounters::PartialUploadBytes, picked);
+		return true;
+	}
+	// Stage the picked guest ranges back to back; runs that nearly touch stay one piece.
 	std::vector<BufferCache::StagingPiece> pieces;
 	std::vector<size_t>                    piece_of(picks.size());
 	uint64_t                               total = 0;
@@ -2960,7 +3025,8 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
-		image.MarkBufferModified();
+		image.MarkBufferModified(std::max(address, image.info.data.address),
+		                         std::min(address + size, image.info.data.End()));
 	}
 }
 
