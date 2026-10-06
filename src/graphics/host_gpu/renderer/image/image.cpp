@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 #include "live-trace.h"
-#include "speculation-state.h"
 
 #include <algorithm>
 #include <array>
@@ -27,14 +26,12 @@ namespace Libs::Graphics {
 
 namespace {
 
-// A group is opened and read by the thread that records the commands (each translating thread its own; ids are
-// unique across them). Zero means no group is open, so nothing can match it and nothing is skipped.
-thread_local uint64_t g_transit_group = 0;
-std::atomic<uint64_t> g_transit_group_next {1};
+// Groups are only ever opened and read from the thread that records commands.
+// Zero means no group is open, so nothing can match it and nothing is skipped.
+uint64_t g_transit_group      = 0;
+uint64_t g_transit_group_next = 1;
 
 std::atomic<uint64_t> g_image_serial_next {1};
-
-std::atomic<uint64_t> g_image_state_epoch {1};
 
 [[nodiscard]] inline bool DedupeTransitGroups() {
 	return kyty_local_image_barrier_dedupe.load(std::memory_order_relaxed) != 0;
@@ -120,55 +117,12 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
-// A speculative translation's image state (speculation-state.h): its own, from the image's when it first used it;
-// the open segment notes how it found it.
-Spec::ImageEntry* Image::SpeculativeEntry() {
-	auto* spec = Spec::Current();
-	if (spec == nullptr) return nullptr;
-	const auto [found, inserted] = spec->overlay_index.try_emplace(this, spec->overlay.size());
-	Spec::ImageEntry* entry      = nullptr;
-	if (inserted) {
-		// (As a speculation before it not committed yet leaves it: the commit then finds it there.)
-		const auto* chain = spec->ChainImage(this, serial);
-		entry             = &spec->overlay.emplace_back();
-		entry->image      = this;
-		entry->serial     = serial;
-		if (chain != nullptr) {
-			entry->state        = chain->state;
-			entry->subresources = chain->subresources;
-			entry->group        = chain->group;
-		} else {
-			const StateLock lock(*this);
-			entry->state        = backing.state;
-			entry->subresources = backing.subresource_states;
-			entry->group        = transit_group;
-		}
-	} else {
-		entry = &spec->overlay[found->second];
-	}
-	if (!entry->used) {
-		entry->used               = true;
-		entry->found              = entry->state;
-		entry->found_subresources = entry->subresources;
-		entry->found_group        = entry->group;
-		spec->used.push_back(found->second);
-	}
-	return entry;
-}
-
 const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
-	auto* const entry        = SpeculativeEntry();
-	std::optional<StateLock> lock;
-	if (entry == nullptr) {
-		lock.emplace(*this);
-		MoveImageStateEpoch();
-	}
-	auto& state              = entry != nullptr ? entry->state : backing.state;
-	auto& subresource_states = entry != nullptr ? entry->subresources : backing.subresource_states;
-	auto& group              = entry != nullptr ? entry->group : transit_group;
+	auto& state              = backing.state;
+	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
@@ -257,7 +211,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    (!repeated_write || (guest && state.guest) ||
-		     (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group))) {
+		     (DedupeTransitGroups() && g_transit_group != 0 && transit_group == g_transit_group))) {
 			return barriers;
 		}
 
@@ -279,73 +233,13 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		barriers.push_back(barrier);
 	}
 
-	state = {destination_stage, destination_access, destination_layout, guest};
-	group = g_transit_group;
+	state         = {destination_stage, destination_access, destination_layout, guest};
+	transit_group = g_transit_group;
 	return barriers;
 }
 
-const VulkanImageState& Image::CurrentState() const {
-	if (const auto* spec = Spec::Current()) {
-		if (const auto found = spec->overlay_index.find(this); found != spec->overlay_index.end())
-			return spec->overlay[found->second].state;
-		if (const auto* chain = spec->ChainImage(this, serial)) return chain->state;
-	}
-	return backing.state;
-}
-
-void Image::RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
-                         vk::CommandBuffer command_buffer) {
-	const StateLock       lock(*this);
-	MoveImageStateEpoch();
-	thread_local Barriers barriers;
-	barriers.clear();
-	const auto add = [&](const VulkanImageState& from, const VulkanImageState& to, uint32_t level, uint32_t levels,
-	                     uint32_t layer, uint32_t layers) {
-		if (from.layout == to.layout && from.access_mask == to.access_mask && from.pl_stage == to.pl_stage) return;
-		vk::ImageMemoryBarrier2 barrier {};
-		barrier.srcStageMask        = from.pl_stage;
-		barrier.srcAccessMask       = from.access_mask;
-		barrier.dstStageMask        = to.pl_stage;
-		barrier.dstAccessMask       = to.access_mask;
-		barrier.oldLayout           = from.layout;
-		barrier.newLayout           = to.layout;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.image               = backing.image;
-		barrier.subresourceRange    = {FullAspectMask(backing.format), level, levels, layer, layers};
-		barriers.push_back(barrier);
-	};
-	if (backing.subresource_states.empty() && subresources.empty()) {
-		add(backing.state, state, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);
-	} else {
-		const uint32_t layers = info.resources.layers;
-		const uint32_t count  = info.resources.levels * layers;
-		EXIT_IF((!backing.subresource_states.empty() && backing.subresource_states.size() != count) ||
-		        (!subresources.empty() && subresources.size() != count));
-		for (uint32_t index = 0; index < count; ++index)
-			add(backing.subresource_states.empty() ? backing.state : backing.subresource_states[index],
-			    subresources.empty() ? state : subresources[index], index / layers, 1, index % layers, 1);
-	}
-	backing.state              = state;
-	backing.subresource_states = subresources;
-	if (barriers.empty()) return;
-	m_scheduler.EndRendering();
-	vk::DependencyInfo dependency {};
-	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
-	dependency.pImageMemoryBarriers    = barriers.data();
-	command_buffer.pipelineBarrier2(dependency);
-}
-
-uint64_t ImageStateEpoch() noexcept {
-	return g_image_state_epoch.load(std::memory_order_acquire);
-}
-
-void MoveImageStateEpoch() noexcept {
-	g_image_state_epoch.fetch_add(1, std::memory_order_acq_rel);
-}
-
 void BeginTransitGroup() noexcept {
-	g_transit_group = g_transit_group_next.fetch_add(1, std::memory_order_relaxed);
+	g_transit_group = g_transit_group_next++;
 }
 
 void EndTransitGroup() noexcept {

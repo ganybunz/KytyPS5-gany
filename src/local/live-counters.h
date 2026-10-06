@@ -144,7 +144,7 @@ inline std::atomic_bool g_dispatch_keys_on {std::getenv("KYTY_DISPATCH_KEYS") !=
 // Live `vma <path>`: writes the GPU allocator's detailed statistics (set by vma.cpp).
 inline void (*g_vma_report)(const char* path) = nullptr;
 // Render thread: the last draw (0) or dispatch shader address.
-inline thread_local uint64_t g_last_dispatch_shader = 0;
+inline uint64_t g_last_dispatch_shader = 0;
 
 inline void Add(Id id, uint64_t n = 1) {
 	if (g_single_writer) {

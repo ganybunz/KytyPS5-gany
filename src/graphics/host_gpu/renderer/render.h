@@ -13,7 +13,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <shared_mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -24,9 +23,6 @@ class Context;
 class UserConfig;
 class Shader;
 } // namespace HW
-namespace Spec {
-struct State;
-} // namespace Spec
 
 struct GraphicContext;
 struct ShaderBufferResource;
@@ -155,8 +151,6 @@ public:
 	void               RecordChainAccess(std::span<const ChainAccess> accesses, bool unknown) const;
 	// Local diagnostic (GPU marks): the handle without draining a pending dependency.
 	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
-	// The recorded work count after this buffer's last global barrier (CommandProcessor::EmitGlobalBarrier).
-	[[nodiscard]] uint64_t& BarrierWork() const noexcept { return m_barrier_work; }
 
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -191,7 +185,6 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
-	mutable uint64_t    m_barrier_work = UINT64_MAX;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
@@ -208,11 +201,6 @@ public:
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
 	                    uint64_t indirect_args = 0);
-	// A state pass's direct dispatch (Spec::t_record): the copy the linear copy shader makes (journaled, as a speculation's
-	// CopyBuffer journals it; one on GPU-written memory: its destination written) or the surface a compute clear clears
-	// (predicted), as the catalog knows them.
-	void PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_group_x, uint32_t thread_group_y,
-	                     uint32_t thread_group_z, uint32_t mode, Spec::State& record);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
@@ -282,11 +270,10 @@ private:
 	void                      BindRenderTarget(ImageId id);
 	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
-	// (`cleared`: the metadata address it cleared.)
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer& buffer, uint32_t group_x,
 	                                                     uint32_t group_y, uint32_t group_z,
-	                                                     uint32_t mode, uint64_t& cleared);
+	                                                     uint32_t mode);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -356,13 +343,11 @@ private:
 
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
-	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
-	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only).
+	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances.
 	struct NativeXprDirectDraw {
 		uint64_t index_address  = 0;
 		uint32_t index_count    = 0;
 		uint32_t instance_count = 1;
-		bool     indexed        = true;
 	};
 	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands`.
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
@@ -380,22 +365,8 @@ public:
 	                                 uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	// Table dispatches (KYTY_TABLE_DISPATCH): a dispatch drawn the table way, and the normal path's dispatches.
 	[[nodiscard]] bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-	                                 uint64_t indirect_args, bool thread_dimensions);
-	// Why the last TableDispatch that declined did (the hole's reason when a speculation's dispatch has no other way).
-	const char* m_dispatch_declined = nullptr;
-	// (`special`: the special path that took the dispatch, as a speculation's hole reason; null: none.)
-	void TableDispatchSeen(const HW::ComputeShaderInfo& cs, const char* special, bool thread_dimensions);
-	// What a speculative translation retired with `pending` (descriptor sets; CommandScheduler::PendingTick and up)
-	// gets `tick`.
-	void ResolvePendingTicks(uint64_t pending, uint64_t tick);
-	// A speculation's executor draws with what `owner` (the graphics queue's) learned: its table pairs and dispatches,
-	// draw states, linear copy shader and compute clears (RenderExecutor::Catalog); `role` its own proofs' (1..Roles-1:
-	// one per speculation thread).
-	void ReadCatalogOf(RenderExecutor& owner, uint32_t role) noexcept {
-		m_catalog = &owner;
-		m_role    = role;
-	}
-	static constexpr uint32_t Roles = 9;
+	                                 uint64_t indirect_args);
+	void TableDispatchSeen(const HW::ComputeShaderInfo& cs, bool special);
 
 private:
 	// Table draws (src/local/table-xpr.inc).
@@ -405,31 +376,11 @@ private:
 	struct TableImageSet;
 	enum class TableResult { Drawn, Native, Store };
 	std::shared_ptr<TableXpr> m_table_xpr;
-	// The executor whose catalog this one reads (a speculation's: the graphics queue's), null: its own. It changes none
-	// of it but its own proofs in it (Role: TablePair::generation, TableImageSet::validated_frame...); what it holds of
-	// it across draws is dropped when the owner changed it (TableXpr::epoch).
-	RenderExecutor* m_catalog = nullptr;
-	uint32_t        m_role    = 0;
-	[[nodiscard]] RenderExecutor& Catalog() noexcept { return m_catalog != nullptr ? *m_catalog : *this; }
-	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
-	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
-	mutable std::shared_mutex m_catalog_mutex;
-	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const { return std::unique_lock(m_catalog_mutex); }
-	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
-	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
-	// The catalog's table (null: nothing learned yet), and this executor's own table state.
-	[[nodiscard]] TableXpr*       CatalogTable() noexcept { return Catalog().m_table_xpr.get(); }
-	TableXpr&                     OwnTable();
-	void                          DropStaleCatalog();
 	// The linear copy shader the normal path last copied with (DemonsSouls::TryLinearCopy), the shader map generation
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
-	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
-	uint32_t              m_linear_copy_uses = 0;
-	bool                  m_linear_copy_masked = false; // its kernel (DemonsSouls::LinearCopyMasked)
-	// The metadata surfaces compute dispatches cleared (TryConsumeComputeMetaClear), by their shader and user data: a
-	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
-	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)
-	std::unordered_map<uint64_t, uint64_t> m_meta_clears;
+	uint64_t m_linear_copy_shader = 0, m_linear_copy_generation = 0;
+	uint32_t m_linear_copy_uses   = 0;
+	bool     m_linear_copy_masked = false; // its kernel (DemonsSouls::LinearCopyMasked)
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,

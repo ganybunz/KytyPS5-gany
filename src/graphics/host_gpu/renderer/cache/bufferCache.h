@@ -10,13 +10,9 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
-#include "speculation-state.h"
 
 #include <array>
-#include <atomic>
 #include <map>
-#include <memory>
-#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -55,12 +51,6 @@ public:
 		return buffer != nullptr && !buffer->is_deleted ? buffer : nullptr;
 	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
-	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
-	// question whether ObtainBuffer gave the range's buffer).
-	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size) {
-		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
-	}
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
@@ -79,7 +69,7 @@ public:
 	// ring keeps its own GPU retirement watches across runtime mode changes.
 	[[nodiscard]] StreamBuffer& GetShaderUploadBuffer() noexcept;
 	// The per-draw blocks of table draws (src/local/table-xpr.inc), read by their device addresses.
-	[[nodiscard]] StreamBuffer& GetTableUploadBuffer() noexcept;
+	[[nodiscard]] StreamBuffer& GetTableUploadBuffer() noexcept { return m_table_upload; }
 	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
 	void ReportLodStats(void* dst, uint32_t size, bool reset);
 	// GET_LOD_STATS of another layout: zeros and a ready label written by the GPU when the range holds
@@ -102,8 +92,6 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
-	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
-	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// GPU thread: retire a pending guest read before touching overlapping backing.
@@ -116,16 +104,6 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
-	// After a speculative translation's work was submitted (its commit obtained the ranges it writes as written
-	// before it): the writes are that work's, which readbacks of the range wait for.
-	void NoteSpeculativeWrite(uint64_t vaddr, uint64_t size) {
-		InvalidateCopyFeedback(vaddr, size);
-		NoteGpuWrite(vaddr, size);
-	}
-	// The tracker's answer whatever a speculative translation will upload (what a cache may keep).
-	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) {
-		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
-	}
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -133,19 +111,12 @@ public:
 		uint64_t address = 0, size = 0, cpu_epoch = 0, registration_epoch = 0;
 	};
 	void SynchronizeRegionRequest(SyncRegionRequest& request);
-	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
-	// A buffer registered or unregistered in the tracker regions of the range since `epoch`.
-	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
-		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
-			if (RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) > epoch) return true;
-		return false;
-	}
+	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
 	// request's proof only depends on the buffers of its own region.
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
 		const auto region = vaddr / TRACKER_REGION_SIZE;
-		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? m_region_registrations[region].load(std::memory_order_acquire)
-		                                                           : 0;
+		return region < m_region_registrations.size() ? m_region_registrations[region] : 0;
 	}
 	// Proofs that an earlier resolution still holds. Pure queries; TouchLiveBuffer
 	// only refreshes the LRU slot exactly as ObtainBuffer's TouchBuffer would.
@@ -172,10 +143,6 @@ public:
 		}
 		return sum;
 	}
-	// A speculative translation's use of the buffer, when it is committed.
-	void TouchSpeculated(BufferId id) {
-		if (auto* buffer = m_slot_buffers.try_get(id)) TouchBuffer(*buffer);
-	}
 	// True when `id` names a live (registered, not deleted) game buffer that
 	// covers the range and whose Vulkan handle is `handle`; refreshes its LRU slot.
 	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr,
@@ -188,12 +155,7 @@ public:
 		TouchBuffer(*buffer);
 		return true;
 	}
-	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
-	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
-	                                   std::vector<RangeSet::Range>& ranges) const;
-	// The spans of the buffers registered or unregistered since the last call, appended to `spans`; false when
-	// more changed than it keeps (then anything may have).
-	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
+	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
 
 	void               RunGarbageCollector(bool collect = true);
 
@@ -227,9 +189,6 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
-	// Deleted buffers a speculation's packet may still read (Spec::PacketsPassed), destroyed once it passed.
-	std::vector<std::pair<BufferId, Spec::PacketMarks>> m_retired;
-	void                                                EraseRetired();
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written);
@@ -270,13 +229,8 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
-	// (Read by a speculative translation's thread: src/graphics/guest_gpu/speculation.h.)
-	std::atomic<uint64_t> m_registration_epoch {1};
-	// Per tracker region, see RegionRegistrationEpoch.
-	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
-	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
-	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
-	bool                    m_registration_spans_lost = true;
+	uint64_t m_registration_epoch = 1;
+	std::vector<uint64_t> m_region_registrations; // per tracker region, see RegionRegistrationEpoch
 	struct SyncBuffer {
 		uint64_t start;
 		uint64_t end;
@@ -293,7 +247,6 @@ private:
 	std::vector<SyncStamp>  m_old_sync_stamps;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	std::shared_mutex                                 m_gpu_modified_mutex; // (its changes: HasGpuDirtyBytes)
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.
