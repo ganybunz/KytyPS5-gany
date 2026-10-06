@@ -104,6 +104,9 @@ inline void Flip() {
 	}
 	// KYTY_FRAME_LOG=<path>: one CSV line per frame (flip to flip on the render thread), flushed every
 	// frame, so frame-time percentiles and every hitch can be read without a hitch threshold.
+	// idle_ms is time the emulated GPU command thread waited for guest work, not physical GPU idle time.
+	// full_upload_kib is guest image bytes counted by whole-image InitializeImage uploads; it is neither
+	// elapsed upload time nor a measurement of host VRAM/PCIe traffic.
 	// *_wait_ms / compile_ms: the render thread's waits as LiveCensus times them, inclusive; they nest
 	// (download_wait encloses waits that also count in gpu_wait and readback_wait) and are not to be added
 	// up. *_self_ms: the same without the waits nested in them, and any_wait_ms the time in any wait: these
