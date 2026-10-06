@@ -1071,8 +1071,10 @@ bool BufferCache::TryFillLodStatsOnGpu(uint64_t vaddr, uint32_t size) {
 		return value == nullptr || value[0] != '0';
 	}();
 	if (!enabled) return false;
+	// GPU-written pages, not bytes: the CPU write faults on a page another GPU write dirtied too, and that fault
+	// drained the GPU (S2: 14% of the GPU thread's samples, with the stats' own bytes CPU-clean).
 	if (size < 4 || (vaddr | size) % 4 != 0 || !GuestRange {vaddr, size}.Valid() ||
-	    !m_gpu_modified_ranges.Intersects(vaddr, size) || m_texture_cache.HasTrackedDataOverlap(vaddr, size) ||
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) || m_texture_cache.HasTrackedDataOverlap(vaddr, size) ||
 	    !m_resources || !m_resources->IsMapped(vaddr, size)) {
 		return false;
 	}
@@ -1980,9 +1982,15 @@ void BufferCache::RunGarbageCollector(bool collect) {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
-	// Most collection checks do no work. Only a real collection can enumerate
-	// pending dirty bytes or retire their owner, so only that path needs a drain.
-	DrainGuestReadback();
+	// Only a readback over a buffer the scan looks at can change its dirty state or still copy from it, so
+	// each candidate drains its own range below. Draining every readback here made the GPU thread wait for
+	// the GPU once a frame whenever memory sat above the trigger (Demon's Souls in Boletaria: 14% of its
+	// samples in S2, with old buffers almost never under a readback). KYTY_GC_DRAIN_ALL=1: drain all (A/B).
+	static const bool drain_all = [] {
+		const char* value = std::getenv("KYTY_GC_DRAIN_ALL");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (drain_all) DrainGuestReadback();
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
@@ -1994,6 +2002,7 @@ void BufferCache::RunGarbageCollector(bool collect) {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (!drain_all) DrainGuestReadback(buffer.CpuAddress(), buffer.Size());
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
