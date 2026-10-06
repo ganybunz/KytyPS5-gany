@@ -88,13 +88,11 @@ uint32_t TargetWidth() {
 		} else if (text == "2160p" || text == "4k") {
 			width = 3840;
 		} else if (text != "auto" && !text.empty()) {
-			std::printf("KYTY_RENDER_RESOLUTION: unknown value '%s' (auto, 1080p, 1440p, 2160p)
-", value);
+			std::printf("KYTY_RENDER_RESOLUTION: unknown value '%s' (auto, 1080p, 1440p, 2160p)\n", value);
 		}
 		if (width != 0) {
 			std::printf("Resolution control: render_resolution %u pixels wide (titles with a verified "
-			            "profile only)
-",
+			            "profile only)\n",
 			            width);
 		}
 		return width;
