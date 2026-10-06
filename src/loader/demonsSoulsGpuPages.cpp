@@ -14,6 +14,10 @@ uint64_t base = 0, cave = 0;
 size_t written = 0;
 constexpr std::array<uint64_t, 3> AllSites {Sites[0], Sites[1], ContextSite};
 std::array<std::array<uint8_t, 5>, AllSites.size()> original {}, installed {};
+bool PatchAuditEnabled() {
+    const auto* value = std::getenv("KYTY_DS_PATCH_AUDIT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 }
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -25,6 +29,29 @@ void Install(Program* program) {
         program->base_vaddr > UINT64_MAX - CaveOffset - ImageSize ||
         program->tls.handler_vaddr < program->base_vaddr ||
         program->tls.handler_vaddr - program->base_vaddr > INT32_MAX) return;
+    if (PatchAuditEnabled()) {
+        const auto* guest = reinterpret_cast<const uint8_t*>(program->base_vaddr);
+        std::printf("Demon's Souls patch audit: module=eboot base=0x%016llx mapped=0x%llx tls=0x%016llx\n",
+            static_cast<unsigned long long>(program->base_vaddr),
+            static_cast<unsigned long long>(program->mapped_size),
+            static_cast<unsigned long long>(program->tls.handler_vaddr));
+        for (const auto& function : AuditedFunctions) {
+            const bool readable = function.rva + function.size <= program->mapped_size &&
+                                  Libs::Graphics::HostMemoryRangeIsReadable(
+                                      program->base_vaddr + function.rva, function.size);
+            const auto raw_hash = readable
+                                      ? Fingerprint(guest + function.rva, function.size)
+                                      : 0;
+            std::printf("Demon's Souls patch audit: eboot+0x%llx size=0x%llx raw=0x%016llx "
+                        "expected=0x%016llx readable=%s match=%s\n",
+                static_cast<unsigned long long>(function.rva),
+                static_cast<unsigned long long>(function.size),
+                static_cast<unsigned long long>(raw_hash),
+                static_cast<unsigned long long>(function.hash),
+                readable ? "yes" : "no",
+                readable && raw_hash == function.hash ? "yes" : "no");
+        }
+    }
     const auto* guest = reinterpret_cast<const uint8_t*>(program->base_vaddr);
     for (const auto& function : AuditedFunctions) {
         if (function.rva + function.size > program->mapped_size ||

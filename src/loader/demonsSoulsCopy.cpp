@@ -8,6 +8,8 @@
 #include "loader/runtimeLinker.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <xxhash.h>
 
 namespace Loader::DemonsSoulsCopy {
@@ -33,7 +35,18 @@ void Install(Program* program) {
 	// Hash the complete audited shared memmove/bcopy body, not just the prologue.
 	// This entry follows the guest's argument/stack checks and has one saved RBP.
 	// Changed module versions, relocations, or platform loader patches fail closed.
-	if (XXH3_64bits(bytes, verify_size) != 0xe654325b8be848a9ull) {
+	const auto actual_hash = XXH3_64bits(bytes, verify_size);
+	const auto* audit = std::getenv("KYTY_DS_PATCH_AUDIT");
+	if (audit != nullptr && std::strcmp(audit, "1") == 0) {
+		std::printf("Demon's Souls patch audit: module=libc base=0x%016llx memmove=0x%016llx "
+		            "size=0x%llx actual=0x%016llx expected=0xe654325b8be848a9 match=%s\n",
+		            static_cast<unsigned long long>(program->base_vaddr),
+		            static_cast<unsigned long long>(address),
+		            static_cast<unsigned long long>(verify_size),
+		            static_cast<unsigned long long>(actual_hash),
+		            actual_hash == 0xe654325b8be848a9ull ? "yes" : "no");
+	}
+	if (actual_hash != 0xe654325b8be848a9ull) {
 		std::printf("Demon's Souls copy: libc memmove differs; retaining guest code\n");
 		return;
 	}
