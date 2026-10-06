@@ -1824,9 +1824,10 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 
 bool TextureCache::UploadImagePartial(Image& image) {
 	const auto& info    = image.info;
-	if (info.host_mip_skip != 0) {
-		return PartialFail("reduced");
-	}
+	// A reduced image (KYTY_TEXTURE_QUALITY=reduced) holds guest levels host_mip_skip and up as its levels 0 and up:
+	// dirty bytes of the levels it leaves out are not uploaded, the others go to their level less the skip (as the
+	// whole-image upload does). Every change of a streamed texture uploaded the whole image before.
+	const uint32_t skip = info.host_mip_skip;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
 	if (binding == BindingType::DepthTarget) {
@@ -1875,6 +1876,9 @@ bool TextureCache::UploadImagePartial(Image& image) {
 		}
 		if (!IntersectsRanges(dirty, begin, end)) {
 			continue;
+		}
+		if (plan.regions[index].imageSubresource.mipLevel < skip) {
+			continue; // a level the reduced image leaves out
 		}
 		TileBlockLayout block {};
 		if (bands_on && RowBandable(tile) && TileGetBlockLayout(tile.family, tile.bytes_per_element, block) &&
@@ -1955,6 +1959,7 @@ bool TextureCache::UploadImagePartial(Image& image) {
 			region.imageOffset.y        = static_cast<int32_t>(first * texel_height);
 			region.imageExtent.height   = std::min(count * texel_height, region.imageExtent.height - first * texel_height);
 		}
+		region.imageSubresource.mipLevel -= skip;
 		const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
 		region.bufferOffset       = linear_offset + (region.bufferOffset - tile.linear_offset);
 		tile.linear_offset        = linear_offset;
