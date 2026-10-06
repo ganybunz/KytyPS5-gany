@@ -277,8 +277,9 @@ static std::string UnsupportedSampledDepthBinding(const ShaderRecompiler::IR::Im
 	    descriptor.fields[6], descriptor.fields[7]);
 }
 
+// levels: the image's mip count when the view resolved to more levels than MAX_MIP names (0: MAX_MIP's).
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
-                                                const ShaderTextureResource& descriptor) {
+                                                const ShaderTextureResource& descriptor, uint32_t levels = 0) {
 	const auto tile              = descriptor.TileMode();
 	const bool is_color_1d       = descriptor.Type() == Prospero::ImageType::kColor1D;
 	const bool is_color_1d_array = descriptor.Type() == Prospero::ImageType::kColor1DArray;
@@ -339,11 +340,12 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
-	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
+	const auto max_mip = levels > 0 ? levels - 1u
+	                     : static_cast<uint32_t>(resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip());
 	const auto view_last_level =
 	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
-	        ? descriptor.LastLevel()
-	        : std::min(descriptor.LastLevel(), max_mip);
+	        ? static_cast<uint32_t>(descriptor.LastLevel())
+	        : std::min(static_cast<uint32_t>(descriptor.LastLevel()), max_mip);
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
 	       descriptor.BaseLevel() <= view_last_level && view_last_level <= max_mip &&
 	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
@@ -375,10 +377,10 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size) {
+                            const ShaderTextureResource& descriptor, uint64_t size, uint32_t levels) {
 	const auto format        = descriptor.Format();
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
-	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
+	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor, levels);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
@@ -826,7 +828,8 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		return {id, nullptr, std::move(desc)};
 	}
 	if (storage) {
-		ValidateStorageTexture(resource, descriptor, size.size);
+		ValidateStorageTexture(resource, descriptor, size.size,
+		                       !multisampled && levels > static_cast<uint32_t>(max_mip) + 1u ? levels : 0u);
 	}
 
 	auto pixel_format = surface_format.vk_format;

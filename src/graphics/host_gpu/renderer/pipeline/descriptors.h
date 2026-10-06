@@ -76,7 +76,7 @@ template <typename T>
 IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
                                const ShaderTextureResource& descriptor, const Image& image);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+                            const ShaderTextureResource& descriptor, uint64_t size, uint32_t levels = 0);
 
 } // namespace Libs::Graphics
 
