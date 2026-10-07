@@ -392,7 +392,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					const auto start = std::chrono::steady_clock::now();
 					CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
 					                       vertex_permutation->handle, pixel ? &ps.pixel : nullptr,
-					                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache);
+					                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache,
+					                       recipe.native_bindings);
 					destroy(pipeline);
 					created_one(start, words_of(vertex_permutation.get()) + words_of(pixel), vs.hash,
 					            pixel != nullptr ? ps.hash : 0);

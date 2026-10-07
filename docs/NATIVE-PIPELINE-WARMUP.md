@@ -42,3 +42,9 @@ Acceptance after the current owned game exits:
 
 Status: unbuilt and game-unverified. This adds learned coverage only; unseen
 effects and table permutations can still miss. No hitch-elimination/FPS claim.
+
+Independent Luna review found one missed secondary call site before any build:
+static seed precompile must pass the native bit to descriptor-layout creation as
+well. Corrected separately; otherwise a native-labelled recipe would populate
+the ordinary pipeline variant. Both startup replay and explicit seed compilation
+now use the saved variant. Build/Vulkan verification remains pending.
