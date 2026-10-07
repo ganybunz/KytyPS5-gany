@@ -71,6 +71,14 @@ namespace Libs::Graphics {
 
 namespace {
 
+bool NativePipelineWarmupEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_PIPELINE_WARMUP");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -1449,12 +1457,14 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		std::filesystem::path adopt_from;
 		std::error_code       error;
 		if ((file == nullptr || *file == 0) && !std::filesystem::exists(path, error)) {
-			const auto gpu = "KytyShaderWarmup3:" + title + device.substr(0, 1 + 8 + 1 + 8 + 1);
+			const auto gpu = title + device.substr(0, 1 + 8 + 1 + 8 + 1);
 			std::filesystem::file_time_type newest {};
 			for (const auto& entry: std::filesystem::directory_iterator(root, error)) {
 				const auto candidate = entry.path() / (title + ".shaders");
+				const auto identity = LocalShaderWarmup::Cache::FileIdentity(candidate);
 				if (!std::filesystem::is_regular_file(candidate, error) ||
-				    !LocalShaderWarmup::Cache::FileIdentity(candidate).starts_with(gpu))
+				    (!identity.starts_with("KytyShaderWarmup3:" + gpu) &&
+				     !identity.starts_with("KytyShaderWarmup4:" + gpu)))
 					continue;
 				const auto written = std::filesystem::last_write_time(candidate, error);
 				if (!error && (adopt_from.empty() || written > newest)) {
@@ -1529,6 +1539,8 @@ void PipelineCache::WarmPipelines() {
 		Job job;
 		LocalShaderWarmup::Reader reader {words};
 		if (!LocalShaderWarmup::VisitPipeline(reader, job.recipe)) { ++skipped; continue; }
+		// Keep recorded variants available, but do not change startup work unless enabled.
+		if (job.recipe.native_bindings && !NativePipelineWarmupEnabled()) continue;
 		if (job.recipe.compute != LocalShaderWarmup::NoShader) {
 			job.compute = get(job.recipe.compute);
 			if (!job.compute) { ++skipped; continue; }
@@ -1541,7 +1553,7 @@ void PipelineCache::WarmPipelines() {
 			job.pixel  = get(job.recipe.pixel);
 			if (!job.vertex || (job.recipe.pixel != LocalShaderWarmup::NoShader && !job.pixel)) { ++skipped; continue; }
 			GraphicsPipelineKey key {job.recipe.rendering, job.vertex->handle.id, job.pixel ? job.pixel->handle.id : 0,
-			                         job.recipe.vertex_input, job.recipe.state};
+			                         job.recipe.vertex_input, job.recipe.state, job.recipe.native_bindings};
 			auto [entry, inserted] = m_graphics_pipelines.try_emplace(std::move(key));
 			if (!inserted) continue;
 			entry->second = std::make_unique<Pipeline>();
@@ -1567,7 +1579,8 @@ void PipelineCache::WarmPipelines() {
 				if (job.pixel) ps.pixel.stage.program = &job.pixel->program;
 				CreatePipelineInternal(m_graphics, *job.pipeline, job.recipe.rendering, job.recipe.vertex_input,
 					vs.vertex, job.vertex->handle, job.pixel ? &ps.pixel : nullptr,
-					job.pixel ? job.pixel->handle : ShaderProgram {}, job.recipe.state, m_driver_cache);
+					job.pixel ? job.pixel->handle : ShaderProgram {}, job.recipe.state, m_driver_cache,
+					job.recipe.native_bindings);
 			}
 			if (const auto done = compiled.fetch_add(1, std::memory_order_relaxed) + 1; done % 250 == 0)
 				PipelineCacheLog("Pipeline warmup: compiling {}/{}", done, jobs.size());
@@ -2290,6 +2303,22 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	// Capture only successfully published variants, never every hot cache lookup.
+	const auto record_recipe = [&](const GraphicsPipelineKey& published) {
+		if (published.native_bindings && !NativePipelineWarmupEnabled()) return;
+		if (vs_input_info.stage.program->table_mode ||
+		    (ps_active && ps_input_info->stage.program->table_mode)) return;
+		LocalShaderWarmup::PipelineRecord recipe;
+		recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
+		recipe.pixel = ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
+		recipe.rendering = published.rendering;
+		recipe.vertex_input = published.vertex_input;
+		recipe.state = published.static_params;
+		recipe.native_bindings = published.native_bindings;
+		if (recipe.vertex != LocalShaderWarmup::NoShader &&
+		    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader))
+			m_program_cache->warmup.AddPipeline(recipe);
+	};
 	const bool indexed = kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0;
 	if (indexed) {
 		if (auto found = m_native_graphics_pipelines.find(key);
@@ -2316,6 +2345,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 			EXIT_IF(!inserted);
+			record_recipe(iter->first);
 			if (indexed) {
 				m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
 			}
@@ -2406,21 +2436,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_driver_cache,
 		                       native_bindings, PipelineBuild::Optimize);
 	});
-	// Warmup recipes describe the normal variant only.
-	if (native_bindings) {
-		return iter->second.get();
-	}
-	LocalShaderWarmup::PipelineRecord recipe;
-	recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
-	recipe.pixel =
-	    ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
-	recipe.rendering    = iter->first.rendering;
-	recipe.vertex_input = iter->first.vertex_input;
-	recipe.state        = iter->first.static_params;
-	if (recipe.vertex != LocalShaderWarmup::NoShader &&
-	    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
-		m_program_cache->warmup.AddPipeline(recipe);
-	}
+	record_recipe(iter->first);
 
 	return iter->second.get();
 }

@@ -190,7 +190,12 @@ def cmd_check(args):
 # ---------------------------------------------------------------------------------------------------
 def _state_words(p):
     """A graphics pipeline recipe without its shaders: rendering, vertex input and static state."""
-    return warmfile.encode_pipeline(p)[3:]
+    # Pass-state files deliberately describe ordinary bindings. Preserve the
+    # legacy state layout; a native recipe is a different pipeline identity.
+    if p.native_bindings:
+        raise ValueError('native binding recipes are not normal pass states')
+    words = warmfile.encode_pipeline(p)
+    return words[4 if p.schema_version == 4 else 3:]
 
 
 def _with_shaders(words, vertex, pixel):
@@ -222,7 +227,7 @@ def cmd_learn_states(args):
         pass_of[(vs_code, ps_code)].add(pass_id)
     groups = collections.defaultdict(list)
     for p in wf.ok_pipelines():
-        if p.is_compute:
+        if p.is_compute or p.native_bindings:
             continue
         if p.pixel == warmfile.NO_SHADER:
             group = 'vertex-only'
@@ -375,8 +380,15 @@ def cmd_recorded_seeds(args):
     """A recorded warmup cache as a seed file (records keep their specialization): compiled the same way,
     it gives the SPIR-V the game's own permutations translate to, for `coverage --recorded-compiled`."""
     raw = recorded_file(args.recorded).read_bytes()
+    identity = raw[:raw.index(b'\n') + 1]
+    if identity.startswith(b'KytyShaderWarmup4:'):
+        seed_identity = SEED_IDENTITY.replace(b'KytyShaderSeeds2:', b'KytyShaderSeeds3:', 1)
+    elif identity.startswith(b'KytyShaderWarmup3:'):
+        seed_identity = SEED_IDENTITY
+    else:
+        raise ValueError('unsupported recorded warmup schema')
     body = raw[raw.index(b'\n') + 1:]  # the checksum covers the body only
-    Path(args.out).write_bytes(SEED_IDENTITY + body)
+    Path(args.out).write_bytes(seed_identity + body)
     print(f'{args.out}: {len(body) / 2**20:.1f} MiB')
 
 
@@ -411,7 +423,7 @@ def _spirv_coverage(seeded, recorded_compiled):
         if p.is_compute:
             return ('cs', spirv.get(p.compute))
         return ('gfx', spirv.get(p.vertex), spirv.get(p.pixel) if p.pixel != warmfile.NO_SHADER else None,
-                p.rendering_norm(), p.vertex_input_norm(), warmfile.state_norm(p))
+                p.rendering_norm(), p.vertex_input_norm(), warmfile.state_norm(p), p.native_bindings)
     seeded_pipelines = {key(p, seeded_spirv) for p in seeded_files.ok_pipelines()}
     result = collections.Counter()
     for p in rec_files.ok_pipelines():

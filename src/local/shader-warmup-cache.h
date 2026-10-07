@@ -28,12 +28,13 @@ inline constexpr uint32_t NoShader = UINT32_MAX;
 // References are indices in the same atomic cache file, never Vulkan handles.
 struct PipelineRecord {
     uint32_t vertex = NoShader, pixel = NoShader, compute = NoShader;
+    bool native_bindings = false;
     PipelineRenderingState rendering;
     PipelineVertexInputState vertex_input;
     PipelineStaticParameters state;
 };
 
-template<class A> bool VisitPipeline(A& a, PipelineRecord& r);
+template<class A> bool VisitPipeline(A& a, PipelineRecord& r, bool legacy = false);
 
 struct Record {
     ShaderType stage = ShaderType::Unknown;
@@ -172,9 +173,11 @@ inline bool ValidKey(Record& r) {
     return actual == r.static_key;
 }
 
-template<class A> bool VisitPipeline(A& a, PipelineRecord& r) {
+template<class A> bool VisitPipeline(A& a, PipelineRecord& r, bool legacy) {
     Fields(a, r.vertex, r.pixel, r.compute);
-    if (r.compute != NoShader) return a.Good() && r.vertex == NoShader && r.pixel == NoShader;
+    if (!legacy) a(r.native_bindings);
+    if (r.compute != NoShader)
+        return a.Good() && r.vertex == NoShader && r.pixel == NoShader && !r.native_bindings;
     if (r.vertex == NoShader) return false;
     auto& t = r.rendering;
     Fields(a, t.color_count, t.depth_format, t.stencil_format); Array(a, t.color_formats);
@@ -222,9 +225,14 @@ public:
         StopWriter();
         records.clear(); pipelines.clear(); record_index.clear(); pipeline_index.clear();
         changed = false; total_bytes = 8;
-        path = location; identity = "KytyShaderWarmup3:" + signature;
+        if (!signature.ends_with('\n')) signature += '\n';
+        path = location; identity = "KytyShaderWarmup4:" + signature;
         if (!std::filesystem::exists(path)) return true;
-        return Load(path, identity);
+        const auto saved_identity = FileIdentity(path);
+        if (saved_identity == identity) return Load(path, identity);
+        const auto legacy_identity = "KytyShaderWarmup3:" + signature;
+        if (saved_identity != legacy_identity) return false;
+        return Load(path, legacy_identity);
     }
 
     // The first line of a warm file: its schema, title and device signature.
@@ -244,7 +252,8 @@ public:
     bool Adopt(const std::filesystem::path& from) {
         if (!Enabled() || !records.empty() || !pipelines.empty()) return false;
         const auto signature = FileIdentity(from);
-        if (!signature.starts_with("KytyShaderWarmup3:") || !Load(from, signature)) return false;
+        if ((!signature.starts_with("KytyShaderWarmup3:") &&
+             !signature.starts_with("KytyShaderWarmup4:")) || !Load(from, signature)) return false;
         changed = true;
         return true;
     }
@@ -302,8 +311,12 @@ public:
                           std::vector<std::vector<uint32_t>>& out_pipelines) {
         const auto signature = FileIdentity(location);
         std::vector<uint32_t> contents;
-        return signature.starts_with("KytyShaderSeeds2:") && ReadFile(location, signature, contents) &&
-               Parse(contents, out_records, out_pipelines);
+        std::vector<std::vector<uint32_t>> records, pipelines;
+        const bool legacy = signature.starts_with("KytyShaderSeeds2:");
+        if ((!legacy && !signature.starts_with("KytyShaderSeeds3:")) ||
+            !ReadFile(location, signature, contents) || !Parse(contents, records, pipelines, legacy)) return false;
+        out_records = std::move(records); out_pipelines = std::move(pipelines);
+        return true;
     }
 
 private:
@@ -359,20 +372,25 @@ private:
     bool Load(const std::filesystem::path& location, const std::string& signature) {
         std::vector<uint32_t> contents;
         std::vector<std::vector<uint32_t>> loaded, loaded_pipelines;
-        if (!ReadFile(location, signature, contents) || !Parse(contents, loaded, loaded_pipelines)) return false;
+        const bool legacy = signature.starts_with("KytyShaderWarmup3:");
+        if (!ReadFile(location, signature, contents) || !Parse(contents, loaded, loaded_pipelines, legacy)) return false;
         records = std::move(loaded); pipelines = std::move(loaded_pipelines);
-        Reindex(); return true;
+        Reindex();
+        if (legacy) changed = true;
+        return true;
     }
     // Records, then pipeline recipes valid against them, and nothing after.
     static bool Parse(const std::vector<uint32_t>& contents, std::vector<std::vector<uint32_t>>& out_records,
-                      std::vector<std::vector<uint32_t>>& out_pipelines) {
+                      std::vector<std::vector<uint32_t>>& out_pipelines, bool legacy_pipelines = false) {
         Reader reader {contents};
         if (!ReadRecords(reader, out_records)) return false;
         uint32_t count = 0; reader(count);
         if (!reader.Good() || count > MaxPipelines) return false;
         out_pipelines.resize(count);
-        for (auto& words : out_pipelines)
-            if (!Words(reader, words, 4096) || !ValidPipeline(words, out_records)) return false;
+        for (auto& words : out_pipelines) {
+            if (!Words(reader, words, 4096) || !ValidPipeline(words, out_records, legacy_pipelines)) return false;
+            if (legacy_pipelines) words.insert(words.begin() + 3, 0);
+        }
         return reader.Good() && reader.cursor == contents.size();
     }
     static bool ReadFile(const std::filesystem::path& location, const std::string& signature,
@@ -401,9 +419,9 @@ private:
         return reader.Good();
     }
     static bool ValidPipeline(const std::vector<uint32_t>& words,
-                              const std::vector<std::vector<uint32_t>>& shaders) {
+                              const std::vector<std::vector<uint32_t>>& shaders, bool legacy = false) {
         PipelineRecord r; Reader reader {words};
-        if (!VisitPipeline(reader, r) || reader.cursor != words.size()) return false;
+        if (!VisitPipeline(reader, r, legacy) || reader.cursor != words.size()) return false;
         const auto stage = [&](uint32_t index) {
             return index < shaders.size() ? ShaderType(shaders[index][0]) : ShaderType::Unknown;
         };

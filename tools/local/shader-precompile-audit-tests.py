@@ -10,15 +10,32 @@ from shader_precompile_audit import compute_input, correlate, read_cache, runtim
 
 
 class AuditTests(unittest.TestCase):
-    def cache(self, path, tail=(), invalid_ref=False):
+    def cache(self, path, tail=(), invalid_ref=False, schema=3, native=0):
         # Minimal CS, zero resources. This fixture checks the audit framing;
         # the production compiler additionally validates the stage static key.
         r = [4, 1, 0, 2, 0, 1, 0xbf810000, 0, 0] + [0] * 17 + [0, 0]
-        words = [1, len(r), *r, 1, 3, 0xffffffff, 0xffffffff, int(invalid_ref), *tail]
+        pipeline = [0xffffffff, 0xffffffff, int(invalid_ref)]
+        if schema == 4:
+            pipeline.append(native)
+        words = [1, len(r), *r, 1, len(pipeline), *pipeline, *tail]
         payload = struct.pack(f'<{len(words)}I', *words)
-        data = b'KytyShaderWarmup3:TEST:device\n' + struct.pack('<Q', xxh3(payload)) + payload
+        data = f'KytyShaderWarmup{schema}:TEST:device\n'.encode() + struct.pack('<Q', xxh3(payload)) + payload
         path.write_bytes(data)
         return data
+
+    def test_schema4_compute_and_native_bit_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'cache'
+            self.cache(path, schema=4)
+            identity, _, pipelines = read_cache(path)
+            self.assertTrue(identity.startswith('KytyShaderWarmup4:'))
+            self.assertEqual(pipelines, [(0xffffffff, 0xffffffff, 0, 0)])
+            self.cache(path, schema=4, native=2)
+            with self.assertRaisesRegex(ValueError, 'native binding bit'):
+                read_cache(path)
+            self.cache(path, schema=4, native=1)
+            with self.assertRaisesRegex(ValueError, 'compute recipe'):
+                read_cache(path)
 
     def test_cache_checks_checksum_and_shader_references(self):
         with tempfile.TemporaryDirectory() as tmp:

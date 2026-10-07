@@ -114,8 +114,9 @@ def decode_record(words):
 def read_cache(path):
     data = path.read_bytes()
     newline = data.find(b'\n', 0, 1024)
-    if newline < 0 or not data.startswith(b'KytyShaderWarmup3:'):
+    if newline < 0 or not data.startswith((b'KytyShaderWarmup3:', b'KytyShaderWarmup4:')):
         raise ValueError('unsupported cache signature')
+    native_field = data.startswith(b'KytyShaderWarmup4:')
     prefix = newline + 1
     if len(data) < prefix + 16 or len(data) > 256 * 1024 * 1024:
         raise ValueError('invalid cache size')
@@ -136,12 +137,15 @@ def read_cache(path):
         if len(p) < 3:
             raise ValueError('truncated pipeline')
         vs, ps, cs = p[:3]
+        if native_field and (len(p) < 4 or p[3] not in (0, 1)):
+            raise ValueError('invalid native binding bit')
         def valid(i, stages):
             return i < len(records) and records[i]['stage'] in stages
         if cs != NO_SHADER:
-            if len(p) != 3 or vs != NO_SHADER or ps != NO_SHADER or not valid(cs, ('CS',)):
+            if (len(p) != 3 + native_field or (native_field and p[3]) or
+                vs != NO_SHADER or ps != NO_SHADER or not valid(cs, ('CS',))):
                 raise ValueError('invalid compute recipe')
-        elif (len(p) != 247 or not valid(vs, ('VS', 'Mesh')) or
+        elif (len(p) != 247 + native_field or not valid(vs, ('VS', 'Mesh')) or
               (ps != NO_SHADER and not valid(ps, ('PS',)))):
             raise ValueError('invalid graphics recipe')
         pipelines.append(p)

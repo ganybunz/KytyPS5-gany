@@ -12991,11 +12991,94 @@ void TestShaderWarmupCacheFiles() {
   LocalShaderWarmup::Reader pipeline_reader {loaded.pipelines.back()};
   Check(LocalShaderWarmup::VisitPipeline(pipeline_reader, replay) &&
         replay.vertex == vs && replay.pixel == ps && replay.rendering == graphics.rendering &&
-        replay.vertex_input == graphics.vertex_input && replay.state == graphics.state,
+        replay.vertex_input == graphics.vertex_input && replay.state == graphics.state && !replay.native_bindings,
         "warmup changed pipeline state during serialization");
+  graphics.native_bindings = true;
+  loaded.AddPipeline(graphics);
+  Check(loaded.pipelines.size() == 3, "warmup pipeline ID ignored native binding mode");
+  LocalShaderWarmup::PipelineRecord native_replay;
+  LocalShaderWarmup::Reader native_reader {loaded.pipelines.back()};
+  Check(LocalShaderWarmup::VisitPipeline(native_reader, native_replay) && native_replay.native_bindings,
+        "warmup native binding bit did not roundtrip");
+  auto invalid_native_bit = loaded.pipelines.back();
+  invalid_native_bit[3] = 2;
+  LocalShaderWarmup::Reader invalid_native_reader {invalid_native_bit};
+  LocalShaderWarmup::PipelineRecord invalid_native;
+  Check(!LocalShaderWarmup::VisitPipeline(invalid_native_reader, invalid_native),
+        "warmup accepted a non-boolean native binding bit");
+  LocalShaderWarmup::PipelineRecord native_compute;
+  native_compute.compute = 0; native_compute.native_bindings = true;
+  LocalShaderWarmup::Writer native_compute_writer;
+  Check(!LocalShaderWarmup::VisitPipeline(native_compute_writer, native_compute),
+        "warmup accepted native bindings on a compute recipe");
+  graphics.native_bindings = false;
   graphics.pixel = 0;
   loaded.AddPipeline(graphics);
-  Check(loaded.pipelines.size() == 2, "warmup accepted compute as pixel shader");
+  Check(loaded.pipelines.size() == 3, "warmup accepted compute as pixel shader");
+
+  // Schema 3 fixtures retain their original shader words and indices while recipes
+  // are validated in their legacy layout, then normalized with a false native bit.
+  auto write_legacy = [&](const std::filesystem::path& legacy_path, const std::string& signature,
+                          const std::vector<std::vector<uint32_t>>& shader_records,
+                          const std::vector<std::vector<uint32_t>>& legacy_pipelines) {
+    LocalShaderWarmup::Writer contents;
+    uint32_t count = uint32_t(shader_records.size()); contents(count);
+    for (auto shader : shader_records) LocalShaderWarmup::Words(contents, shader, 1024 * 1024);
+    count = uint32_t(legacy_pipelines.size()); contents(count);
+    for (auto pipeline : legacy_pipelines) LocalShaderWarmup::Words(contents, pipeline, 4096);
+    const uint64_t checksum = XXH3_64bits(contents.words.data(), contents.words.size() * sizeof(uint32_t));
+    std::ofstream file(legacy_path, std::ios::binary | std::ios::trunc);
+    file.write(signature.data(), std::streamsize(signature.size()));
+    file.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
+    file.write(reinterpret_cast<const char*>(contents.words.data()),
+               std::streamsize(contents.words.size() * sizeof(uint32_t)));
+    return bool(file);
+  };
+  auto legacy_pipeline = loaded.pipelines[1];
+  legacy_pipeline.erase(legacy_pipeline.begin() + 3);
+  const auto legacy_path = directory / "legacy.shaders";
+  const std::string legacy_signature = "KytyShaderWarmup3:device-and-executable-A\n";
+  Check(write_legacy(legacy_path, legacy_signature, loaded.records, {legacy_pipeline}),
+        "write checksummed schema 3 warmup fixture");
+  LocalShaderWarmup::Cache migrated;
+  Check(migrated.Open(legacy_path, "device-and-executable-A") && migrated.records == loaded.records &&
+        migrated.pipelines.size() == 1 && migrated.pipelines[0] == loaded.pipelines[1],
+        "schema 3 migration changed shaders, pipeline order, or normalized recipe incorrectly");
+  Check(migrated.Save() &&
+        LocalShaderWarmup::Cache::FileIdentity(legacy_path) ==
+            "KytyShaderWarmup4:device-and-executable-A\n",
+        "schema 3 cache was not rewritten with schema 4 identity");
+  const auto seed_path = directory / "legacy-seeds.shaders";
+  Check(write_legacy(seed_path, "KytyShaderSeeds2:test\n", loaded.records, {legacy_pipeline}),
+        "write checksummed legacy shader seed fixture");
+  std::vector<std::vector<uint32_t>> seed_records, seed_pipelines;
+  Check(LocalShaderWarmup::Cache::ReadSeeds(seed_path, seed_records, seed_pipelines) &&
+        seed_records == loaded.records && seed_pipelines.size() == 1 &&
+        seed_pipelines[0] == loaded.pipelines[1], "legacy shader seeds were not normalized");
+  const auto current_seed_path = directory / "current-seeds.shaders";
+  Check(write_legacy(current_seed_path, "KytyShaderSeeds3:test\n", loaded.records,
+                     {loaded.pipelines[2]}), "write current shader seed fixture");
+  Check(LocalShaderWarmup::Cache::ReadSeeds(current_seed_path, seed_records, seed_pipelines) &&
+        seed_records == loaded.records && seed_pipelines.size() == 1 &&
+        seed_pipelines[0] == loaded.pipelines[2], "current shader seeds lost native binding recipes");
+  const auto malformed_seed_path = directory / "malformed-seeds.shaders";
+  Check(write_legacy(malformed_seed_path, "KytyShaderSeeds2:test\n", loaded.records, {legacy_pipeline}),
+        "write malformed seed fixture");
+  {
+    std::fstream malformed(malformed_seed_path, std::ios::binary | std::ios::in | std::ios::out);
+    malformed.seekp(-1, std::ios::end); malformed.put(char(0xff));
+  }
+  seed_records = {{123}}; seed_pipelines = {{456}};
+  Check(!LocalShaderWarmup::Cache::ReadSeeds(malformed_seed_path, seed_records, seed_pipelines) &&
+        seed_records == std::vector<std::vector<uint32_t>>{{123}} &&
+        seed_pipelines == std::vector<std::vector<uint32_t>>{{456}},
+        "malformed shader seeds were reinterpreted or partially loaded");
+  const auto wrong_legacy_path = directory / "wrong-legacy.shaders";
+  Check(write_legacy(wrong_legacy_path, "KytyShaderWarmup3:another-executable\n",
+                     loaded.records, {legacy_pipeline}), "write mismatched schema 3 fixture");
+  LocalShaderWarmup::Cache wrong_legacy;
+  Check(!wrong_legacy.Open(wrong_legacy_path, "device-and-executable-A") && wrong_legacy.records.empty(),
+        "warmup migrated a schema 3 cache with a mismatched title/device signature");
   loaded.StartWriter();
   record.hash = 123;
   loaded.Add(record);
@@ -13003,7 +13086,7 @@ void TestShaderWarmupCacheFiles() {
   for (unsigned attempt = 0; attempt < 70 && !checkpoint_before_close; ++attempt) {
     LocalShaderWarmup::Cache observed;
     checkpoint_before_close = observed.Open(path, "device-and-executable-A") &&
-        observed.records.size() == 4 && observed.pipelines.size() == 2;
+        observed.records.size() == 4 && observed.pipelines.size() == 3;
     if (!checkpoint_before_close) std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   Check(checkpoint_before_close, "shader inputs were not checkpointed before normal exit");

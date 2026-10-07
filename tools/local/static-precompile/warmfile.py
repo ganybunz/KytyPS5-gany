@@ -1,4 +1,4 @@
-"""warmlib.py -- strict decoder + validator for KytyShaderWarmup3 caches.
+"""warmlib.py -- strict decoder + validator for KytyShaderWarmup3/4 caches.
 
 Mirrors, field for field and word for word:
   * src/local/shader-warmup-cache.h   (Visit, VisitPipeline, Cache::Load/ReadRecords/ValidPipeline)
@@ -550,7 +550,7 @@ def nonkey_components(rec: Record) -> list[tuple[str, int, int]]:
 class Pipeline:
     __slots__ = ('index', 'vertex', 'pixel', 'compute', 'color_count', 'depth_format', 'stencil_format',
                  'color_formats', 'binding_count', 'attribute_count', 'bindings', 'attributes', 'state',
-                 'nwords')
+                 'nwords', 'native_bindings', 'schema_version')
 
     @property
     def is_compute(self):
@@ -581,19 +581,25 @@ STATE_FIELDS_ORDER = (STATE_SCALARS + ('stencil_front', 'stencil_back', 'cull_fr
                                        'provoking_vtx_last', 'polygon_mode') + STATE_ARRAYS)
 
 
-def decode_pipeline(w, index: int = -1) -> Pipeline:
+def decode_pipeline(w, index: int = -1, schema_version: int = 3) -> Pipeline:
     """VisitPipeline(Reader&, PipelineRecord&) + the `reader.cursor == words.size()` check."""
     r = Rd([int(x) for x in np.asarray(w, dtype=np.uint32)])
     p = Pipeline()
     p.index = index
     p.nwords = len(w)
     p.vertex = r.u(); p.pixel = r.u(); p.compute = r.u()
+    if schema_version not in (3, 4):
+        raise DecodeError('unsupported pipeline schema')
+    p.schema_version = schema_version
+    p.native_bindings = r.b() if schema_version == 4 else False
     p.color_count = p.depth_format = p.stencil_format = 0
     p.color_formats = ()
     p.binding_count = p.attribute_count = 0
     p.bindings = p.attributes = ()
     p.state = {}
     if p.compute != NO_SHADER:
+        if p.native_bindings:
+            raise DecodeError('native bindings on compute recipe')
         if p.vertex != NO_SHADER or p.pixel != NO_SHADER:
             raise DecodeError('compute pipeline with vertex/pixel')
         if r.i != r.n:
@@ -710,6 +716,8 @@ def encode_record(rec: Record) -> list[int]:
 
 def encode_pipeline(p: Pipeline) -> list[int]:
     out: list[int] = [p.vertex, p.pixel, p.compute]
+    if p.schema_version == 4:
+        out.append(int(p.native_bindings))
     if p.compute != NO_SHADER:
         return out
     out += [p.color_count, p.depth_format, p.stencil_format]
@@ -761,6 +769,12 @@ class WarmFile:
         raw = self.path.read_bytes()
         nl = raw.index(b'\n', 0, 1024)
         self.identity = raw[:nl + 1].decode('latin1')
+        if self.identity.startswith(('KytyShaderWarmup4:', 'KytyShaderSeeds3:')):
+            schema_version = 4
+        elif self.identity.startswith(('KytyShaderWarmup3:', 'KytyShaderSeeds2:')):
+            schema_version = 3
+        else:
+            raise DecodeError('unsupported warmup/seed identity')
         self.checksum_stored = struct.unpack_from('<Q', raw, nl + 1)[0]
         body = raw[nl + 1 + 8:]
         if len(body) % 4:
@@ -791,7 +805,7 @@ class WarmFile:
         for idx, w in enumerate(pipe_words):
             self.pipe_words_total += len(w)
             try:
-                p = decode_pipeline(w, idx)
+                p = decode_pipeline(w, idx, schema_version)
             except (DecodeError, IndexError, ValueError) as e:
                 self.pipe_fail.append((idx, str(e)))
                 p = None
