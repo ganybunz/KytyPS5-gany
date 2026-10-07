@@ -598,13 +598,19 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	// out of bounds they load its first dword).
 	const vk::DeviceAddress null_device = upload.BufferDeviceAddress();
 	// A V#'s buffer word (IR::BufferWord, as IR::BufferDescriptorWord makes it) and stride.
+	static const auto format_classes = [] {
+		std::array<uint32_t, 128> classes {};
+		for (uint32_t format = 0; format < classes.size(); ++format)
+			classes[format] = ShaderRecompiler::IR::BufferFormatClass(static_cast<Prospero::BufferFormat>(format));
+		return classes;
+	}();
 	const auto word_of = [](const std::array<uint32_t, 4>& words4) -> std::pair<uint32_t, uint32_t> {
 		ShaderBufferResource descriptor;
 		std::copy_n(words4.begin(), 4, descriptor.fields);
 		if (descriptor.Type() != 0) return {0, 0};
 		using Word = ShaderRecompiler::IR::BufferWord;
 		return {(descriptor.Stride() <= Word::MaxStride ? descriptor.Stride() : 0u) |
-		            ShaderRecompiler::IR::BufferFormatClass(descriptor.Format()) << Word::LayoutShift |
+		            format_classes[descriptor.RawFormat()] << Word::LayoutShift |
 		            descriptor.DstSelXYZW() << Word::DstSelShift,
 		        descriptor.Stride()};
 	};
@@ -661,7 +667,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		// The buffers it writes first: a range it also reads through another V# is GPU-written by then, as the
 		// normal path's second lookup (RebindBuffers) sees it (not a copy of the guest's bytes in the ring).
 		for (size_t n = 0; n < 2 * plan.buffers.size(); ++n) {
-			const auto  i         = n % plan.buffers.size();
+			const auto  i         = n < plan.buffers.size() ? n : n - plan.buffers.size();
 			const auto& words4    = entries[i].first;
 			const auto& resource  = program.info.buffers[i];
 			const bool  formatted = resource.formatted;
@@ -942,6 +948,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (!TableTransit(*set, vk_buffer, &draw_state)) return TableResult::Native;
 	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
+	    emit.state->dynamic_hash == draw_state.dynamic_hash &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
 		emit.state = &draw_state;
 	if (!same_command || emit.state != &draw_state) {

@@ -198,6 +198,7 @@ struct RenderExecutor::NativeXprDrawState {
 	RenderState                      first_rendering; // as the stored draw began it
 	std::vector<Target>              targets;
 	LocalDrawRecording::DynamicState dynamic;
+	uint64_t                         dynamic_hash = 0;
 	// Metadata epoch under which no target had a pending fast clear.
 	mutable uint64_t                 meta_epoch = 0;
 	// Texture cache resolution epoch under which the targets were what a lookup finds (0: not yet).
@@ -1625,6 +1626,9 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	auto& slot = cache.states[state_key];
 	if (!slot) slot = std::make_unique<NativeXprDrawState>();
 	*slot = std::move(draw_state);
+	// Hash the final stored representation. The full byte comparison below
+	// still decides equality; a hash collision cannot suppress state updates.
+	slot->dynamic_hash = XXH3_64bits(&slot->dynamic, sizeof(slot->dynamic));
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 }
 
@@ -3014,6 +3018,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// stays bound unless another path bound graphics state (generation).
 	const bool same_command = emit.command == vk_buffer && emit.generation == buffer.GraphicsGeneration();
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
+	    emit.state->dynamic_hash == draw_state.dynamic_hash &&
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0) {
 		// Another draw state with the same dynamic state is bound already.
 		emit.state = &draw_state;

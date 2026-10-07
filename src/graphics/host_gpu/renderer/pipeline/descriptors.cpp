@@ -1222,7 +1222,9 @@ void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const Pre
 	const bool first_dma = first.runtime->program->info.uses_dma;
 	const bool second_dma = second && second->runtime->program->info.uses_dma;
 	if (!first_dma && !second_dma) return;
-	std::vector<GuestRange> first_ranges, second_ranges;
+	thread_local std::vector<GuestRange> first_ranges, second_ranges;
+	first_ranges.clear();
+	second_ranges.clear();
 	const bool bounded = (!first_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
 	    first.runtime->program->bda_read_plan, first.runtime->resources, first_ranges)) &&
 	    (!second_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
