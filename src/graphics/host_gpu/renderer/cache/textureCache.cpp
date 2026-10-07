@@ -2320,59 +2320,79 @@ bool TextureCache::UploadImageChunked(Image& image) {
 	TileBlockLayout block {};
 	if (!TileGetBlockLayout(plan.tiles.front().family, plan.tiles.front().bytes_per_element, block)) return false;
 	uint64_t uploaded_bytes = 0;
-	for (size_t first = 0; first < entries.size();) {
-		std::vector<BufferCache::StagingPiece> pieces;
-		std::vector<GpuTileInfo> tiles;
-		std::vector<vk::BufferImageCopy> copies;
-		pieces.reserve(entries.size() - first);
-		tiles.reserve(entries.size() - first);
-		copies.reserve(entries.size() - first);
-		uint64_t stage_bytes = 0;
-		uint64_t linear_bytes = 0;
-		size_t last = first;
-		for (; last < entries.size(); ++last) {
-			const auto& entry = entries[last];
-			const uint64_t stage_offset = (stage_bytes + 255) & ~uint64_t {255};
-			const uint64_t stage_size = entry.source_end - entry.source_begin;
-			if (stage_offset > capacity || stage_size > capacity - stage_offset) break;
-			const uint64_t linear_offset = (linear_bytes + 255) & ~uint64_t {255};
-			if (linear_offset > capacity || entry.tile.linear_size > capacity - linear_offset) break;
-			pieces.push_back({entry.source_begin, stage_size, stage_offset});
-			auto tile = entry.tile;
-			auto copy = entry.copy;
-			tile.tiled_offset = stage_offset + (info.data.address + tile.tiled_offset - entry.source_begin);
-			tile.linear_offset = linear_offset;
-			copy.bufferOffset = linear_offset + (copy.bufferOffset - entry.tile.linear_offset);
-			copy.imageSubresource.mipLevel -= info.host_mip_skip;
-			linear_bytes = linear_offset + tile.linear_size;
-			tiles.push_back(tile);
-			copies.push_back(copy);
-			stage_bytes = stage_offset + stage_size;
+	static const bool reuse_scratch = [] {
+		const char* value = std::getenv("KYTY_COLOR_CHUNK_SCRATCH_REUSE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	bool complete = true;
+	const auto record_batches = [&](TileManager::Result scratch) {
+		for (size_t first = 0; first < entries.size();) {
+			std::vector<BufferCache::StagingPiece> pieces;
+			std::vector<GpuTileInfo> tiles;
+			std::vector<vk::BufferImageCopy> copies;
+			pieces.reserve(entries.size() - first);
+			tiles.reserve(entries.size() - first);
+			copies.reserve(entries.size() - first);
+			uint64_t stage_bytes = 0;
+			uint64_t linear_bytes = 0;
+			size_t last = first;
+			for (; last < entries.size(); ++last) {
+				const auto& entry = entries[last];
+				const uint64_t stage_offset = (stage_bytes + 255) & ~uint64_t {255};
+				const uint64_t stage_size = entry.source_end - entry.source_begin;
+				if (stage_offset > capacity || stage_size > capacity - stage_offset) break;
+				const uint64_t linear_offset = (linear_bytes + 255) & ~uint64_t {255};
+				if (linear_offset > capacity || entry.tile.linear_size > capacity - linear_offset) break;
+				pieces.push_back({entry.source_begin, stage_size, stage_offset});
+				auto tile = entry.tile;
+				auto copy = entry.copy;
+				tile.tiled_offset = stage_offset + (info.data.address + tile.tiled_offset - entry.source_begin);
+				tile.linear_offset = linear_offset;
+				copy.bufferOffset = linear_offset + (copy.bufferOffset - entry.tile.linear_offset);
+				copy.imageSubresource.mipLevel -= info.host_mip_skip;
+				linear_bytes = linear_offset + tile.linear_size;
+				tiles.push_back(tile);
+				copies.push_back(copy);
+				stage_bytes = stage_offset + stage_size;
+			}
+			if (last == first || copies.empty()) { complete = false; return; }
+			BufferCache::ImageStageFailure failure {};
+			const auto [source, source_offset] =
+			    m_buffer_cache.StageImagePieces(pieces, stage_bytes, &failure, true);
+			if (source == nullptr) {
+				std::printf("FULL-IMAGE-CHUNK-FAIL addr=0x%llx stage=0x%llx capacity=0x%llx reason=%u\n",
+				            static_cast<unsigned long long>(info.data.address),
+				            static_cast<unsigned long long>(stage_bytes), static_cast<unsigned long long>(capacity),
+				            static_cast<unsigned>(failure));
+				complete = false;
+				return;
+			}
+			TileManager::Result linear;
+			if (reuse_scratch) {
+				// Every batch's linear extent is bounded by capacity above. The lease
+				// survives staging/parameter submission flushes and all image consumers.
+				m_tiler.DetileInto(source->Handle(), source_offset, stage_bytes, linear_bytes, tiles, scratch);
+				linear = {scratch.buffer, scratch.offset, linear_bytes};
+			} else {
+				linear = m_tiler.Detile(source->Handle(), source_offset, stage_bytes, linear_bytes, tiles);
+			}
+			for (auto& copy: copies) copy.bufferOffset += linear.offset;
+			image.Upload(copies, linear.buffer, linear.offset, linear.size);
+			m_buffer_cache.RetainImageStaging();
+			uploaded_bytes += stage_bytes;
+			first = last;
 		}
-		if (last == first || copies.empty()) return false;
-		BufferCache::ImageStageFailure failure {};
-		const auto [source, source_offset] =
-		    m_buffer_cache.StageImagePieces(pieces, stage_bytes, &failure, true);
-		if (source == nullptr) {
-			std::printf("FULL-IMAGE-CHUNK-FAIL addr=0x%llx stage=0x%llx capacity=0x%llx reason=%u\n",
-			            static_cast<unsigned long long>(info.data.address),
-			            static_cast<unsigned long long>(stage_bytes), static_cast<unsigned long long>(capacity),
-			            static_cast<unsigned>(failure));
-			return false;
-		}
-		const auto linear = m_tiler.Detile(source->Handle(), source_offset, stage_bytes, linear_bytes, tiles);
-		for (auto& copy: copies) copy.bufferOffset += linear.offset;
-		image.Upload(copies, linear.buffer, linear.offset, linear.size);
-		m_buffer_cache.RetainImageStaging();
-		uploaded_bytes += stage_bytes;
-		first = last;
-	}
+	};
+	if (reuse_scratch) m_tiler.UseScratch(capacity, record_batches);
+	else record_batches({});
+	if (!complete) return false;
 	LiveCounters::Add(LiveCounters::FullUploads);
 	LiveCounters::Add(LiveCounters::FullUploadBytes, info.data.size);
-	std::printf("FULL-IMAGE-CHUNK addr=0x%llx image=0x%llx staged=0x%llx layers=%u levels=%u skip=%u\n",
+	std::printf("FULL-IMAGE-CHUNK addr=0x%llx image=0x%llx staged=0x%llx layers=%u levels=%u skip=%u scratch_reuse=%d scratch=0x%llx\n",
 	            static_cast<unsigned long long>(info.data.address),
 	            static_cast<unsigned long long>(info.data.size), static_cast<unsigned long long>(uploaded_bytes),
-	            info.resources.layers, info.resources.levels, info.host_mip_skip);
+	            info.resources.layers, info.resources.levels, info.host_mip_skip, reuse_scratch ? 1 : 0,
+	            static_cast<unsigned long long>(reuse_scratch ? capacity : 0));
 	TrimUploadedTexture(image, true);
 	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 && PartialDirtyCandidate(image)) {
 		UpdatePartialHashes(image, true);
