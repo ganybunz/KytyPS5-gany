@@ -45,7 +45,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -54,6 +56,10 @@
 #include <semaphore>
 #include <thread>
 #include <vector>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -188,11 +194,37 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	static const bool spin_enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_WAIT_SPIN");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!spin_enabled) {
+		std::binary_semaphore done {0};
+		SendCommand([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		done.acquire();
+		return;
+	}
+
 	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
+	std::atomic<bool>    completed {false};
+	SendCommand([operation = std::move(command), &done, &completed]() mutable {
 		operation();
+		completed.store(true, std::memory_order_release);
 		done.release();
 	});
+	const auto spin_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(2);
+	while (!completed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < spin_deadline) {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#else
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+	}
+	// Keep the semaphore as the completion primitive: a release during the spin remains
+	// available here, so there is no check-then-sleep lost-wakeup window.
 	done.acquire();
 }
 
