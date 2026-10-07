@@ -543,7 +543,7 @@ void TileManager::DetileInto(vk::Buffer tiled, uint64_t tiled_offset, uint64_t t
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
 	Record(tiled, tiled_offset, tiled_capacity, target.buffer, target.offset, target_capacity,
-	       dispatches, false, true);
+	       dispatches, true, true);
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
