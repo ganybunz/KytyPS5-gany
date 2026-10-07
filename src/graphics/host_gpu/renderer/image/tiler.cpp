@@ -431,7 +431,7 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 void TileManager::Record(vk::Buffer source, uint64_t source_offset,
                          uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
                          uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+                         bool clear_target, bool target_reused) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -456,6 +456,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[0].offset              = source_offset;
 	barriers[0].size                = source_capacity;
 	barriers[1]                     = barriers[0];
+	if (target_reused) barriers[1].srcAccessMask |= vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask =
 	    clear_target ? vk::AccessFlagBits::eTransferWrite
 	                 : vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -527,6 +528,24 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	return {scratch.buffer, 0, linear_capacity};
 }
 
+void TileManager::DetileInto(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+                             uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
+                             Result target) {
+	EXIT_IF(linear_capacity > UINT64_MAX - 3u);
+	const uint64_t target_capacity = (linear_capacity + 3u) & ~uint64_t {3};
+	EXIT_IF(target.buffer == nullptr || target.size < target_capacity || target.offset % 4 != 0);
+
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_base = tiled_offset & (descriptor_alignment - 1);
+	const uint64_t target_base = target.offset & (descriptor_alignment - 1);
+	std::vector<Dispatch> dispatches;
+	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
+	Record(tiled, tiled_offset, tiled_capacity, target.buffer, target.offset, target_capacity,
+	       dispatches, false, true);
+}
+
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                        std::span<const GpuTileInfo> infos) {
@@ -569,6 +588,19 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
 	auto scratch = AllocateScratch((size + 3u) & ~uint64_t {3});
 	DeferDestroy(scratch);
 	return {scratch.buffer, 0, scratch.size};
+}
+
+void TileManager::UseScratch(uint64_t size, const std::function<void(Result)>& record) {
+	EXIT_IF(size == 0 || size > UINT64_MAX - 3u);
+	const uint64_t allocation_size = (size + 3u) & ~uint64_t {3};
+	auto           scratch         = AllocateScratch(allocation_size);
+	try {
+		record({scratch.buffer, 0, size});
+	} catch (...) {
+		DeferDestroy(scratch);
+		throw;
+	}
+	DeferDestroy(scratch);
 }
 
 TileManager::StorageBinding TileManager::BindStorage(Result buffer, uint64_t size) const {

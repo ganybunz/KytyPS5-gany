@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <vector>
@@ -66,6 +67,8 @@ public:
 	// The returned device-local buffer remains alive through the current scheduler tick.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
 	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos);
+	void DetileInto(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+	                uint64_t linear_capacity, std::span<const GpuTileInfo> infos, Result target);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, std::span<const GpuTileInfo> infos);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
@@ -73,6 +76,7 @@ public:
 	               std::span<const GpuTileInfo> infos,
 	               ColorTransform               transform = ColorTransform::None);
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size);
+	void                 UseScratch(uint64_t size, const std::function<void(Result)>& record);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result SwapBgra16(Result input);
@@ -128,7 +132,7 @@ private:
 	             std::vector<Dispatch>& dispatches);
 	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-	            std::span<Dispatch> dispatches, bool clear_target);
+	            std::span<Dispatch> dispatches, bool clear_target, bool target_reused = false);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
 	void                       SwapBgra16(Result input, Result output, uint32_t pixels);
 
