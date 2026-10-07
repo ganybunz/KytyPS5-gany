@@ -7,6 +7,7 @@ extern "C" volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 #include <barrier>
 extern "C" volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern "C" volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode;
+extern "C" volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
 #endif
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -4201,6 +4202,133 @@ public:
   }
 
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckNarrowSyncReadback() {
+    constexpr const char* name = "NarrowSyncReadback";
+    constexpr uintptr_t base = 0x0000000200700000ull;
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    constexpr uint64_t bytes = 0x400000, alignment = 0x10000;
+    constexpr uint64_t first_owner_size = page * 3;
+    constexpr uint64_t edge_owner_offset = 0x200000;
+    constexpr uint64_t edge_owner_size = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    auto& context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto& gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), bytes,
+        alignment, 0, &direct_offset) == 0, "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, bytes, 0x3, 0x10, direct_offset, alignment) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "mapping failed");
+    std::memset(mapped, 0x5a, bytes);
+    const auto old_frame_mode = kyty_local_frame_pipeline_mode.exchange(1);
+    const auto old_narrow_mode = kyty_local_sync_readback_narrow_mode.exchange(1);
+    struct RestoreModes {
+      uint32_t frame;
+      uint32_t narrow;
+      ~RestoreModes() {
+        kyty_local_sync_readback_narrow_mode.store(narrow);
+        kyty_local_frame_pipeline_mode.store(frame);
+      }
+    } restore_modes{old_frame_mode, old_narrow_mode};
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, bytes);
+      auto& cache = resources.GetBufferCache();
+      gpu.SendCommandSync([&] {
+        (void)cache.FindBuffer(base, first_owner_size);
+        (void)cache.FindBuffer(base + edge_owner_offset, edge_owner_size);
+      });
+      const auto backing = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "backing", Libs::LibKernel::Memory::TryReadBacking(
+            address, &value, sizeof(value)), "backing unavailable");
+        return value;
+      };
+      const auto fill = [&](uint64_t address, uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(address, sizeof(value), true);
+        buffer->Fill(offset, sizeof(value), value);
+      };
+
+      const auto boundary = base + page;
+      const auto before_boundary = boundary - sizeof(uint32_t);
+      constexpr uint32_t first_value = 0x12345678;
+      constexpr uint32_t second_value = 0x90abcdef;
+      constexpr uint32_t excluded_value = 0x76543210;
+      gpu.SendCommandSync([&] {
+        fill(before_boundary, first_value);
+        fill(boundary, second_value);
+        // Clearing page ownership must also publish dirty bytes outside the
+        // byte request, on each of the two required tracker pages.
+        fill(base + 0x100, 0x11112222);
+        fill(boundary + 0x100, 0x33334444);
+        fill(base + page * 2 + 0x100, excluded_value);
+        Require(name, "dirty setup",
+                cache.HasGpuDirtyBytes(before_boundary, sizeof(uint32_t)) &&
+                    cache.HasGpuDirtyBytes(boundary, sizeof(uint32_t)) &&
+                    cache.HasGpuDirtyBytes(base + page * 2 + 0x100, sizeof(uint32_t)),
+                "GPU writes did not dirty all three pages");
+      });
+
+      // Exercise synchronous GPU-thread reads, not the guest asynchronous
+      // readback window that has a separate narrowing policy.
+      gpu.SendCommandSync([&] { cache.ReadMemory(before_boundary, sizeof(uint32_t) * 2); });
+      Require(name, "boundary bytes",
+              backing(before_boundary) == first_value && backing(boundary) == second_value &&
+                  backing(before_boundary - sizeof(uint32_t)) == 0x5a5a5a5a &&
+                  backing(boundary + sizeof(uint32_t)) == 0x5a5a5a5a,
+              "cross-page request missed GPU bytes or changed adjacent bytes");
+      Require(name, "both required pages copied",
+              backing(base + 0x100) == 0x11112222 && backing(boundary + 0x100) == 0x33334444 &&
+                  !cache.HasGpuDirtyBytes(base, page) && !cache.IsRegionGpuModified(base, page) &&
+                  !cache.HasGpuDirtyBytes(base + page, page) &&
+                  !cache.IsRegionGpuModified(base + page, page),
+              "one of the request's tracker pages remained GPU-owned");
+      Require(name, "unrequested page retained",
+              backing(base + page * 2 + 0x100) == 0x5a5a5a5a &&
+                  cache.HasGpuDirtyBytes(base + page * 2 + 0x100, sizeof(uint32_t)) &&
+                  cache.IsRegionGpuModified(base + page * 2, page),
+              "narrow read copied or cleared the neighbouring dirty page");
+
+      const auto edge_end = base + edge_owner_offset + edge_owner_size;
+      const auto edge_word = edge_end - sizeof(uint32_t);
+      constexpr uint32_t edge_value = 0x0badc0de;
+      gpu.SendCommandSync([&] {
+        const auto& owner = cache.GetBuffer(cache.FindBuffer(edge_word, sizeof(uint32_t)));
+        Require(name, "actual owner edge", owner.CpuAddress() + owner.Size() == edge_end,
+                "test request is not at the owning buffer's end");
+        fill(edge_word, edge_value);
+        cache.ReadMemory(edge_word, sizeof(uint32_t));
+      });
+      Require(name, "owner edge clipping",
+              backing(edge_word) == edge_value &&
+                  backing(edge_word - sizeof(uint32_t)) == 0x5a5a5a5a &&
+                  !cache.HasGpuDirtyBytes(edge_word, sizeof(uint32_t)) &&
+                  !cache.IsRegionGpuModified(edge_word, sizeof(uint32_t)),
+              "readback widened past the owning buffer edge or missed its final bytes");
+
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        resources.UnmapMemory(base, bytes);
+      });
+    }
+    context.GetGpu().Shutdown();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0,
+            "guest unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+        direct_offset, bytes) == 0, "direct release failed");
+    scheduler.Shutdown();
+    std::printf("PASS %s\n", name);
+  }
+
   void CheckGuestReadback() {
     constexpr const char* name = "GuestReadback";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -32363,6 +32491,11 @@ int main(int argc, char **argv) {
     return 0;
   }
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--sync-readback-narrow-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNarrowSyncReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--guest-readback-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGuestReadback();

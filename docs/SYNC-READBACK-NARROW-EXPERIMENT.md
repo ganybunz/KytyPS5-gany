@@ -18,7 +18,25 @@ events 37–39 record request, SRT consumer and enumerated window.
 
 Narrowing can help only if speculative neighbouring pages caused the wait.
 It cannot bypass the actual request's unfinished writer. More small downloads
-can also make it slower. No build or runtime/FPS claim yet.
+can also make it slower.
+
+M20 be20169a built this path and tested three paired 12-second standing windows.
+FPS pairs (wide/narrow): 20.17/20.17, 20.83/20.92, 21.50/21.75. This is too small
+to establish a useful gain; the flag was restored to 0. Instrumented captures
+show a one-byte fault request at 0x20ed7fda0, shader hash 7fd4cfcc774889a2. This
+one byte is the fault-handler request, not proof of the shader's total read size.
+The last 608-byte write overlaps that address in the current tick and completes
+about 16 ms later. Narrowing from the clipped 16 KiB owner to its 4 KiB page
+reduces copied bytes from 7,816 to 3,864 per sampled request without removing the
+actual producer dependency. The original captures and consumer reports live in
+Performance Experiments/M20-be20169a-correctness. No bypass is justified.
+
+New regression --sync-readback-narrow-only covers the synchronous GPU-thread
+path, a crossing request, dirty bytes outside that request on both required
+pages, the excluded dirty page, and the actual page-aligned owner end. Buffer
+owners are caching-page aligned; no partial-owner-page coverage is claimed.
+The regression is source-reviewed but not yet built or run. It preserves and
+restores the two live switches it changes.
 
 ## Correctness constraints
 
