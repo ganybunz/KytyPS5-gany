@@ -3193,7 +3193,14 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
+		EXIT("TextureCache: color target requires rediscovery before final acquisition: "
+		     "id=%u:%u registered=%u depth_id=%u:%u needs_rebind=%u "
+		     "owner=0x%016llx+0x%llx request=0x%016llx+0x%llx format=%u type=%u\n",
+		     id.index, id.generation, static_cast<unsigned>(image.registered),
+		     image.depth_id.index, image.depth_id.generation, static_cast<unsigned>(image.binding.needs_rebind),
+		     static_cast<unsigned long long>(image.info.data.address), static_cast<unsigned long long>(image.info.data.size),
+		     static_cast<unsigned long long>(desc.info.data.address), static_cast<unsigned long long>(desc.info.data.size),
+		     static_cast<unsigned>(desc.info.guest_format), static_cast<unsigned>(desc.type));
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
