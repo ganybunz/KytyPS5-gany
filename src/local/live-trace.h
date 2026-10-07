@@ -42,6 +42,9 @@ enum Type : uint32_t {
 	ImageUse      = 34, // a: image address, b: size (low 32 bits) | layout << 32 | 1 << 63 when written (`tracew`)
 	SlowOsCall    = 35, // a: address, b: call << 56 | TSC ticks / 1024 (24 bits) << 32 | size in 4 KiB pages
 	FaultDone     = 36, // the handled fault of the thread's last FaultSite: a: 1 write / 0 read, b: fault address
+	SyncRequest   = 37, // synchronous buffer read: a address, b size | write access << 63
+	SyncConsumer  = 38, // follows SyncRequest: a SRT shader hash (0 when unavailable), b current tick
+	SyncWindow    = 39, // pages enumerated for that request: a address, b size
 };
 
 // SlowOsCall ids: address-space calls that hold the process's memory locks (a page fault anywhere

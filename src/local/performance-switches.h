@@ -28,6 +28,7 @@ extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode;
+extern volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
@@ -89,6 +90,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_ASYNC_REPROTECT", &kyty_local_async_reprotect_mode},
 	    Switch {"KYTY_READBACK_NARROW", &kyty_local_readback_narrow_mode},
 	    Switch {"KYTY_SYNC_READBACK_SCOPED_DRAIN", &kyty_local_sync_readback_scoped_drain_mode},
+	    Switch {"KYTY_SYNC_READBACK_NARROW", &kyty_local_sync_readback_narrow_mode},
 	    // Also creates the transfer queue at device creation (vulkanWindow.cpp).
 	    Switch {"KYTY_READBACK_QUEUE", &kyty_local_readback_queue_mode, 0, 3},
 	    // Images and command submission.

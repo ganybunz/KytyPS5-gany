@@ -14,6 +14,8 @@
 extern "C" {
 // 1: a synchronous download retires only guest readbacks overlapping its pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode {0};
+// 1: synchronous reads download only their required tracker pages, without 512 KiB prefetch.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode {0};
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {0};
@@ -1281,6 +1283,11 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
 	LiveCensus::Scope census(LiveCensus::SyncDownload, vaddr >> 20u << 20u, is_write);
 	LiveCensus::WaitScope waiting(LiveCensus::WaitDownload);
+	if (LiveTrace::WriteTicks()) {
+		LiveTrace::Event(LiveTrace::SyncRequest, vaddr, size | (uint64_t {is_write} << 63u));
+		LiveTrace::Event(LiveTrace::SyncConsumer, Libs::LibKernel::Memory::g_srt_shader_hash,
+		                 m_scheduler.CurrentTick());
+	}
 	const bool scoped_drain = kyty_local_sync_readback_scoped_drain_mode.load(std::memory_order_relaxed) != 0;
 	// A synchronous SRT read need not retire tickets for unrelated guest pages.
 	// Retire the requested pages before owner discovery, then the entire widened
@@ -1301,8 +1308,12 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	constexpr uint64_t WindowSize   = 512 * 1024;
 	const auto         buffer_begin = buffer.CpuAddress();
 	const auto         buffer_end   = buffer_begin + buffer.Size();
-	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
-	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	const bool narrow = kyty_local_sync_readback_narrow_mode.load(std::memory_order_relaxed) != 0;
+	const auto window_begin = std::max(vaddr & ~(narrow ? TRACKER_PAGE_SIZE - 1 : WindowSize - 1), buffer_begin);
+	const auto window_end = narrow
+	    ? std::min((vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1), buffer_end)
+	    : std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::SyncWindow, window_begin, window_end - window_begin);
 	if (scoped_drain) DrainGuestReadback(window_begin, window_end - window_begin);
 
 	std::vector<DownloadCopy> copies;
