@@ -36,10 +36,19 @@ struct MarkAfter {
 	Handle   handle;
 	MarkKind kind;
 	uint64_t shader;
-	MarkAfter(Handle h, MarkKind k, uint64_t s): handle(h), kind(k), shader(s) { ++g_mark_scope; }
+	uint64_t previous_tag;
+	uint32_t previous_kind;
+	MarkAfter(Handle h, MarkKind k, uint64_t s): handle(h), kind(k), shader(s),
+	    previous_tag(g_mark_tag), previous_kind(g_write_kind) {
+		++g_mark_scope;
+		g_mark_tag = shader;
+		g_write_kind = static_cast<uint32_t>(kind);
+	}
 	MarkAfter(const MarkAfter&)            = delete;
 	MarkAfter& operator=(const MarkAfter&) = delete;
 	~MarkAfter() {
+		g_mark_tag = previous_tag;
+		g_write_kind = previous_kind;
 		--g_mark_scope;
 		if (g_marks_on.load(std::memory_order_relaxed)) GpuMarkNow(handle(), kind, shader);
 	}

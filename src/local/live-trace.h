@@ -45,6 +45,7 @@ enum Type : uint32_t {
 	SyncRequest   = 37, // synchronous buffer read: a address, b size | write access << 63
 	SyncConsumer  = 38, // follows SyncRequest: a SRT shader hash (0 when unavailable), b current tick
 	SyncWindow    = 39, // pages enumerated for that request: a address, b size
+	WriteContext  = 40, // follows GpuWrite on its thread: a enclosing shader address, b origin | mark kind << 8
 };
 
 // SlowOsCall ids: address-space calls that hold the process's memory locks (a page fault anywhere
@@ -85,6 +86,7 @@ inline void*                 g_mark_pool = nullptr; // VkQueryPool
 inline std::atomic_bool      g_marks_on {false};
 inline std::atomic<uint32_t> g_mark_next {0};
 inline thread_local uint64_t g_mark_tag = 0;
+inline thread_local uint32_t g_write_kind = 0;
 // Set by the renderer: reads the used marks into the trace (after tracing stops).
 inline void (*g_read_marks)(uint32_t count) = nullptr;
 

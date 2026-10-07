@@ -285,7 +285,11 @@ private:
 	struct GpuWrite {
 		uint64_t begin, end, tick;
 	};
-	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	// Trace origins distinguish a writable binding declaration from a recorded copy.
+	enum class GpuWriteOrigin : uint32_t {
+		WritableBinding = 1, CpuUpload = 2, BufferJoin = 3, ImageDownload = 4,
+	};
+	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size, GpuWriteOrigin origin);
 	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
 	                                         bool between_commands);
 	// The graphics tick a transfer-queue copy of `ranges` ({begin, end}) waits for; false when

@@ -3573,7 +3573,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	InvalidateCopyFeedback(image.info.data.address, copy_size);
-	NoteGpuWrite(image.info.data.address, copy_size);
+	NoteGpuWrite(image.info.data.address, copy_size, GpuWriteOrigin::ImageDownload);
 	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));
 	return true;
 }

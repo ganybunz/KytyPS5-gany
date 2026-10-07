@@ -350,15 +350,19 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 }
 
 // Local diagnostic: every GPU write into guest buffers (tracew), noted or not.
-static void TraceGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
-	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | tick << 32u);
+static void TraceGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint32_t origin) {
+	if (LiveTrace::WriteTicks()) {
+		LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | tick << 32u);
+		LiveTrace::Event(LiveTrace::WriteContext, LiveTrace::g_mark_tag,
+		                 origin | uint64_t {LiveTrace::g_write_kind} << 8u);
+	}
 }
 
 // KYTY_READBACK_QUEUE. GPU thread, inside a command: the write is recorded at or after the
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
-void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
-	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
+void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, GpuWriteOrigin origin) {
+	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick(), static_cast<uint32_t>(origin));
 	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
 		if (m_gpu_writes_on) {
 			m_gpu_writes_on = false;
@@ -1486,7 +1490,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	// The new owner holds these bytes only once the copy ran.
-	NoteGpuWrite(overlap.CpuAddress(), overlap.Size());
+	NoteGpuWrite(overlap.CpuAddress(), overlap.Size(), GpuWriteOrigin::BufferJoin);
 	DeleteBuffer(overlap_id);
 }
 
@@ -1567,7 +1571,7 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source) {
 		for (const auto& copy: copies) {
 			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
-			NoteGpuWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
+			NoteGpuWrite(buffer.CpuAddress() + copy.dstOffset, copy.size, GpuWriteOrigin::CpuUpload);
 		}
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -1722,7 +1726,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
-		NoteGpuWrite(vaddr, size);
+		NoteGpuWrite(vaddr, size, GpuWriteOrigin::WritableBinding);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 	}
