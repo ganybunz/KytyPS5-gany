@@ -1220,6 +1220,17 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		            })),
 		            program->table_plan.images.size(), program->table_plan.samplers.size());
 	}
+	// Restrict the opt-in experiment without omitting work. A rejected shader
+	// falls through to DispatchDirect, including all normal special paths.
+	// Change the two exact-hash words only while TABLE_DISPATCH is disabled;
+	// a live reader must not observe a partially updated selection.
+	const auto shader_hash = pair.programs[0]->shader_hash;
+	const auto bucket = static_cast<uint32_t>((shader_hash ^ (shader_hash >> 32u)) & 31u);
+	const auto selected_hash = uint64_t {kyty_local_table_dispatch_hash_lo.load(std::memory_order_relaxed)} |
+	                           uint64_t {kyty_local_table_dispatch_hash_hi.load(std::memory_order_relaxed)} << 32u;
+	if ((kyty_local_table_dispatch_buckets.load(std::memory_order_relaxed) & (uint32_t {1} << bucket)) == 0 ||
+	    (selected_hash != 0 && selected_hash != shader_hash))
+		return false;
 	if (pair.pipeline == nullptr) {
 		pair.pipeline = pipelines.TryCreateComputePipeline(*pair.compute, pair.compute_program);
 		if (pair.pipeline == nullptr) {

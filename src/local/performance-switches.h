@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,9 @@ extern volatile std::atomic_uint32_t kyty_local_native_xpr_keep_frames;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_instance_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_xpr_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
+extern volatile std::atomic_uint32_t kyty_local_table_dispatch_buckets;
+extern volatile std::atomic_uint32_t kyty_local_table_dispatch_hash_lo;
+extern volatile std::atomic_uint32_t kyty_local_table_dispatch_hash_hi;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 #endif
 }
@@ -118,6 +122,10 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
 	    // Table dispatches (src/local/table-xpr.inc).
 	    Switch {"KYTY_TABLE_DISPATCH", &kyty_local_table_dispatch_mode},
+	    // Diagnostic selection: unselected shaders use the complete normal path.
+	    Switch {"KYTY_TABLE_DISPATCH_BUCKETS", &kyty_local_table_dispatch_buckets, 0, UINT32_MAX},
+	    Switch {"KYTY_TABLE_DISPATCH_HASH_LO", &kyty_local_table_dispatch_hash_lo, 0, UINT32_MAX},
+	    Switch {"KYTY_TABLE_DISPATCH_HASH_HI", &kyty_local_table_dispatch_hash_hi, 0, UINT32_MAX},
 	    // Table store requests per frame (0: no limit).
 	    Switch {"KYTY_TABLE_STORE_BUDGET", &kyty_local_table_store_budget, 0, 65536},
 #endif
@@ -129,8 +137,9 @@ inline void InitializePerformanceSwitches() {
 			continue;
 		}
 		char*      end   = nullptr;
-		const auto value = std::strtoul(text, &end, 10);
-		if (*text == '\0' || *end != '\0' || value < setting.minimum || value > setting.maximum) {
+		errno = 0;
+		const auto value = std::strtoull(text, &end, 10);
+		if (errno == ERANGE || *text == '\0' || *end != '\0' || value < setting.minimum || value > setting.maximum) {
 			std::fprintf(stderr, "%s must be a value from %u to %u\n", setting.environment,
 			             setting.minimum, setting.maximum);
 			std::abort();

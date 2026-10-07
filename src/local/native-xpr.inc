@@ -67,6 +67,12 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_xpr_mode {0};
 // 1: table dispatches (src/local/table-xpr.inc) for the compute shaders that allow them.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {0};
+// Diagnostic shader selection only: rejected dispatches execute normally.
+// Each bit selects one bucket of the folded stable shader hash. All on by
+// default; an optional exact hash further restricts the selected buckets.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_buckets {UINT32_MAX};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_hash_lo {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_hash_hi {0};
 // N > 0: at most N table store requests a frame (each takes its draw to the normal path; the others draw from native
 // records meanwhile). A new area brings hundreds of pairs whose programs and pipelines compile in the background.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {32};

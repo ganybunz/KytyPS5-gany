@@ -1,6 +1,6 @@
 # USA 01.004 empty-poll backoff experiment
 
-**Default off. Unbuilt and unmeasured.** Set `KYTY_DS_EMPTY_POLL_BACKOFF=1`
+**Default off. Built in be20169a; enabled path unmeasured.** Set `KYTY_DS_EMPTY_POLL_BACKOFF=1`
 before a new process to install it. A lower CPU percentage alone is not an FPS
 win. No modification to the current game's memory or installed game assets.
 
