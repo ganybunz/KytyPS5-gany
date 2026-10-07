@@ -1511,6 +1511,51 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
 	auto                copies          = BuildDepthCopies(info, full_slice_size);
+	static const bool bound_depth_fallback = [] {
+		const char* value = std::getenv("KYTY_DEPTH_FALLBACK_SCRATCH_REUSE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	// Keep the whole-path source acquisition and ownership decisions unchanged,
+	// including GPU image aliases that make CPU staging unsafe. Bound only its
+	// detile temporary: every layer still reads the original synchronized source.
+	if (bound_depth_fallback && info.IsTiled() && layers > 1 && info.resources.levels == 1 &&
+	    !info.HasStencil() && info.host_mip_skip == 0 &&
+	    source_offset <= source.Size() && info.data.size <= source.Size() - source_offset &&
+	    info.data.size > m_buffer_cache.ImageStagingCapacity() &&
+	    full_slice_size <= m_buffer_cache.ImageStagingCapacity() &&
+	    DepthAspectTransferBytes(info.pixel_format) == info.bytes_per_block) {
+		const auto tiles = BuildDepthTiles(info);
+		bool valid = tiles.size() == copies.size();
+		for (size_t i = 0; valid && i < tiles.size(); ++i) {
+			const auto& tile = tiles[i];
+			valid = tile.linear_size == full_slice_size && tile.tiled_size == full_slice_size &&
+			        tile.tiled_offset <= info.data.size &&
+			        tile.tiled_size <= info.data.size - tile.tiled_offset &&
+			        copies[i].bufferOffset == tile.linear_offset;
+		}
+		if (valid) {
+			m_tiler.UseScratch(full_slice_size, [&](TileManager::Result scratch) {
+				for (size_t i = 0; i < tiles.size(); ++i) {
+					auto tile = tiles[i];
+					const uint64_t input_offset = source_offset + tile.tiled_offset;
+					tile.tiled_offset = 0;
+					tile.linear_offset = 0;
+					m_tiler.DetileInto(source.Handle(), input_offset, full_slice_size,
+					                   full_slice_size, std::span<const GpuTileInfo> {&tile, 1}, scratch);
+					auto copy = copies[i];
+					copy.bufferOffset = scratch.offset;
+					image.Upload(std::span<const vk::BufferImageCopy> {&copy, 1}, scratch.buffer,
+					             scratch.offset, full_slice_size);
+					if (source.Usage() == MemoryUsage::Upload) m_buffer_cache.RetainImageStaging();
+				}
+			});
+			static uint32_t reports = 0;
+			if (reports++ < 32) std::printf("DEPTH-FALLBACK-SCRATCH addr=0x%llx image=0x%llx layers=%u scratch=0x%llx\n",
+			    static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(info.data.size),
+			    layers, static_cast<unsigned long long>(full_slice_size));
+			return;
+		}
+	}
 	TileManager::Result linear {source.Handle(), source_offset, source.Size() - source_offset};
 	if (info.IsTiled()) {
 		const auto tiles = BuildDepthTiles(info);
