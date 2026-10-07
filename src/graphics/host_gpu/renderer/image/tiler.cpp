@@ -43,8 +43,10 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -113,11 +115,26 @@ TileManager::~TileManager() {
 	}
 }
 
-// Scratch capacities are powers of two from 64 KiB, so buffers of similar requests are reused.
+// Keep the existing size classes by default. The bounded mode avoids rounding a
+// 320 MiB texture refresh to 512 MiB; allocation alignment is still handled by VMA.
+static bool BoundedScratchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BOUNDED_SCRATCH");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
 static uint64_t ScratchCapacity(uint64_t size) {
+	if (BoundedScratchEnabled() && size > (64ull << 20u)) {
+		constexpr uint64_t quantum = 16ull << 20u;
+		EXIT_IF(size > UINT64_MAX - (quantum - 1));
+		return (size + quantum - 1) & ~(quantum - 1);
+	}
 	return std::max<uint64_t>(uint64_t {1} << 16u, std::bit_ceil(size));
 }
-static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
+static uint64_t ScratchPoolBudget() {
+	return BoundedScratchEnabled() ? 128ull << 20u : 512ull << 20u;
+}
 
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
@@ -165,7 +182,7 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 		result     = vmaCreateBuffer(m_graphics.allocator, &raw, &host, &buffer, &memory, nullptr);
 		static std::atomic<uint32_t> host_count {0};
-		if (host_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		if (result == VK_SUCCESS && host_count.fetch_add(1, std::memory_order_relaxed) < 8) {
 			std::printf("TileManager: %llu MiB scratch placed in system memory (video memory full)\n",
 			            static_cast<unsigned long long>(capacity >> 20u));
 		}
@@ -181,7 +198,7 @@ void TileManager::DeferDestroy(Scratch scratch) {
 		const auto capacity = ScratchCapacity(scratch.size);
 		{
 			std::scoped_lock lock(m_scratch_mutex);
-			if (m_scratch_pool_bytes + capacity <= ScratchPoolBudget) {
+			if (capacity <= ScratchPoolBudget() && m_scratch_pool_bytes <= ScratchPoolBudget() - capacity) {
 				m_scratch_pool.push_back({scratch.buffer, scratch.allocation, capacity});
 				m_scratch_pool_bytes += capacity;
 				return;
