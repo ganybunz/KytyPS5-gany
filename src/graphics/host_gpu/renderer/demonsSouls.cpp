@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
 #include "live-counters.h"
+#include "frame-capture.h"
 #include "loader/systemContent.h"
 
 #include <array>
@@ -106,6 +107,13 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 		return false;
 	cache.CopyBuffer(dst, src, bytes, false, false);
 	cache.ScheduleCopyFeedback(dst, bytes);
+	if (FrameCapture::Active()) {
+		// Use the validated, executed extents, not the descriptor's whole allocation.
+		// Consumed copies return before the generic compute binding capture.
+		FrameCapture::g_call.buffers.push_back({src, bytes, FrameCapture::StageCs, 0});
+		FrameCapture::g_call.buffers.push_back({dst, bytes, FrameCapture::StageCs, 1});
+		FrameCapture::g_call.buffers.push_back({parameters.Base48(), sizeof(controls), FrameCapture::StageCs, 0});
+	}
 	LiveCounters::Add(LiveCounters::LinearCopies);
 	return true;
 }

@@ -30,3 +30,22 @@ Status: source inspection and whitespace check only; unbuilt while M20 remains
 open. No runtime gain or producer identity is claimed yet. Rollback is this
 isolated source commit plus the helper's event-40 decoding; old captures remain
 readable without context.
+
+## Consumed linear-copy capture operands
+
+The live M20 one-frame capture omitted operands for all 221 consumed linear
+copies. A fresh trace still identifies the same consumer byte and current-tick
+608-byte overlapping declaration; there is no evidence that the address moved.
+The missing capture match is unknown, not absence of a GPU producer.
+
+`TryLinearCopy` now appends the validated source and destination byte intervals
+and the eight-byte control read to the active frame capture, after the actual
+copy and feedback scheduling. Only the destination is marked written. Rejected
+kernels append nothing. This does not read additional guest data or change copy
+eligibility, barriers, ownership, or feedback. The capture remains a diagnostic
+that may perturb timings; do not count its frame as an optimization benchmark.
+
+After the next clean build, capture one frame in the matching scene and run
+`frame_readback_producer.py` with the address from a fresh `tracew` capture. Match
+ordering and ticks before proposing any early mirror/readback. Source inspected
+and whitespace checked only; build and in-game verification pending.
