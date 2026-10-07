@@ -1534,25 +1534,51 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			        copies[i].bufferOffset == tile.linear_offset;
 		}
 		if (valid) {
-			m_tiler.UseScratch(full_slice_size, [&](TileManager::Result scratch) {
-				for (size_t i = 0; i < tiles.size(); ++i) {
-					auto tile = tiles[i];
-					const uint64_t input_offset = source_offset + tile.tiled_offset;
-					tile.tiled_offset = 0;
-					tile.linear_offset = 0;
-					m_tiler.DetileInto(source.Handle(), input_offset, full_slice_size,
-					                   full_slice_size, std::span<const GpuTileInfo> {&tile, 1}, scratch);
-					auto copy = copies[i];
-					copy.bufferOffset = scratch.offset;
-					image.Upload(std::span<const vk::BufferImageCopy> {&copy, 1}, scratch.buffer,
-					             scratch.offset, full_slice_size);
+			static const bool batch_depth_fallback = [] {
+				const char* value = std::getenv("KYTY_DEPTH_FALLBACK_BATCH");
+				return value != nullptr && std::string_view(value) == "1";
+			}();
+			// An opt-in batch keeps the same original synchronized source and all
+			// layers, but pays the scratch clear/copy barriers once per batch. Only
+			// contiguous slices can be rebased together; otherwise keep one layer.
+			uint64_t batch_layers = 1;
+			bool contiguous = true;
+			for (size_t i = 0; batch_depth_fallback && contiguous && i < tiles.size(); ++i)
+				contiguous = tiles[i].tiled_offset == i * full_slice_size &&
+				             tiles[i].linear_offset == tiles[i].tiled_offset;
+			if (batch_depth_fallback && contiguous && full_slice_size != 0) {
+				batch_layers = std::max<uint64_t>(1, std::min<uint64_t>({layers, 8,
+				    (32ull << 20u) / full_slice_size,
+				    m_buffer_cache.ImageStagingCapacity() / full_slice_size}));
+			}
+			const uint64_t scratch_size = full_slice_size * batch_layers;
+			m_tiler.UseScratch(scratch_size, [&](TileManager::Result scratch) {
+				for (size_t first = 0; first < tiles.size(); first += batch_layers) {
+					const auto count = std::min<size_t>(batch_layers, tiles.size() - first);
+					const auto bytes = full_slice_size * count;
+					const auto input_base = tiles[first].tiled_offset;
+					const auto output_base = tiles[first].linear_offset;
+					std::array<GpuTileInfo, 8> batch_tiles;
+					std::array<vk::BufferImageCopy, 8> batch_copies;
+					std::copy_n(tiles.begin() + first, count, batch_tiles.begin());
+					std::copy_n(copies.begin() + first, count, batch_copies.begin());
+					for (size_t i = 0; i < count; ++i) {
+						batch_tiles[i].tiled_offset -= input_base;
+						batch_tiles[i].linear_offset -= output_base;
+						batch_copies[i].bufferOffset -= output_base;
+						batch_copies[i].bufferOffset += scratch.offset;
+					}
+					m_tiler.DetileInto(source.Handle(), source_offset + input_base, bytes,
+					                   bytes, std::span<const GpuTileInfo> {batch_tiles}.first(count), scratch);
+					image.Upload(std::span<const vk::BufferImageCopy> {batch_copies}.first(count),
+					             scratch.buffer, scratch.offset, bytes);
 					if (source.Usage() == MemoryUsage::Upload) m_buffer_cache.RetainImageStaging();
 				}
 			});
 			static uint32_t reports = 0;
-			if (reports++ < 32) std::printf("DEPTH-FALLBACK-SCRATCH addr=0x%llx image=0x%llx layers=%u scratch=0x%llx\n",
+			if (reports++ < 32) std::printf("DEPTH-FALLBACK-SCRATCH addr=0x%llx image=0x%llx layers=%u scratch=0x%llx batch=%llu\n",
 			    static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(info.data.size),
-			    layers, static_cast<unsigned long long>(full_slice_size));
+			    layers, static_cast<unsigned long long>(scratch_size), static_cast<unsigned long long>(batch_layers));
 			return;
 		}
 	}
