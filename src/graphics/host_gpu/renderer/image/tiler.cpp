@@ -188,6 +188,16 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		}
 	}
 	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
+	static const bool allocation_names = [] {
+		const char* value = std::getenv("KYTY_VMA_ALLOCATION_NAMES");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	if (allocation_names) {
+		char name[112];
+		std::snprintf(name, sizeof(name), "TileManager scratch requested=0x%llx capacity=0x%llx",
+		              static_cast<unsigned long long>(size), static_cast<unsigned long long>(capacity));
+		vmaSetAllocationName(m_graphics.allocator, memory, name);
+	}
 	return {buffer, memory, size};
 }
 

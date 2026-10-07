@@ -331,6 +331,18 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 
+	static const bool allocation_names = [] {
+		const char* value = std::getenv("KYTY_VMA_ALLOCATION_NAMES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (allocation_names) {
+		char name[160];
+		std::snprintf(name, sizeof(name), "Image %ux%ux%u layers=%u mips=%u format=%u usage=0x%x",
+		              image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+		              image_info.arrayLayers, image_info.mipLevels, static_cast<unsigned>(image_info.format),
+		              static_cast<unsigned>(image_info.usage));
+		vmaSetAllocationName(allocator, image.allocation, name);
+	}
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;

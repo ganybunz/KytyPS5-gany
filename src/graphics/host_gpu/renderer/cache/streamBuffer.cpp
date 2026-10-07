@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -181,6 +183,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
 	m_buffer = native_buffer;
+	static const bool allocation_names = [] {
+		const char* value = std::getenv("KYTY_VMA_ALLOCATION_NAMES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (allocation_names) {
+		char name[160];
+		std::snprintf(name, sizeof(name), "Buffer guest=0x%llx bytes=0x%llx memory_usage=%u flags=0x%x",
+		              static_cast<unsigned long long>(cpu_address), static_cast<unsigned long long>(size),
+		              static_cast<unsigned>(usage), static_cast<unsigned>(flags));
+		vmaSetAllocationName(graphics.allocator, m_allocation, name);
+	}
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
