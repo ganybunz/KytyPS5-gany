@@ -1256,11 +1256,15 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if (cache.RegistrationEpoch() != registration) return LiveCounters::Add(LiveCounters::TableRegistered), false;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 4);
-	// Emission, as DispatchDirect's.
+	// End a normal dispatch's pending chain before emitting a table dispatch.
+	// TableBlocks does not produce the ChainAccess proof DispatchDirect uses;
+	// ChainHandle here would silently bypass its dependency checks (and even
+	// KYTY_DS_COMPUTE_CHAIN=0). Keep full ordering until table accesses can be
+	// proven too. This path remains opt-in through KYTY_TABLE_DISPATCH.
 	buffer.EndRendering();
-	const bool chain     = DemonsSouls::IsSupportedGame();
-	const auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
+	const auto vk_buffer = buffer.Handle();
 	if (!TableTransit(*set, vk_buffer, nullptr)) return false;
+	storage_writes = storage_writes || std::ranges::any_of(set->images, &TableImageSet::Image::storage);
 	const auto& pipeline = *pair.pipeline;
 	const auto& program  = *pair.programs[0];
 	const auto& bindings = program.bindings;
@@ -1271,14 +1275,17 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			const auto index = bindings.user_data_registers[i] - program.user_data_base;
 			push_data.dwords[bindings.push_data_start_dword + i] = index < user_data[0].size() ? user_data[0][index] : 0;
 		}
+		// TableEvaluate supplies these words for compute images too, as the
+		// normal descriptor path does. Zeroing them loses guest LOD feedback.
+		for (size_t i = 0; i < std::min<size_t>(bindings.lod_stats_count, table.lod_stats.size()); ++i)
+			push_data.dwords[bindings.push_data_start_dword + bindings.LodStatsDword() + i] = table.lod_stats[i];
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[0]);
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword() + 1] = static_cast<uint32_t>(blocks[0] >> 32u);
 		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 		                        (bindings.push_data_start_dword + bindings.ShaderDataDwords()) * sizeof(uint32_t),
 		                        push_data.dwords.data());
 	}
-	const bool continues_chain = chain && buffer.ComputeChainPending();
-	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (storage_writes) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
@@ -1290,15 +1297,13 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		args_barrier.buffer              = indirect_buffer;
 		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		if (!continues_chain)
-			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
-			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
+		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	} else {
 		vk_buffer.dispatch(groups_x, groups_y, groups_z);
 	}
-	if (chain) buffer.ContinueComputeChain();
-	else ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	m_context.GetCommandScheduler().CompleteDispatch();
 	// (A later table draw binds its pipeline and set again: the graphics state is untouched.)
 	LiveCounters::Add(LiveCounters::TableDispatches);
