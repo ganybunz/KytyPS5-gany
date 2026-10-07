@@ -12,6 +12,8 @@
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
 extern "C" {
+// 1: a synchronous download retires only guest readbacks overlapping its pages.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode {0};
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {0};
@@ -1279,7 +1281,13 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
 	LiveCensus::Scope census(LiveCensus::SyncDownload, vaddr >> 20u << 20u, is_write);
 	LiveCensus::WaitScope waiting(LiveCensus::WaitDownload);
-	DrainGuestReadback();
+	const bool scoped_drain = kyty_local_sync_readback_scoped_drain_mode.load(std::memory_order_relaxed) != 0;
+	// A synchronous SRT read need not retire tickets for unrelated guest pages.
+	// Retire the requested pages before owner discovery, then the entire widened
+	// window below before enumerating dirty ranges or publishing CPU ownership.
+	// Owner replacement still drains that owner's tickets in DeleteBuffer.
+	if (scoped_drain) DrainGuestReadback(vaddr, size);
+	else DrainGuestReadback();
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
@@ -1295,6 +1303,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const auto         buffer_end   = buffer_begin + buffer.Size();
 	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
 	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	if (scoped_drain) DrainGuestReadback(window_begin, window_end - window_begin);
 
 	std::vector<DownloadCopy> copies;
 	m_memory_tracker.ForEachDownloadRange<false>(
