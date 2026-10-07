@@ -1922,6 +1922,25 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 			}
 		}
 		if (source_failure == BufferCache::ImageStageFailure::SourceOwned) {
+			std::vector<bool> buffer_sources;
+			buffer_sources.reserve(picked.size());
+			for (const auto layer: picked) {
+				const uint64_t address = base + slice * layer;
+				const std::vector<BufferCache::StagingPiece> piece {{address, slice, 0}};
+				const auto failure = m_buffer_cache.ValidateImageStageSources(piece, slice);
+				const bool from_buffer = failure == BufferCache::ImageStageFailure::SourceOwned;
+				if (failure != BufferCache::ImageStageFailure::None && !from_buffer) {
+					return PartialFail("depth_source_preflight");
+				}
+				// The full source helper can stage a span when no complete buffer owns it.
+				// Exclude sparse cached ranges before recording: its synchronous staging
+				// fallback requires mapped backing. CPU-only sparse layers use the existing
+				// mapped-or-zero piece staging below instead.
+				if (from_buffer && !LibKernel::Memory::IsFullyMapped(address, slice)) {
+					return PartialFail("depth_sparse_buffer_source");
+				}
+				buffer_sources.push_back(from_buffer);
+			}
 			// A cached buffer is the coherent source, not a reason to upload every layer.
 			// ObtainBufferForImage retains its normal readback/synchronization rules, but
 			// applies them only to each selected layer. Bound detile output to one slice;
@@ -1931,9 +1950,13 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 			    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block)) {
 				return PartialFail("depth_block_layout");
 			}
-			for (const auto layer: picked) {
-				const auto [source, source_offset] =
-				    m_buffer_cache.ObtainBufferForImage(base + slice * layer, slice);
+			for (size_t i = 0; i < picked.size(); ++i) {
+				const auto layer = picked[i];
+				const uint64_t address = base + slice * layer;
+				const std::vector<BufferCache::StagingPiece> piece {{address, slice, 0}};
+				const auto [source, source_offset] = buffer_sources[i]
+				    ? m_buffer_cache.ObtainBufferForImage(address, slice)
+				    : m_buffer_cache.StageImagePieces(piece, slice, nullptr, true);
 				if (source == nullptr) return PartialFail("depth_buffer_source");
 				vk::BufferImageCopy copy {};
 				copy.bufferRowLength = info.pitch;
