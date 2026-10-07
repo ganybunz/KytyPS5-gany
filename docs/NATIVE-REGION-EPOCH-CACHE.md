@@ -35,4 +35,7 @@ All sums retain uint64_t modular arithmetic and the old zero sentinel.
    Do not count a reduced atomic-read count as a measured FPS improvement.
 
 Unset the variable to restore the original algorithm, or revert the isolated
-commit. Status: unbuilt and game-unverified; no promotion to the player package.
+commit. Standalone clang-cl /O2 CPU regression passed on October 7, including
+600 deterministic differential cases. This built only one small translation
+unit, without the emulator, Vulkan, or LTO. The integrated emulator build and
+in-game verification remain pending; no promotion to the player package.
