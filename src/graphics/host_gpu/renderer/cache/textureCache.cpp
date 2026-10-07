@@ -1925,7 +1925,7 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 			return PartialFail("depth_capacity");
 		}
 		for (const auto layer: picked) {
-			if (HasGpuWrittenImageOverlap(base + slice * layer, slice)) {
+			if (HasGpuWrittenImageOverlapLocked(base + slice * layer, slice)) {
 				return PartialFail("depth_image_owned");
 			}
 		}
@@ -2089,7 +2089,7 @@ bool TextureCache::UploadImageChunked(Image& image) {
 			return false;
 		}
 		for (uint32_t layer = 0; layer < layers; ++layer) {
-			if (HasGpuWrittenImageOverlap(info.data.address + slice * layer, slice)) return false;
+			if (HasGpuWrittenImageOverlapLocked(info.data.address + slice * layer, slice)) return false;
 		}
 		TileBlockLayout block {};
 		if (info.IsTiled() && !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block)) {
@@ -2200,7 +2200,7 @@ bool TextureCache::UploadImageChunked(Image& image) {
 		return false;
 	}
 	for (const auto& entry: entries) {
-		if (HasGpuWrittenImageOverlap(entry.source_begin, entry.source_end - entry.source_begin)) return false;
+		if (HasGpuWrittenImageOverlapLocked(entry.source_begin, entry.source_end - entry.source_begin)) return false;
 	}
 	TileBlockLayout block {};
 	if (!TileGetBlockLayout(plan.tiles.front().family, plan.tiles.front().bytes_per_element, block)) return false;
@@ -3475,6 +3475,11 @@ bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
 bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return true;
 	std::scoped_lock lock {m_lock};
+	return HasGpuWrittenImageOverlapLocked(address, size);
+}
+
+bool TextureCache::HasGpuWrittenImageOverlapLocked(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) return true;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		if (image.IsGpuModified() || image.IsStencilModified()) return true;
