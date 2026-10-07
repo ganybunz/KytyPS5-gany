@@ -521,6 +521,11 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(native_region_epoch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeRegionEpochTests.cpp"
+)
+target_include_directories(native_region_epoch_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -667,6 +672,7 @@ if(BUILD_TESTING)
 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME native_region_epoch COMMAND $<TARGET_FILE:native_region_epoch_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -744,6 +750,7 @@ if(BUILD_TESTING)
 		page_protection_table_tests
 		atrac9_initialization_tests
 		bit_array_tests
+		native_region_epoch_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

@@ -38,6 +38,7 @@
 #include "frame-capture.h"
 #include "frame-gen.h"
 #include "native-preparation-state.h"
+#include "native-region-epochs.h"
 #include "slow-log.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -51,6 +52,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>

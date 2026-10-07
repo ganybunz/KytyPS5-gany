@@ -2736,20 +2736,32 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 	auto& buffers   = m_context.GetBufferCache();
 	auto& textures  = m_context.GetTextureCache();
 	auto& resources = m_context.GetGpuResources();
+	// Optional CPU cost experiment. No proof survives beyond this invocation;
+	// changing epochs or cache overflow use the existing exact range checks.
+	static const bool region_epoch_cache = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_REGION_EPOCH_CACHE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const auto cpu_epochs = [&] {
+		if (region_epoch_cache) {
+			return NativeRegionEpochs::Aggregate(record.buffers, [&](uint64_t address, uint64_t size) {
+				return buffers.CpuModificationEpoch(address, size);
+			});
+		}
+		uint64_t sum = 0;
+		for (const auto& dep: record.buffers) {
+			const auto epoch = buffers.CpuModificationEpoch(dep.address, dep.size);
+			if (epoch == 0) return uint64_t {0};
+			sum += epoch;
+		}
+		return sum;
+	};
 	// The rest holds for the whole frame unless the live-object epochs move, or the guest
 	// wrote a bound buffer since the proof (its region's CPU epoch moved).
 	if (!mapping_moved && record.validated_frame == frame &&
 	    record.registration_epoch == buffers.RegistrationEpoch() &&
 	    record.resolution_epoch == textures.ResolutionEpoch()) {
-		uint64_t cpu_epoch = 0;
-		for (const auto& dep: record.buffers) {
-			const auto epoch = buffers.CpuModificationEpoch(dep.address, dep.size);
-			if (epoch == 0) {
-				cpu_epoch = 0;
-				break;
-			}
-			cpu_epoch += epoch;
-		}
+		const auto cpu_epoch = cpu_epochs();
 		// The epochs cannot prove it: the ranges themselves (what the normal path's
 		// ObtainBuffer checks per draw).
 		const bool buffers_clean = record.buffers.empty() || (cpu_epoch != 0 && cpu_epoch == record.cpu_epoch) ||
@@ -2771,15 +2783,7 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 	const auto image_epoch_at_proof = Image::CpuDirtyEpoch();
 	// Buffers: live owners, CPU-clean. The region epochs prove both unchanged
 	// cheaply; when they moved, check each range.
-	uint64_t cpu_epoch = 0;
-	for (const auto& dep: record.buffers) {
-		const auto epoch = buffers.CpuModificationEpoch(dep.address, dep.size);
-		if (epoch == 0) {
-			cpu_epoch = 0;
-			break;
-		}
-		cpu_epoch += epoch;
-	}
+	const auto cpu_epoch = cpu_epochs();
 	// After a mapping change, the ranges as FindBuffers gives them now: none unmapped since
 	// the proof (the refresh below reads them), and one it clamped to the mappings not grown.
 	const auto range_current = [&](const NativeXprRecord::BufferDep& dep) {
