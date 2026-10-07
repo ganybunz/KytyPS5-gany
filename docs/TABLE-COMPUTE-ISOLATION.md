@@ -40,3 +40,13 @@ environment values are decimal. Do not reuse addresses from another build.
    correction can be promoted. Do not accept a visually broken faster result.
 
 No speedup, visual fix, or 30 FPS qualification is established by this selector.
+
+## Separate atomic alignment safeguard
+
+TableBlocks now rejects atomic buffer bases at 4 mod 8 before preparing their
+bindings. The normal descriptor path has an aligned prefix and byte adjustment;
+the table path uses a direct physical address and length size/4, halved for U64
+accesses. Those representations do not establish the same U64 atomic alignment
+and bounds for that base. Rejection executes the normal draw/dispatch, preserving
+its work. This also conservatively excludes some U32-only atomics. It is not
+evidence for the lighting defect's cause and is not yet built or game-tested.

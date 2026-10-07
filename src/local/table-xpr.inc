@@ -640,7 +640,12 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		ShaderBufferResource descriptor;
 		std::copy_n(words4.begin(), 4, descriptor.fields);
 		if (descriptor.Type() != 0) return true; // no buffer: read as a null one
-		return !descriptor.SwizzleEnabled() && !descriptor.AddTid() &&
+		// Table physical-address U64 atomics have no aligned descriptor prefix.
+		// An atomic base at 4 mod 8 therefore lacks the normal path's qword
+		// alignment/range semantics. Keep it on the complete normal path until
+		// table atomic width and prefix handling are represented explicitly.
+		return (!resource.atomic || (descriptor.Base48() & 7u) == 0) &&
+		       !descriptor.SwizzleEnabled() && !descriptor.AddTid() &&
 		       (!resource.formatted || resource.descriptor_format == Prospero::BufferFormat::kInvalid ||
 		        (descriptor.Format() == resource.descriptor_format && descriptor.DstSelXYZW() == resource.descriptor_swizzle));
 	};
