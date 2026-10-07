@@ -10,6 +10,7 @@
 #include "libs/guestPrintf.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
+#include "loader/demonsSoulsIdle.h"
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
@@ -75,6 +76,7 @@ const char** GetArgv() {
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
+	if (Loader::DemonsSoulsIdle::HasProcessLifetimePatch()) std::quick_exit(code);
 	::exit(code);
 }
 

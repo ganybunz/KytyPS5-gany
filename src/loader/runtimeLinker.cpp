@@ -1524,6 +1524,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 void RuntimeLinker::UnloadProgram(Program* program) {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
+	EXIT_IF(DemonsSoulsIdle::OwnsProcessLifetimePatch(program));
 	Common::LockGuard lock(m_mutex);
 
 	if (auto it = std::find(m_programs.begin(), m_programs.end(), program);
@@ -1671,6 +1672,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 void RuntimeLinker::Clear() {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
+	// Opt-in guest exits use quick_exit. Reject live teardown before any patch
+	// bytes or mappings change: there is no guest-thread quiescence protocol.
+	EXIT_IF(DemonsSoulsIdle::HasProcessLifetimePatch());
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
 	DemonsSoulsIdle::Clear();

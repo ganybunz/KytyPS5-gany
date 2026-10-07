@@ -19,6 +19,11 @@ struct Program;
 namespace DemonsSoulsIdle {
 void Install(Program* program);
 void Clear();
+// The opt-in empty-poll thunk is a process-lifetime patch. Guest exits use
+// quick_exit with the requested status, as WindowRun already does, instead of
+// restoring/freeing code that another guest thread may still be executing.
+[[nodiscard]] bool HasProcessLifetimePatch();
+[[nodiscard]] bool OwnsProcessLifetimePatch(const Program* program);
 
 inline constexpr uint64_t                CallOffset = 0x83b59b, PollOffset = 0x83b880;
 inline constexpr std::array<uint8_t, 24> CallBytes {0xe8, 0xe0, 0x02, 0x00, 0x00, 0x84, 0xc0, 0x74,

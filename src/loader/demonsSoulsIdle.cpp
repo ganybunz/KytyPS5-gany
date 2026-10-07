@@ -1,5 +1,6 @@
 #include "loader/demonsSoulsIdle.h"
 
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -7,12 +8,18 @@
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
 #include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
 #include <functional>
 #include <span>
+#include <cstdlib>
+#include <string>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xbyak/xbyak_util.h>
+#endif
 
 namespace Loader::DemonsSoulsIdle {
 namespace {
@@ -28,6 +35,8 @@ bool Readable(uint64_t address, uint64_t size) {
 	// Executable modules are private runtime allocations, not GPU backing aliases.
 	return Libs::Graphics::HostMemoryRangeIsReadable(address, size);
 }
+
+#include "demonsSoulsEmptyPoll.inc"
 
 // Another build of the game (another region or version) has the same code elsewhere: the call's
 // bytes after its displacement, landing on the poll's prologue up to its RIP-relative displacement.
@@ -135,10 +144,15 @@ void Install(Program* program) {
 	site = call;
 	std::printf("Demon's Souls idle wait: installed portable 50 us backoff (call at eboot+0x%llx)\n",
 	     static_cast<unsigned long long>(call - program->base_vaddr));
+	InstallEmptyPoll(program);
 #endif
 }
 
 void Clear() {
+#if defined(__x86_64__) || defined(_M_X64)
+	// RuntimeLinker::Clear has no guest-thread quiescence protocol.
+	EXIT_IF(empty_poll_cave != 0);
+#endif
 	if (!cave) return;
 	std::array<uint8_t, 5> bytes {};
 	std::memcpy(bytes.data(), reinterpret_cast<const void*>(site), bytes.size());
@@ -148,5 +162,19 @@ void Clear() {
 	}
 	Libs::LibKernel::Memory::FreeGuestMemory(cave, PageSize);
 	cave = site = 0;
+}
+bool HasProcessLifetimePatch() {
+#if defined(__x86_64__) || defined(_M_X64)
+	return empty_poll_cave != 0;
+#else
+	return false;
+#endif
+}
+bool OwnsProcessLifetimePatch(const Program* program) {
+#if defined(__x86_64__) || defined(_M_X64)
+	return empty_poll_cave != 0 && program == empty_poll_owner;
+#else
+	return false;
+#endif
 }
 } // namespace Loader::DemonsSoulsIdle

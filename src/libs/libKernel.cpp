@@ -18,6 +18,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/demonsSoulsIdle.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
@@ -1290,6 +1291,10 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 		return OK;
 	}
 
+	if (Loader::DemonsSoulsIdle::OwnsProcessLifetimePatch(program)) {
+		LOGF("KernelStopUnloadModule: cannot unload a process-lifetime patch owner\n");
+		return KERNEL_ERROR_EBUSY;
+	}
 	if (g_get_thread_atexit_count_func != nullptr &&
 	    g_get_thread_atexit_count_func(program->unique_id) > 0) {
 		LOGF("KernelStopUnloadModule: cannot unload %s\n",
@@ -1703,6 +1708,7 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
 
+	if (Loader::DemonsSoulsIdle::HasProcessLifetimePatch()) std::quick_exit(code);
 	::exit(code);
 }
 
