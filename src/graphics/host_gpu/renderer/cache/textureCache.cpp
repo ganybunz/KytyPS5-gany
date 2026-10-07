@@ -68,6 +68,37 @@ constexpr uint64_t PartialUploadMaxShare = 2;
 // Staged runs of picked subresources closer than this are staged as one run.
 constexpr uint64_t PartialStageGap = uint64_t {64} << 10;
 
+// Bounded attribution only: a fault span reports the faulting byte, not the
+// instruction's write width. Log before dirty ranges are dropped; never change
+// ownership, tracking or upload selection here.
+void TraceColorDirty(const Image& image, const char* cause, uint64_t address = 0,
+                     uint64_t size = 0) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COLOR_DIRTY_TRACE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	if (!enabled || image.info.data.size < (uint64_t {256} << 20) || image.info.IsDepth()) return;
+	static std::atomic<uint32_t> remaining {192};
+	uint32_t count = remaining.load(std::memory_order_relaxed);
+	while (count != 0 && !remaining.compare_exchange_weak(count, count - 1, std::memory_order_relaxed)) {}
+	if (count == 0) return;
+	std::printf("COLOR-DIRTY serial=%llu cause=%s addr=0x%llx size=0x%llx span=0x%llx+0x%llx "
+	            "one_byte_span=%d layers=%u levels=%u tracked=%d whole_tracked=%d cpu=%d maybe=%d "
+	            "partial=%d ranges=%zu gpu=%d buffer=%d stencil=%d target=%d storage=%d\n",
+	            static_cast<unsigned long long>(image.serial), cause,
+	            static_cast<unsigned long long>(image.info.data.address),
+	            static_cast<unsigned long long>(image.info.data.size),
+	            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+	            std::string_view(cause) == "cpu-write-full" && size == 1 ? 1 : 0,
+	            image.info.resources.layers, image.info.resources.levels, image.IsTracked() ? 1 : 0,
+	            image.track_addr == image.info.data.address && image.track_addr_end == image.info.data.End() ? 1 : 0,
+	            image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+	            image.IsPartiallyCpuDirty() ? 1 : 0, image.CpuDirtyRanges().size(),
+	            image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+	            image.IsStencilModified() ? 1 : 0, image.binding.is_target ? 1 : 0,
+	            image.usage.storage ? 1 : 0);
+}
+
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
                                   uint32_t fill, vk::ClearColorValue& clear) {
 	const auto code = static_cast<uint8_t>(fill);
@@ -446,6 +477,7 @@ void TextureCache::TouchImage(Image& image) {
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	TraceColorDirty(image, "maybe-dirty");
 	image.MarkMaybeCpuDirty();
 	if (image.NeedsMaybeCpuHash()) {
 		image.SetMaybeCpuHash(image.HashGuestEdges());
@@ -1574,6 +1606,7 @@ static bool PartialFail(const char* why) {
 void TextureCache::InitializeImage(ImageId id) {
 	using Clock = std::chrono::steady_clock;
 	auto&             image = m_slot_images[id];
+	if (image.IsCpuDirty() && !image.IsPartiallyCpuDirty()) TraceColorDirty(image, "refresh-full");
 	Clock::time_point marks[3] {Clock::now()};
 	const char*       kind = image.IsPartiallyCpuDirty() ? "partial"
 	                         : image.IsBufferModified()  ? "buffer"
@@ -3658,6 +3691,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 				            owner->IsStencilModified() ? 1 : 0);
 				std::fflush(stdout);
 			}
+			TraceColorDirty(*owner, "cpu-write-full", address, size);
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
 			continue;
@@ -3794,6 +3828,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
+		TraceColorDirty(*owner, "map-full", address, size);
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
