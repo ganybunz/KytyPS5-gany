@@ -1264,9 +1264,11 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	buffer.EndRendering();
 	const auto vk_buffer = buffer.Handle();
 	if (!TableTransit(*set, vk_buffer, nullptr)) return false;
-	storage_writes = storage_writes || std::ranges::any_of(set->images, &TableImageSet::Image::storage);
 	const auto& pipeline = *pair.pipeline;
 	const auto& program  = *pair.programs[0];
+	storage_writes = storage_writes || std::ranges::any_of(program.info.images, [](const auto& image) {
+		return image.written && image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+	});
 	const auto& bindings = program.bindings;
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, 0, 1, &set->set, 0, nullptr);
 	if (bindings.UsesPushData()) {
@@ -1275,10 +1277,6 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			const auto index = bindings.user_data_registers[i] - program.user_data_base;
 			push_data.dwords[bindings.push_data_start_dword + i] = index < user_data[0].size() ? user_data[0][index] : 0;
 		}
-		// TableEvaluate supplies these words for compute images too, as the
-		// normal descriptor path does. Zeroing them loses guest LOD feedback.
-		for (size_t i = 0; i < std::min<size_t>(bindings.lod_stats_count, table.lod_stats.size()); ++i)
-			push_data.dwords[bindings.push_data_start_dword + bindings.LodStatsDword() + i] = table.lod_stats[i];
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[0]);
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword() + 1] = static_cast<uint32_t>(blocks[0] >> 32u);
 		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,

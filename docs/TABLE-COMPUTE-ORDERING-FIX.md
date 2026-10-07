@@ -19,11 +19,14 @@ post-dispatch shader barrier. Storage image writes now participate in the
 write-hazard decision as in normal dispatches. Until a complete access proof is
 implemented, table dispatches do not elide barriers. Draw table mode is separate.
 
-Also copy compute LOD-statistics words prepared by `TableEvaluate` to push data;
-previously only table pixel draws populated those fields. PushData is already
-zero-initialized, so this is a missing value, not uninitialized storage.
+Luna review found two refinements: use the program's `image.written` metadata
+as well as its storage class, matching normal dispatch. A read-only storage
+image is not a write hazard. The proposed compute LOD push was unnecessary:
+BindingLayout allocates LOD feedback only for pixel shaders, so compute's count
+is zero. It has been removed. The earlier missing-compute-LOD explanation was
+incorrect; it is not a demonstrated cause of M19's overexposure.
 
-This fixes concrete source omissions but **does not yet prove the visual
+This fixes a concrete dependency omission but **does not yet prove the visual
 regression is fixed**. Runtime buffer stride on AMD remains a separate suspect.
 The current game continues to run the old executable with table compute OFF.
 This correction is not built or game-tested yet. No speedup is claimed.
