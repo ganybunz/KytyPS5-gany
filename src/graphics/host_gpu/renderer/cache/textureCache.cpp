@@ -1916,18 +1916,59 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 		for (const auto layer: picked) preflight.push_back({base + slice * layer, slice, 0});
 		uint64_t rejected_address = 0;
 		const auto source_failure = m_buffer_cache.ValidateImageStageSources(preflight, slice, &rejected_address);
-		if (source_failure == BufferCache::ImageStageFailure::SourceOwned) {
-			std::printf("PARTIAL-DEPTH-STAGE-FAIL addr=0x%llx source=0x%llx reason=source_owned preflight=1\n",
-			            static_cast<unsigned long long>(base), static_cast<unsigned long long>(rejected_address));
-			return PartialFail("depth_source_owned");
-		}
-		if (source_failure != BufferCache::ImageStageFailure::None) {
-			return PartialFail("depth_capacity");
-		}
 		for (const auto layer: picked) {
 			if (HasGpuWrittenImageOverlapLocked(base + slice * layer, slice)) {
 				return PartialFail("depth_image_owned");
 			}
+		}
+		if (source_failure == BufferCache::ImageStageFailure::SourceOwned) {
+			// A cached buffer is the coherent source, not a reason to upload every layer.
+			// ObtainBufferForImage retains its normal readback/synchronization rules, but
+			// applies them only to each selected layer. Bound detile output to one slice;
+			// do not read the backing mapping over bytes owned by the GPU.
+			TileBlockLayout block {};
+			if (info.IsTiled() &&
+			    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block)) {
+				return PartialFail("depth_block_layout");
+			}
+			for (const auto layer: picked) {
+				const auto [source, source_offset] =
+				    m_buffer_cache.ObtainBufferForImage(base + slice * layer, slice);
+				if (source == nullptr) return PartialFail("depth_buffer_source");
+				vk::BufferImageCopy copy {};
+				copy.bufferRowLength = info.pitch;
+				copy.bufferImageHeight = info.extent.height;
+				copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
+				copy.imageExtent = {info.extent.width, info.extent.height, 1};
+				TileManager::Result linear {source->Handle(), source_offset, slice};
+				if (info.IsTiled()) {
+					GpuTileInfo tile {block.family, block.bytes_per_element, 0, slice, 0, slice, 0,
+					                  info.extent.width, info.extent.height, 1, info.pitch};
+					tile.surface_z = layer;
+					linear = m_tiler.Detile(source->Handle(), source_offset, slice, slice,
+					                        std::span<const GpuTileInfo> {&tile, 1});
+				}
+				copy.bufferOffset = linear.offset;
+				image.Upload(std::span<const vk::BufferImageCopy> {&copy, 1}, linear.buffer,
+				             linear.offset, linear.size);
+				// ObtainBufferForImage returns either a cache buffer or its upload ring.
+				// Only the ring has a reservation to extend after a tiler parameter flush.
+				if (source->Usage() == MemoryUsage::Upload) m_buffer_cache.RetainImageStaging();
+			}
+			LiveCounters::Add(LiveCounters::PartialUploads);
+			LiveCounters::Add(LiveCounters::PartialUploadBytes, slice * picked.size());
+			static uint64_t buffer_chunk_reports = 0;
+			if (buffer_chunk_reports++ < 16) {
+				std::printf("PARTIAL-DEPTH-BUFFER-CHUNK addr=0x%llx image=0x%llx uploaded=0x%llx "
+				            "layers=%zu slice=0x%llx\n", static_cast<unsigned long long>(base),
+				            static_cast<unsigned long long>(info.data.size),
+				            static_cast<unsigned long long>(slice * picked.size()), picked.size(),
+				            static_cast<unsigned long long>(slice));
+			}
+			return true;
+		}
+		if (source_failure != BufferCache::ImageStageFailure::None) {
+			return PartialFail("depth_capacity");
 		}
 		TileBlockLayout block {};
 		if (info.IsTiled()) {
