@@ -2337,6 +2337,14 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
 		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
 		(table ? TableWorkers() : Workers()).Push([this, job, table] {
+			SlowLog::Scope create_slow([&](double ms) {
+				std::printf("SLOW AsyncCreateGraphicsPipeline %.1f ms VS=%llu PS=%llu table=%u native=%u cache=%s VS_hash=%016llx PS_hash=%016llx\n",
+				            ms, static_cast<unsigned long long>(job->vertex_program.id),
+				            static_cast<unsigned long long>(job->pixel_program.id), static_cast<unsigned>(table),
+				            static_cast<unsigned>(job->native_bindings), table ? "table" : "main",
+			            static_cast<unsigned long long>(job->vs_input_info.stage.program ? job->vs_input_info.stage.program->shader_hash : 0),
+			            static_cast<unsigned long long>(job->ps_active && job->ps_input_info.stage.program ? job->ps_input_info.stage.program->shader_hash : 0));
+			}, SlowLog::HitchThreshold());
 			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
 			                       job->vs_input_info, job->vertex_program,
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
@@ -2360,9 +2368,18 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	// Snapshot the fingerprint before key is moved into the cache. IDs/fingerprint
+	// identify this process; shader hashes permit comparisons between boots.
+	const auto slow_key = GraphicsPipelineKeyHash {}(key);
 	SlowLog::Scope create_slow([&](double ms) {
-		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu\n", ms,
-		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id));
+		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu path=sync native=%u VS_table=%u PS_table=%u cache=main key=%016llx VS_hash=%016llx PS_hash=%016llx colors=%u depth=%u samples=%u\n", ms,
+		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
+		            static_cast<unsigned>(native_bindings), static_cast<unsigned>(vs_input_info.stage.program->table_mode),
+		            static_cast<unsigned>(ps_active && ps_input_info->stage.program && ps_input_info->stage.program->table_mode),
+		            static_cast<unsigned long long>(slow_key),
+		            static_cast<unsigned long long>(vs_input_info.stage.program->shader_hash),
+		            static_cast<unsigned long long>(ps_active && ps_input_info->stage.program ? ps_input_info->stage.program->shader_hash : 0),
+		            rendering.color_count, static_cast<unsigned>(rendering.depth_format), static_params.samples);
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
@@ -2428,8 +2445,10 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	SlowLog::Scope create_slow([&](double ms) {
-		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu\n", ms,
-		            static_cast<unsigned long long>(compute_program.id));
+		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu path=sync table=%u cache=main CS_hash=%016llx\n", ms,
+		            static_cast<unsigned long long>(compute_program.id),
+		            static_cast<unsigned>(input_info.stage.program && input_info.stage.program->table_mode),
+		            static_cast<unsigned long long>(input_info.stage.program ? input_info.stage.program->shader_hash : 0));
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
@@ -2483,7 +2502,12 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 	job->module     = compute_program.module;
 	m_pending_compute_pipelines.emplace(compute_program.id, job);
 	m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
-	TableWorkers().Push([this, job] { // (table dispatches' pipelines)
+	TableWorkers().Push([this, job, id = compute_program.id] { // (table dispatches' pipelines)
+		SlowLog::Scope create_slow([&](double ms) {
+			std::printf("SLOW AsyncCreateComputePipeline %.1f ms CS=%llu table=1 native=1 cache=table CS_hash=%016llx\n", ms,
+			            static_cast<unsigned long long>(id),
+			            static_cast<unsigned long long>(job->input_info.stage.program ? job->input_info.stage.program->shader_hash : 0));
+		}, SlowLog::HitchThreshold());
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, TablePipelineCache(),
 		                       PipelineBuild::Full, true);
 		TablePipelineDone();
