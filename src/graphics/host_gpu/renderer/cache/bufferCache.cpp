@@ -1799,20 +1799,30 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<StagingPiece>& pieces,
-                                                           uint64_t total) {
-	for (const auto& piece: pieces) {
-		if (!GuestRange {piece.vaddr, piece.size}.Valid() || piece.offset > total ||
-		    piece.size > total - piece.offset) {
-			EXIT("BufferCache: invalid image staging piece\n");
+                                                           uint64_t total, ImageStageFailure* failure,
+                                                           bool sources_prevalidated) {
+	if (failure != nullptr) *failure = ImageStageFailure::None;
+	if (sources_prevalidated) {
+		if (total > m_staging_buffer.Size()) {
+			if (failure != nullptr) *failure = ImageStageFailure::Capacity;
+			return {nullptr, 0};
 		}
-		DrainGuestReadback(piece.vaddr, piece.size);
-		const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
-		if ((owner != nullptr && *owner) || IsRegionGpuModified(piece.vaddr, piece.size)) {
+		for (const auto& piece: pieces) {
+			if (!GuestRange {piece.vaddr, piece.size}.Valid() || piece.offset > total ||
+			    piece.size > total - piece.offset) {
+				EXIT("BufferCache: invalid prevalidated image staging piece\n");
+			}
+		}
+	} else {
+		const auto source_failure = ValidateImageStageSources(pieces, total);
+		if (source_failure != ImageStageFailure::None) {
+			if (failure != nullptr) *failure = source_failure;
 			return {nullptr, 0};
 		}
 	}
 	auto [staging, stage_offset] = m_staging_buffer.Map(total, 16);
 	if (staging == nullptr) {
+		if (failure != nullptr) *failure = ImageStageFailure::RingUnavailable;
 		return {nullptr, 0};
 	}
 	const bool async = kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2 &&
@@ -1854,6 +1864,24 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
+}
+
+BufferCache::ImageStageFailure BufferCache::ValidateImageStageSources(
+	const std::vector<StagingPiece>& pieces, uint64_t total, uint64_t* rejected_address) {
+	if (total > m_staging_buffer.Size()) return ImageStageFailure::Capacity;
+	for (const auto& piece: pieces) {
+		if (!GuestRange {piece.vaddr, piece.size}.Valid() || piece.offset > total ||
+		    piece.size > total - piece.offset) {
+			EXIT("BufferCache: invalid image staging piece\n");
+		}
+		DrainGuestReadback(piece.vaddr, piece.size);
+		const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
+		if ((owner != nullptr && *owner) || IsRegionGpuModified(piece.vaddr, piece.size)) {
+			if (rejected_address != nullptr) *rejected_address = piece.vaddr;
+			return ImageStageFailure::SourceOwned;
+		}
+	}
+	return ImageStageFailure::None;
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {

@@ -198,6 +198,7 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id);
+	[[nodiscard]] bool           UploadImageChunked(Image& image);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] const TextureTransferPlan& CachedUploadPlan(Image& image, BindingType binding);

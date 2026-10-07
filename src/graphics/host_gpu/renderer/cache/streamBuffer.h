@@ -103,6 +103,9 @@ public:
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
+	// After recording the consumer, extend the most recently committed reservation's
+	// lifetime if preparation submitted its original tick. No intervening Map/Commit.
+	void                                        RetainLastUse();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
 private:

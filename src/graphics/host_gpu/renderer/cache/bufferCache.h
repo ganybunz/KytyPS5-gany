@@ -87,8 +87,17 @@ public:
 		uint64_t size   = 0;
 		uint64_t offset = 0;
 	};
+	enum class ImageStageFailure : uint8_t { None, SourceOwned, Capacity, RingUnavailable };
+	[[nodiscard]] ImageStageFailure ValidateImageStageSources(const std::vector<StagingPiece>& pieces,
+	                                                         uint64_t total,
+	                                                         uint64_t* rejected_address = nullptr);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> StageImagePieces(const std::vector<StagingPiece>& pieces,
-	                                                            uint64_t total);
+	                                                            uint64_t total,
+	                                                            ImageStageFailure* failure = nullptr,
+	                                                            bool sources_prevalidated = false);
+	// Retain the last staging reservation through a consumer recorded after a tiler-stream wrap.
+	void RetainImageStaging() { m_staging_buffer.RetainLastUse(); }
+	[[nodiscard]] uint64_t ImageStagingCapacity() const noexcept { return m_staging_buffer.Size(); }
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);

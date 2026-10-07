@@ -411,6 +411,13 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
+void StreamBuffer::RetainLastUse() {
+	EXIT_IF(m_current_watch_cursor == 0);
+	auto& watch = m_current_watches[m_current_watch_cursor - 1];
+	EXIT_IF(watch.upper_bound != m_offset);
+	watch.tick = std::max(watch.tick, Scheduler().CurrentTick());
+}
+
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);

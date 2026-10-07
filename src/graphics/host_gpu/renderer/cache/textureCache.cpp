@@ -1700,6 +1700,10 @@ void TextureCache::InitializeImage(ImageId id) {
 				std::fflush(stdout);
 			}
 		}
+		if (!uploaded && UploadImageChunked(image)) {
+			uploaded = true;
+			marks[2] = Clock::now();
+		}
 		if (!uploaded) {
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
@@ -1897,55 +1901,367 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 	if (slice * picked.size() > info.data.size / PartialUploadMaxShare) {
 		return PartialFail("depth_share");
 	}
-	// Runs of consecutive layers stage as one piece each.
-	std::vector<BufferCache::StagingPiece> pieces;
-	std::vector<uint64_t>                  staged(picked.size());
-	uint64_t                               total = 0;
-	for (size_t i = 0; i < picked.size(); ++i) {
-		const uint64_t vaddr = base + slice * picked[i];
-		if (!pieces.empty() && pieces.back().vaddr + pieces.back().size == vaddr) {
-			staged[i] = pieces.back().offset + pieces.back().size;
-			pieces.back().size += slice;
-		} else {
-			const uint64_t offset = (total + 255) & ~uint64_t {255};
-			pieces.push_back({vaddr, slice, offset});
-			staged[i] = offset;
+	// Bound both staging and depth detile scratch by the ring capacity when explicitly enabled.
+	// Preflight every picked source before recording any batch so source rejection cannot cause a
+	// partial upload followed by a full fallback over GPU-owned guest bytes.
+	static const bool depth_chunks = [] {
+		const char* value = std::getenv("KYTY_PARTIAL_DEPTH_CHUNKS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	const uint64_t capacity = m_buffer_cache.ImageStagingCapacity();
+	uint64_t staged_total = 0;
+	if (depth_chunks && slice <= capacity) {
+		std::vector<BufferCache::StagingPiece> preflight;
+		preflight.reserve(picked.size());
+		for (const auto layer: picked) preflight.push_back({base + slice * layer, slice, 0});
+		uint64_t rejected_address = 0;
+		const auto source_failure = m_buffer_cache.ValidateImageStageSources(preflight, slice, &rejected_address);
+		if (source_failure == BufferCache::ImageStageFailure::SourceOwned) {
+			std::printf("PARTIAL-DEPTH-STAGE-FAIL addr=0x%llx source=0x%llx reason=source_owned preflight=1\n",
+			            static_cast<unsigned long long>(base), static_cast<unsigned long long>(rejected_address));
+			return PartialFail("depth_source_owned");
 		}
-		total = pieces.back().offset + pieces.back().size;
-	}
-	const auto [source, source_offset] = m_buffer_cache.StageImagePieces(pieces, total);
-	if (source == nullptr) {
-		return PartialFail("depth_stage");
-	}
-	// The picked layers, packed: as the whole path's copies and tiles, at their own layer.
-	std::vector<vk::BufferImageCopy> copies(picked.size());
-	for (size_t i = 0; i < picked.size(); ++i) {
-		auto& copy             = copies[i];
-		copy.bufferOffset      = info.IsTiled() ? slice * i : staged[i];
-		copy.bufferRowLength   = info.pitch;
-		copy.bufferImageHeight = info.extent.height;
-		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, picked[i], 1};
-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
-	}
-	TileManager::Result linear {source->Handle(), source_offset, total};
-	if (info.IsTiled()) {
+		if (source_failure != BufferCache::ImageStageFailure::None) {
+			return PartialFail("depth_capacity");
+		}
+		for (const auto layer: picked) {
+			if (HasGpuWrittenImageOverlap(base + slice * layer, slice)) {
+				return PartialFail("depth_image_owned");
+			}
+		}
 		TileBlockLayout block {};
-		EXIT_NOT_IMPLEMENTED(!TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
-		std::vector<GpuTileInfo> tiles;
-		tiles.reserve(picked.size());
-		for (size_t i = 0; i < picked.size(); ++i) {
-			tiles.push_back({block.family, block.bytes_per_element, slice * i, slice, staged[i], slice, 0,
-			                 info.extent.width, info.extent.height, 1, info.pitch});
-			tiles.back().surface_z = picked[i];
+		if (info.IsTiled()) {
+			EXIT_NOT_IMPLEMENTED(!TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
 		}
-		linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * picked.size(), tiles);
+		for (size_t first = 0; first < picked.size();) {
+			size_t batch_count = 0;
+			uint64_t batch_bytes = 0;
+			while (first + batch_count < picked.size()) {
+				const uint64_t next_offset = (batch_bytes + 255) & ~uint64_t {255};
+				if (next_offset > capacity || slice > capacity - next_offset) break;
+				batch_bytes = next_offset + slice;
+				++batch_count;
+			}
+			if (batch_count == 0) return PartialFail("depth_layer_exceeds_stage_capacity");
+			std::vector<BufferCache::StagingPiece> pieces;
+			std::vector<vk::BufferImageCopy> copies(batch_count);
+			std::vector<GpuTileInfo> tiles;
+			pieces.reserve(batch_count);
+			if (info.IsTiled()) tiles.reserve(batch_count);
+			uint64_t total = 0;
+			for (size_t i = 0; i < batch_count; ++i) {
+				const uint64_t offset = (total + 255) & ~uint64_t {255};
+				const uint64_t vaddr = base + slice * picked[first + i];
+				pieces.push_back({vaddr, slice, offset});
+				total = offset + slice;
+				auto& copy             = copies[i];
+				copy.bufferOffset      = info.IsTiled() ? slice * i : offset;
+				copy.bufferRowLength   = info.pitch;
+				copy.bufferImageHeight = info.extent.height;
+				copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, picked[first + i], 1};
+				copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+				if (info.IsTiled()) {
+					tiles.push_back({block.family, block.bytes_per_element, slice * i, slice, offset, slice, 0,
+					                 info.extent.width, info.extent.height, 1, info.pitch});
+					tiles.back().surface_z = picked[first + i];
+				}
+			}
+			BufferCache::ImageStageFailure stage_failure {};
+			const auto [source, source_offset] =
+			    m_buffer_cache.StageImagePieces(pieces, total, &stage_failure, true);
+			if (source == nullptr) {
+				static constexpr const char* failure_names[] {"none", "source_owned", "capacity", "ring_unavailable"};
+				const auto index = static_cast<size_t>(stage_failure);
+				const char* reason = index < std::size(failure_names) ? failure_names[index] : "unknown";
+				std::printf("PARTIAL-DEPTH-STAGE-FAIL addr=0x%llx staged_bytes=0x%llx capacity=0x%llx "
+				            "batch_layers=%zu reason=%s preflight=1\n",
+				            static_cast<unsigned long long>(base), static_cast<unsigned long long>(total),
+				            static_cast<unsigned long long>(capacity), batch_count, reason);
+				return PartialFail("depth_chunk_stage");
+			}
+			TileManager::Result linear {source->Handle(), source_offset, total};
+			if (info.IsTiled()) {
+				linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * batch_count, tiles);
+			}
+			for (auto& copy: copies) copy.bufferOffset += linear.offset;
+			image.Upload(copies, linear.buffer, linear.offset, linear.size);
+			m_buffer_cache.RetainImageStaging();
+			staged_total += total;
+			first += batch_count;
+		}
+	} else {
+		// Existing single-reservation path remains the default and the oversized-layer fallback.
+		std::vector<BufferCache::StagingPiece> pieces;
+		std::vector<uint64_t> staged(picked.size());
+		uint64_t total = 0;
+		for (size_t i = 0; i < picked.size(); ++i) {
+			const uint64_t vaddr = base + slice * picked[i];
+			if (!pieces.empty() && pieces.back().vaddr + pieces.back().size == vaddr) {
+				staged[i] = pieces.back().offset + pieces.back().size;
+				pieces.back().size += slice;
+			} else {
+				const uint64_t offset = (total + 255) & ~uint64_t {255};
+				pieces.push_back({vaddr, slice, offset});
+				staged[i] = offset;
+			}
+			total = pieces.back().offset + pieces.back().size;
+		}
+		BufferCache::ImageStageFailure stage_failure {};
+		const auto [source, source_offset] = m_buffer_cache.StageImagePieces(pieces, total, &stage_failure);
+		if (source == nullptr) {
+			static constexpr const char* names[] {"none", "source_owned", "capacity", "ring_unavailable"};
+			const auto index = static_cast<size_t>(stage_failure);
+			const char* reason = index < std::size(names) ? names[index] : "unknown";
+			std::printf("PARTIAL-DEPTH-STAGE-FAIL addr=0x%llx image_bytes=0x%llx staged_bytes=0x%llx "
+			            "capacity=0x%llx pieces=%zu reason=%s\n",
+			            static_cast<unsigned long long>(base), static_cast<unsigned long long>(info.data.size),
+			            static_cast<unsigned long long>(total), static_cast<unsigned long long>(capacity),
+			            pieces.size(), reason);
+			return PartialFail(stage_failure == BufferCache::ImageStageFailure::SourceOwned ? "depth_source_owned" :
+			                   stage_failure == BufferCache::ImageStageFailure::Capacity ? "depth_capacity" :
+			                   "depth_ring_unavailable");
+		}
+		std::vector<vk::BufferImageCopy> copies(picked.size());
+		for (size_t i = 0; i < picked.size(); ++i) {
+			auto& copy             = copies[i];
+			copy.bufferOffset      = info.IsTiled() ? slice * i : staged[i];
+			copy.bufferRowLength   = info.pitch;
+			copy.bufferImageHeight = info.extent.height;
+			copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, picked[i], 1};
+			copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+		}
+		TileManager::Result linear {source->Handle(), source_offset, total};
+		if (info.IsTiled()) {
+			TileBlockLayout block {};
+			EXIT_NOT_IMPLEMENTED(!TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
+			std::vector<GpuTileInfo> tiles;
+			tiles.reserve(picked.size());
+			for (size_t i = 0; i < picked.size(); ++i) {
+				tiles.push_back({block.family, block.bytes_per_element, slice * i, slice, staged[i], slice, 0,
+				                 info.extent.width, info.extent.height, 1, info.pitch});
+				tiles.back().surface_z = picked[i];
+			}
+			linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * picked.size(), tiles);
+		}
+		for (auto& copy: copies) copy.bufferOffset += linear.offset;
+		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+		staged_total = total;
 	}
-	for (auto& copy: copies) {
-		copy.bufferOffset += linear.offset;
-	}
-	image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	LiveCounters::Add(LiveCounters::PartialUploads);
-	LiveCounters::Add(LiveCounters::PartialUploadBytes, total);
+	LiveCounters::Add(LiveCounters::PartialUploadBytes, staged_total);
+	return true;
+}
+
+bool TextureCache::UploadImageChunked(Image& image) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FULL_IMAGE_CHUNKS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	const auto& info = image.info;
+	const uint64_t capacity = m_buffer_cache.ImageStagingCapacity();
+	if (!enabled || info.data.size <= capacity || !image.IsCpuDirty() || image.IsBufferModified() ||
+	    image.IsGpuModified() || image.IsMaybeCpuDirty() || image.IsStencilModified() ||
+	    image.usage.storage || image.usage.render_target || image.depth_id) {
+		return false;
+	}
+	const auto binding = UploadBinding(image);
+	if (binding == BindingType::DepthTarget) {
+		if (!image.usage.depth_target || !info.IsDepth() || info.HasStencil() || info.IsVolume() ||
+		    info.resources.levels != 1 || info.resources.layers == 0 ||
+		    info.data.size % info.resources.layers != 0 || info.samples != 1 || image.backing.samples != 1 ||
+		    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block ||
+		    DepthAspectTransferBytes(info.pixel_format) != info.bytes_per_block) return false;
+		const uint32_t layers = info.resources.layers;
+		const uint64_t slice = info.data.size / layers;
+		if (slice > capacity) return false;
+		std::vector<BufferCache::StagingPiece> preflight;
+		preflight.reserve(layers);
+		for (uint32_t layer = 0; layer < layers; ++layer) {
+			const uint64_t address = info.data.address + slice * layer;
+			preflight.push_back({address, slice, 0});
+		}
+		uint64_t rejected_address = 0;
+		const auto source_failure = m_buffer_cache.ValidateImageStageSources(preflight, capacity, &rejected_address);
+		if (source_failure != BufferCache::ImageStageFailure::None) {
+			std::printf("FULL-DEPTH-CHUNK-REJECT addr=0x%llx source=0x%llx reason=%u\n",
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<unsigned long long>(rejected_address), static_cast<unsigned>(source_failure));
+			return false;
+		}
+		for (uint32_t layer = 0; layer < layers; ++layer) {
+			if (HasGpuWrittenImageOverlap(info.data.address + slice * layer, slice)) return false;
+		}
+		TileBlockLayout block {};
+		if (info.IsTiled() && !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block)) {
+			return false;
+		}
+		uint64_t uploaded_bytes = 0;
+		for (uint32_t first = 0; first < layers;) {
+			std::vector<BufferCache::StagingPiece> pieces;
+			std::vector<vk::BufferImageCopy> copies;
+			std::vector<GpuTileInfo> tiles;
+			uint64_t stage_bytes = 0;
+			const uint32_t batch_first = first;
+			while (first < layers) {
+				const uint64_t stage_offset = (stage_bytes + 255) & ~uint64_t {255};
+				if (stage_offset > capacity || slice > capacity - stage_offset) break;
+				const uint64_t address = info.data.address + slice * first;
+				pieces.push_back({address, slice, stage_offset});
+				vk::BufferImageCopy copy {};
+				copy.bufferOffset = slice * first;
+				copy.bufferRowLength = info.pitch;
+				copy.bufferImageHeight = info.extent.height;
+				copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, first, 1};
+				copy.imageExtent = {info.extent.width, info.extent.height, 1};
+				copy.bufferOffset = info.IsTiled() ? slice * (first - batch_first) : stage_offset;
+				copies.push_back(copy);
+				if (info.IsTiled()) {
+					tiles.push_back({block.family, block.bytes_per_element, slice * (first - batch_first), slice,
+					                 stage_offset, slice, 0, info.extent.width, info.extent.height, 1, info.pitch});
+					tiles.back().surface_z = first;
+				}
+				stage_bytes = stage_offset + slice;
+				++first;
+			}
+			BufferCache::ImageStageFailure failure {};
+			const auto [source, source_offset] =
+			    m_buffer_cache.StageImagePieces(pieces, stage_bytes, &failure, true);
+			if (source == nullptr) {
+				std::printf("FULL-DEPTH-CHUNK-FAIL addr=0x%llx first=%u layers=%zu stage=0x%llx reason=%u\n",
+				            static_cast<unsigned long long>(info.data.address), batch_first, pieces.size(),
+				            static_cast<unsigned long long>(stage_bytes), static_cast<unsigned>(failure));
+				return false;
+			}
+			TileManager::Result linear {source->Handle(), source_offset, stage_bytes};
+			if (info.IsTiled()) {
+				linear = m_tiler.Detile(source->Handle(), source_offset, stage_bytes,
+				                        slice * pieces.size(), tiles);
+			}
+			for (auto& copy: copies) copy.bufferOffset += linear.offset;
+			image.Upload(copies, linear.buffer, linear.offset, linear.size);
+			m_buffer_cache.RetainImageStaging();
+			uploaded_bytes += stage_bytes;
+		}
+		LiveCounters::Add(LiveCounters::FullUploads);
+		LiveCounters::Add(LiveCounters::FullUploadBytes, info.data.size);
+		std::printf("FULL-DEPTH-CHUNK addr=0x%llx image=0x%llx staged=0x%llx layers=%u\n",
+		            static_cast<unsigned long long>(info.data.address),
+		            static_cast<unsigned long long>(info.data.size), static_cast<unsigned long long>(uploaded_bytes),
+		            layers);
+		return true;
+	}
+	if (binding != BindingType::Texture || image.binding.is_target || image.usage.depth_target || info.IsDepth() ||
+	    info.IsVolume() || image.depth_id || info.host_mip_skip >= info.resources.levels) return false;
+	auto plan = BuildTextureTransfer(image, BindingType::Texture, TransferDirection::Upload);
+	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() || plan.tiles.size() != plan.regions.size()) {
+		return false;
+	}
+	struct Entry {
+		GpuTileInfo tile;
+		vk::BufferImageCopy copy;
+		uint64_t source_begin = 0;
+		uint64_t source_end = 0;
+	};
+	std::vector<Entry> entries;
+	std::vector<BufferCache::StagingPiece> preflight;
+	entries.reserve(plan.tiles.size());
+	preflight.reserve(plan.tiles.size());
+	for (size_t i = 0; i < plan.tiles.size(); ++i) {
+		auto tile = plan.tiles[i];
+		auto copy = plan.regions[i];
+		if (copy.imageSubresource.mipLevel < info.host_mip_skip) continue;
+		if (copy.imageSubresource.mipLevel >= info.resources.levels || tile.depth != 1 || tile.linear_size == 0 ||
+		    tile.tiled_size == 0 || tile.tiled_offset > info.data.size ||
+		    tile.tiled_size > info.data.size - tile.tiled_offset || copy.bufferOffset < tile.linear_offset) {
+			return false;
+		}
+		const uint64_t raw_begin = info.data.address + tile.tiled_offset;
+		const uint64_t raw_end = raw_begin + tile.tiled_size;
+		const uint64_t begin = raw_begin;
+		const uint64_t end = raw_end;
+		if (end <= begin || end - begin > capacity || tile.linear_size > end - begin ||
+		    tile.family != plan.tiles.front().family ||
+		    tile.bytes_per_element != plan.tiles.front().bytes_per_element ||
+		    copy.bufferOffset - tile.linear_offset >= tile.linear_size ||
+		    copy.imageSubresource.baseArrayLayer >= info.resources.layers || copy.imageExtent.width == 0 ||
+		    copy.imageExtent.height == 0 || copy.imageExtent.depth != 1) return false;
+		entries.push_back({tile, copy, begin, end});
+		preflight.push_back({begin, end - begin, 0});
+	}
+	if (entries.empty()) return false;
+	uint64_t rejected_address = 0;
+	const auto source_failure = m_buffer_cache.ValidateImageStageSources(preflight, capacity, &rejected_address);
+	if (source_failure != BufferCache::ImageStageFailure::None) {
+		std::printf("FULL-IMAGE-CHUNK-REJECT addr=0x%llx size=0x%llx reason=%s source=0x%llx\n",
+		            static_cast<unsigned long long>(info.data.address),
+		            static_cast<unsigned long long>(info.data.size),
+		            source_failure == BufferCache::ImageStageFailure::SourceOwned ? "source_owned" : "capacity",
+		            static_cast<unsigned long long>(rejected_address));
+		return false;
+	}
+	for (const auto& entry: entries) {
+		if (HasGpuWrittenImageOverlap(entry.source_begin, entry.source_end - entry.source_begin)) return false;
+	}
+	TileBlockLayout block {};
+	if (!TileGetBlockLayout(plan.tiles.front().family, plan.tiles.front().bytes_per_element, block)) return false;
+	uint64_t uploaded_bytes = 0;
+	for (size_t first = 0; first < entries.size();) {
+		std::vector<BufferCache::StagingPiece> pieces;
+		std::vector<GpuTileInfo> tiles;
+		std::vector<vk::BufferImageCopy> copies;
+		pieces.reserve(entries.size() - first);
+		tiles.reserve(entries.size() - first);
+		copies.reserve(entries.size() - first);
+		uint64_t stage_bytes = 0;
+		uint64_t linear_bytes = 0;
+		size_t last = first;
+		for (; last < entries.size(); ++last) {
+			const auto& entry = entries[last];
+			const uint64_t stage_offset = (stage_bytes + 255) & ~uint64_t {255};
+			const uint64_t stage_size = entry.source_end - entry.source_begin;
+			if (stage_offset > capacity || stage_size > capacity - stage_offset) break;
+			const uint64_t linear_offset = (linear_bytes + 255) & ~uint64_t {255};
+			if (linear_offset > capacity || entry.tile.linear_size > capacity - linear_offset) break;
+			pieces.push_back({entry.source_begin, stage_size, stage_offset});
+			auto tile = entry.tile;
+			auto copy = entry.copy;
+			tile.tiled_offset = stage_offset + (info.data.address + tile.tiled_offset - entry.source_begin);
+			tile.linear_offset = linear_offset;
+			copy.bufferOffset = linear_offset + (copy.bufferOffset - entry.tile.linear_offset);
+			copy.imageSubresource.mipLevel -= info.host_mip_skip;
+			linear_bytes = linear_offset + tile.linear_size;
+			tiles.push_back(tile);
+			copies.push_back(copy);
+			stage_bytes = stage_offset + stage_size;
+		}
+		if (last == first || copies.empty()) return false;
+		BufferCache::ImageStageFailure failure {};
+		const auto [source, source_offset] =
+		    m_buffer_cache.StageImagePieces(pieces, stage_bytes, &failure, true);
+		if (source == nullptr) {
+			std::printf("FULL-IMAGE-CHUNK-FAIL addr=0x%llx stage=0x%llx capacity=0x%llx reason=%u\n",
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<unsigned long long>(stage_bytes), static_cast<unsigned long long>(capacity),
+			            static_cast<unsigned>(failure));
+			return false;
+		}
+		const auto linear = m_tiler.Detile(source->Handle(), source_offset, stage_bytes, linear_bytes, tiles);
+		for (auto& copy: copies) copy.bufferOffset += linear.offset;
+		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+		m_buffer_cache.RetainImageStaging();
+		uploaded_bytes += stage_bytes;
+		first = last;
+	}
+	LiveCounters::Add(LiveCounters::FullUploads);
+	LiveCounters::Add(LiveCounters::FullUploadBytes, info.data.size);
+	std::printf("FULL-IMAGE-CHUNK addr=0x%llx image=0x%llx staged=0x%llx layers=%u levels=%u skip=%u\n",
+	            static_cast<unsigned long long>(info.data.address),
+	            static_cast<unsigned long long>(info.data.size), static_cast<unsigned long long>(uploaded_bytes),
+	            info.resources.layers, info.resources.levels, info.host_mip_skip);
+	TrimUploadedTexture(image, true);
+	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 && PartialDirtyCandidate(image)) {
+		UpdatePartialHashes(image, true);
+	}
 	return true;
 }
 
