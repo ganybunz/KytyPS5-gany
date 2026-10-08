@@ -2727,6 +2727,13 @@ void TestModuleRelocationUsesWritableHostMapping() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--backing-view-modes-only") == 0) {
+		const bool ok = Libs::LibKernel::Memory::TestWindowsBackingViewModes();
+		std::printf("Windows backing view permission modes: %s\n", ok ? "passed" : "FAILED");
+		return ok ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--prt-direct-concurrent-only") == 0) {
 		RunTest(TestPrtBackingConcurrentDirectResidency);
 		return g_failed_tests == 0 ? 0 : 1;
