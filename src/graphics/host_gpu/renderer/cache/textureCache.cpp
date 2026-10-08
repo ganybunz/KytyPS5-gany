@@ -3193,6 +3193,26 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		if (image.depth_id) {
+			const auto* depth = m_slot_images.try_get(image.depth_id);
+			std::printf("Color association state: color_gpu=%u color_cpu=%u color_buffer=%u "
+			            "color_backing=%u depth_live=%u depth_registered=%u depth_gpu=%u "
+			            "depth_cpu=%u depth_stencil_dirty=%u depth_samples=%u "
+			            "depth_data=0x%016" PRIx64 "+0x%" PRIx64
+			            " depth_stencil=0x%016" PRIx64 "+0x%" PRIx64 "\n",
+			            static_cast<unsigned>(image.IsGpuModified()), static_cast<unsigned>(image.IsCpuDirty()),
+			            static_cast<unsigned>(image.IsBufferModified()), static_cast<unsigned>(image.backing.image != nullptr),
+			            static_cast<unsigned>(depth != nullptr), static_cast<unsigned>(depth != nullptr && depth->registered),
+			            static_cast<unsigned>(depth != nullptr && depth->IsGpuModified()),
+			            static_cast<unsigned>(depth != nullptr && depth->IsCpuDirty()),
+			            static_cast<unsigned>(depth != nullptr && depth->IsStencilModified()),
+			            depth != nullptr ? depth->info.samples : 0u,
+			            depth != nullptr ? depth->info.data.address : uint64_t {0},
+			            depth != nullptr ? depth->info.data.size : uint64_t {0},
+			            depth != nullptr ? depth->info.stencil.address : uint64_t {0},
+			            depth != nullptr ? depth->info.stencil.size : uint64_t {0});
+			std::fflush(stdout);
+		}
 		EXIT("TextureCache: color target requires rediscovery before final acquisition: "
 		     "id=%u:%u registered=%u depth_id=%u:%u needs_rebind=%u "
 		     "owner=0x%016llx+0x%llx request=0x%016llx+0x%llx format=%u type=%u\n",
