@@ -86,6 +86,31 @@ uint64_t UploadRingSize() {
 	return SmallUploadRingEnabled() ? 128 * MiB : 512 * MiB;
 }
 
+
+uint32_t GpuWriteLogIndexMode() {
+	static const uint32_t mode = [] {
+		const auto* value = std::getenv("KYTY_GPU_WRITE_LOG_INDEX");
+		if (value == nullptr) return 0u;
+		if (std::strcmp(value, "1") == 0) return 1u;
+		if (std::strcmp(value, "2") == 0) return 2u;
+		return 0u;
+	}();
+	return mode;
+}
+
+bool IsLargeGpuWrite(uint64_t begin, uint64_t end) {
+	constexpr uint64_t GranuleShift = 16;
+	constexpr uint64_t MaxIndexedWriteGranules = 64;
+	return begin < end && ((end - 1) >> GranuleShift) - (begin >> GranuleShift) + 1 > MaxIndexedWriteGranules;
+}
+
+// Hash 64 KiB guest granules into the fixed-size table. A collision stores a later
+// absolute sequence and therefore only makes the query scan farther backward.
+size_t GpuWriteIndexSlot(uint64_t address) {
+	const uint64_t granule = address >> 16u;
+	return static_cast<size_t>(granule * 11400714819323198485ull) & ((size_t {1} << 16u) - 1);
+}
+
 // AsyncUpload call (context: the guest address): an image span with unmapped parts (a streamed
 // texture pool) into staging, the mapped parts as they are and the rest as zeros.
 void ReadMappedOrZeroCall(void* context, uint64_t destination, uint64_t size) {
@@ -368,6 +393,11 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, GpuWriteOrigin ori
 			m_gpu_writes_on = false;
 			m_gpu_writes.clear();
 			m_gpu_writes_head = m_gpu_writes_stamped = 0;
+			m_gpu_write_index.reset();
+			m_gpu_write_sequence = 0;
+			m_gpu_write_index_on = false;
+			m_gpu_write_index_safe = true;
+			m_gpu_write_large_count = 0;
 		}
 		return;
 	}
@@ -379,12 +409,40 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, GpuWriteOrigin ori
 		m_gpu_writes.clear();
 		m_gpu_writes_head = m_gpu_writes_stamped = 0;
 		m_gpu_writes_from = UINT64_MAX;
+		m_gpu_write_sequence = 0;
+		m_gpu_write_index_on = GpuWriteLogIndexMode() != 0;
+		m_gpu_write_index_safe = true;
+		m_gpu_write_large_count = 0;
+		if (m_gpu_write_index_on) {
+			m_gpu_write_index = std::make_unique<GpuWriteIndex>();
+			m_gpu_write_index->fill(0);
+		} else {
+			m_gpu_write_index.reset();
+		}
 	}
 	// Writes not stamped yet all get the same tick at the next point between commands: a range
 	// noted again before then (a dispatch run writing the same buffers) adds nothing.
 	for (size_t i = m_gpu_writes.size(), last = std::max(m_gpu_writes_stamped, i > 4 ? i - 4 : 0); i > last; --i)
 		if (m_gpu_writes[i - 1].begin == vaddr && m_gpu_writes[i - 1].end == vaddr + size) return;
-	m_gpu_writes.push_back({vaddr, vaddr + size, 0});
+	if (m_gpu_write_index_on && m_gpu_write_index_safe) {
+		if (m_gpu_write_sequence == UINT64_MAX) {
+			// Never wrap sequence arithmetic. The retained log remains authoritative.
+			m_gpu_write_index_safe = false;
+			m_gpu_write_index.reset();
+		} else {
+			++m_gpu_write_sequence;
+		}
+	}
+	const uint64_t end = vaddr + size;
+	m_gpu_writes.push_back({vaddr, end, 0, m_gpu_write_sequence});
+	if (m_gpu_write_index_on && m_gpu_write_index_safe) {
+		if (IsLargeGpuWrite(vaddr, end)) {
+			++m_gpu_write_large_count;
+		} else if (vaddr < end) {
+			for (uint64_t granule = vaddr >> 16u; granule <= (end - 1) >> 16u; ++granule)
+				(*m_gpu_write_index)[GpuWriteIndexSlot(granule << 16u)] = m_gpu_write_sequence;
+		}
+	}
 }
 
 
@@ -401,20 +459,75 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
 		if (m_gpu_writes_from == UINT64_MAX) m_gpu_writes_from = current;
 	}
 	// Stamps never decrease: the completed writes are a prefix of the dated ones.
-	while (m_gpu_writes_head < m_gpu_writes_stamped && m_gpu_writes[m_gpu_writes_head].tick <= completed)
+	while (m_gpu_writes_head < m_gpu_writes_stamped && m_gpu_writes[m_gpu_writes_head].tick <= completed) {
+		const auto& write = m_gpu_writes[m_gpu_writes_head];
+		if (m_gpu_write_index_on && m_gpu_write_index_safe && IsLargeGpuWrite(write.begin, write.end))
+			--m_gpu_write_large_count;
 		++m_gpu_writes_head;
+	}
 	if (m_gpu_writes_head >= 4096 && m_gpu_writes_head * 2 >= m_gpu_writes.size()) {
 		m_gpu_writes.erase(m_gpu_writes.begin(), m_gpu_writes.begin() + static_cast<std::ptrdiff_t>(m_gpu_writes_head));
 		m_gpu_writes_stamped -= m_gpu_writes_head;
 		m_gpu_writes_head = 0;
+		// Absolute sequence stamps remain valid across prefix compaction.
 	}
-	uint64_t tick = 0;
-	for (size_t i = m_gpu_writes_head; i < m_gpu_writes.size(); ++i) {
-		const auto& write = m_gpu_writes[i];
-		if (write.begin < end && begin < write.end)
-			tick = std::max(tick, i < m_gpu_writes_stamped ? write.tick : UINT64_MAX);
+	auto full_scan = [&] {
+		uint64_t result = 0;
+		for (size_t i = m_gpu_writes_head; i < m_gpu_writes.size(); ++i) {
+			const auto& write = m_gpu_writes[i];
+			if (write.begin < end && begin < write.end)
+				result = std::max(result, i < m_gpu_writes_stamped ? write.tick : UINT64_MAX);
+		}
+		return result;
+	};
+	auto verify_indexed = [&](uint64_t indexed, uint64_t sequence) {
+		if (GpuWriteLogIndexMode() != 2) return indexed;
+		const uint64_t reference = full_scan();
+		if (indexed != reference) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 40) {
+				std::printf("GPU_WRITE_LOG_INDEX_MISMATCH begin=0x%" PRIx64 " end=0x%" PRIx64
+				            " indexed=%" PRIu64 " reference=%" PRIu64 " sequence=%" PRIu64 "\n",
+				            begin, end, indexed, reference, sequence);
+				std::fflush(stdout);
+			}
+			m_gpu_write_index_safe = false;
+			m_gpu_write_index.reset();
+			return reference;
+		}
+		static uint64_t verified = 0; // GPU thread owns the write log.
+		if (++verified == 1 || (verified & 65535u) == 0) {
+			std::printf("GPU_WRITE_LOG_INDEX verified=%" PRIu64 " mismatches=0\n", verified);
+			std::fflush(stdout);
+		}
+		return indexed;
+	};
+	if (!m_gpu_write_index_on || !m_gpu_write_index_safe || m_gpu_write_large_count != 0 || begin >= end)
+		return full_scan();
+	constexpr uint64_t MaxQueryGranules = 256;
+	constexpr size_t MaxBackwardCandidates = 4096;
+	const uint64_t first = begin >> 16u;
+	const uint64_t last  = (end - 1) >> 16u;
+	if (last - first + 1 > MaxQueryGranules) return full_scan();
+	uint64_t candidate_sequence = 0;
+	for (uint64_t granule = first; granule <= last; ++granule)
+		candidate_sequence = std::max(candidate_sequence, (*m_gpu_write_index)[GpuWriteIndexSlot(granule << 16u)]);
+	if (candidate_sequence == 0 || m_gpu_writes.empty() || candidate_sequence < m_gpu_writes.front().sequence)
+		return verify_indexed(0, candidate_sequence);
+	const uint64_t offset = candidate_sequence - m_gpu_writes.front().sequence;
+	if (offset >= m_gpu_writes.size()) return full_scan();
+	size_t i = static_cast<size_t>(offset) + 1;
+	size_t walked = 0;
+	while (i > m_gpu_writes_head && walked < MaxBackwardCandidates) {
+		const auto& write = m_gpu_writes[--i];
+		++walked;
+		if (write.begin < end && begin < write.end) {
+			const uint64_t indexed = i < m_gpu_writes_stamped ? write.tick : UINT64_MAX;
+			return verify_indexed(indexed, candidate_sequence);
+		}
 	}
-	return tick;
+	if (i > m_gpu_writes_head) return full_scan();
+	return verify_indexed(0, candidate_sequence);
 }
 
 bool BufferCache::ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_t>> ranges,

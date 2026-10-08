@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -283,7 +284,7 @@ private:
 	// tick is set at the next point between commands (every write noted by then is recorded
 	// at or before the current tick); entries the GPU completed are dropped from the front.
 	struct GpuWrite {
-		uint64_t begin, end, tick;
+		uint64_t begin, end, tick, sequence;
 	};
 	// Trace origins distinguish a writable binding declaration from a recorded copy.
 	enum class GpuWriteOrigin : uint32_t {
@@ -300,6 +301,14 @@ private:
 	size_t                m_gpu_writes_head    = 0;
 	size_t                m_gpu_writes_stamped = 0;
 	bool                  m_gpu_writes_on      = false;
+	// Optional fixed hashed lookup: 65,536 64-bit absolute sequence stamps (512 KiB).
+	// Lazily allocated; hash collisions only move the backward scan's start later.
+	using GpuWriteIndex = std::array<uint64_t, 1u << 16u>;
+	std::unique_ptr<GpuWriteIndex> m_gpu_write_index;
+	uint64_t m_gpu_write_sequence = 0;
+	bool m_gpu_write_index_on = false;
+	bool m_gpu_write_index_safe = true;
+	size_t m_gpu_write_large_count = 0;
 	// Writes before this tick were not noted (UINT64_MAX: set at the next stamp).
 	uint64_t              m_gpu_writes_from    = UINT64_MAX;
 	// Last copy-engine value, and last graphics tick, that wrote each download slot: a detached
