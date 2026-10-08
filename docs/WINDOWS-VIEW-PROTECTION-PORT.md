@@ -11,5 +11,8 @@ The upstream test maps the same placeholder in four supported modes, queries
 actual Windows protection and mapping type, then unmaps before the next mode.
 Run virtual_memory_allocation_tests --backing-view-modes-only after a clean build.
 Status: source port; build/test/game verification pending. No measured FPS gain.
+The first focused test compile caught the upstream helper name `MapFixed`, which
+this branch names `MapExistingPlaceholderFixed`; corrected in the test-only hook.
+The production emulator compiled successfully before this test harness correction.
 Rollback: revert this commit. Primary source:
 https://github.com/KytyPS5/KytyPS5/commit/c30ac7c904ca9cd678a064b73c0b66b0b333ba99
