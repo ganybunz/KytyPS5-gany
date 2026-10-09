@@ -15,10 +15,14 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QIODevice>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -381,11 +385,58 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 }
 #endif
 
+// An optional portable package may supply title-specific runtime switches. Reset
+// the environment on every launch so a previous game's switches cannot leak.
+static bool SetTitleEnvironment(QProcess* process, const QString& directory,
+                                const QString& title_id, QString* error) {
+	auto environment = QProcessEnvironment::systemEnvironment();
+	const auto path = QDir(directory).filePath(QStringLiteral("launcher-environment.json"));
+	if (QFileInfo::exists(path)) {
+		QFile file(path);
+		if (!file.open(QIODevice::ReadOnly)) {
+			*error = QStringLiteral("Cannot read %1: %2").arg(path, file.errorString());
+			return false;
+		}
+		QJsonParseError parse_error;
+		const auto document = QJsonDocument::fromJson(file.readAll(), &parse_error);
+		const auto root = document.object();
+		if (parse_error.error != QJsonParseError::NoError || !document.isObject() ||
+		    root.value("version").toDouble(-1) != 1 || !root.value("titles").isObject()) {
+			*error = QStringLiteral("Invalid title environment file: %1").arg(path);
+			return false;
+		}
+		const auto profile = root.value("titles").toObject().value(title_id);
+		if (!profile.isUndefined()) {
+			if (!profile.isObject()) {
+				*error = QStringLiteral("Invalid environment profile for %1").arg(title_id);
+				return false;
+			}
+			const auto settings = profile.toObject();
+			const QRegularExpression name_pattern(QStringLiteral("^KYTY_[A-Z0-9_]+$"));
+			for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+				if (!name_pattern.match(it.key()).hasMatch() || !it.value().isString() ||
+				    it.value().toString().contains(QChar(0))) {
+					*error = QStringLiteral("Invalid runtime switch %1 in %2").arg(it.key(), path);
+					return false;
+				}
+				environment.insert(it.key(), it.value().toString());
+			}
+		}
+	}
+	process->setProcessEnvironment(environment);
+	return true;
+}
+
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
 
 	QFileInfo f(interpreter);
 	auto      dir = f.absoluteDir();
+	QString environment_error;
+	if (!SetTitleEnvironment(process, dir.path(), info.title_id, &environment_error)) {
+		QMessageBox::critical(this, tr("Error"), environment_error);
+		return;
+	}
 
 	auto args = CreateEmulatorArgs(info);
 	if (args.isEmpty()) {

@@ -3,10 +3,16 @@
 
 #include <QApplication>
 #include <QArgument>
+#include <QDir>
+#include <QFileInfo>
 #include <QObject>
 
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
+	const auto package_dir = QCoreApplication::applicationDirPath();
+	if (QFileInfo::exists(QDir(package_dir).filePath(QStringLiteral("Kyty.ini")))) {
+		QDir::setCurrent(package_dir);
+	}
 	LauncherTheme::Initialize(a);
 
 	MainDialog w;
