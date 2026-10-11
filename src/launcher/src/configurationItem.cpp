@@ -1,6 +1,7 @@
 #include "configurationItem.h"
 
 #include "configuration.h"
+#include "gameContent.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -11,6 +12,8 @@
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
+#include <QPixmap>
 #include <QSize>
 #include <QStringList>
 #include <QStyle>
@@ -153,13 +156,13 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 	m_comment_edit->setFrame(false);
 	parent->setItemWidget(this, CommentsColumn, m_comment_edit);
 
-	Update();
+	Update(true);
 	SetRunning(false);
 }
 
 ConfigurationItem::~ConfigurationItem() = default;
 
-void ConfigurationItem::Update() {
+void ConfigurationItem::Update(bool reload_icon) {
 	const auto display_text = GetDisplayText(*m_info);
 	const auto path         = GetPathText(*m_info);
 
@@ -180,6 +183,12 @@ void ConfigurationItem::Update() {
 		m_comment_edit->setText(m_info->game_comment);
 	}
 
+	if (reload_icon) {
+		const auto icon_data = GameContent::ReadFile(
+		    m_info->basedir, QStringLiteral("sce_sys/icon0.png"), GameContent::MaxImageSize);
+		QPixmap icon;
+		m_icon = !icon_data.isEmpty() && icon.loadFromData(icon_data) ? QIcon(icon) : QIcon {};
+	}
 	UpdateIcon();
 	UpdateStatusIndicator();
 }
@@ -235,9 +244,8 @@ void ConfigurationItem::SetCompatibilityEditable(bool editable) {
 }
 
 void ConfigurationItem::UpdateIcon() {
-	const QString icon_file = QDir(m_info->basedir).filePath(QStringLiteral("sce_sys/icon0.png"));
-	if (QFileInfo::exists(icon_file)) {
-		setIcon(NameColumn, QIcon(icon_file));
+	if (!m_icon.isNull()) {
+		setIcon(NameColumn, m_icon);
 		return;
 	}
 

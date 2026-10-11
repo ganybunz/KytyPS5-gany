@@ -285,17 +285,25 @@ open _Build/macos/install/KytyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
-from the game list.
+folders recursively for game directories containing `eboot.bin`, and for ZArchive (`.zar`) game
+dumps and raw exFAT volume images (`.exfat`) whose root contains `eboot.bin`. Select a detected game
+and run it from the game list. Archives and images are mounted read-only and streamed directly; they
+do not need to be extracted first. An `.exfat` file must be a bare volume image, starting at the
+exFAT boot sector rather than at a partition table.
 
-The emulator can also be started directly with a legally obtained game directory or ELF file:
+The emulator can also be started directly with a legally obtained game directory, ELF file,
+ZArchive dump, or exFAT image:
 
 ```powershell
 .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
+.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.exfat"
 ```
 
 ```bash
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.exfat"
 ```
 
 On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no

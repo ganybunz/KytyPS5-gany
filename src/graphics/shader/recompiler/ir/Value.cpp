@@ -260,8 +260,12 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	EXIT_IF(ValidationEnabled() && std::ranges::find(used->uses, Use {this, operand}) != used->uses.end());
-	used->uses.push_back({this, operand});
+        if (ValidationEnabled()) {
+                for (const auto& use : used->uses) {
+                        EXIT_IF(use.user == this && use.operand == operand);
+                }
+        }
+        used->uses.push_back({this, operand});
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {

@@ -1,0 +1,1584 @@
+From 5bed7aa4274ef6f96f78b06cbbe868521b0de1fd Mon Sep 17 00:00:00 2001
+From: yarldron <yarldron@gmail.com>
+Date: Sun, 11 Oct 2026 00:25:58 -0500
+Subject: [PATCH 3/3] Add raw exFAT volume image support
+
+New Common::ExFatVolume reads a bare exFAT image (boot sector at offset 0) in
+place, with lazy directory parsing, the volume's own up-case table, NoFatChain
+and FAT-chained files, and ValidDataLength zero-fill. It plugs into the archive
+layer as the ".exfat" format, so --game, the launcher scan and the existing
+read-only /app0 mount work with .exfat files like they do with .zar.
+
+Adds tests/ExFatTests.cpp (exfat_tests) with a spec-based image writer.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012RzP2oeUuwvkJZN1MqG14S
+---
+ CMakeLists.txt         |   8 +
+ README.md              |  14 +-
+ src/common/archive.cpp |  39 ++-
+ src/common/exfat.cpp   | 635 +++++++++++++++++++++++++++++++++++++
+ src/common/exfat.h     |  60 ++++
+ src/main.cpp           |   4 +-
+ tests/ExFatTests.cpp   | 695 +++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 1447 insertions(+), 8 deletions(-)
+ create mode 100644 src/common/exfat.cpp
+ create mode 100644 src/common/exfat.h
+ create mode 100644 tests/ExFatTests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b88b0d88..e4bdff29 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -521,6 +521,12 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
+ target_link_libraries(archive_file_tests common ZArchive::zarchive)
+ target_include_directories(archive_file_tests PRIVATE ${inc_headers})
+ 
++add_executable(exfat_tests EXCLUDE_FROM_ALL
++	"${KYTY_TESTS_DIR}/ExFatTests.cpp"
++)
++target_link_libraries(exfat_tests common)
++target_include_directories(exfat_tests PRIVATE ${inc_headers})
++
+ add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp")
+ target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
+ target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
+@@ -682,6 +688,7 @@ if(BUILD_TESTING)
+ 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
+ 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
+ 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
++	add_test(NAME exfat COMMAND $<TARGET_FILE:exfat_tests>)
+ 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
+ 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+ 	add_test(NAME native_region_epoch COMMAND $<TARGET_FILE:native_region_epoch_tests>)
+@@ -762,6 +769,7 @@ if(BUILD_TESTING)
+ 		page_protection_table_tests
+ 		atrac9_initialization_tests
+ 		archive_file_tests
++		exfat_tests
+ 		avplayer_file_tests
+ 		bit_array_tests
+ 		native_region_epoch_tests
+diff --git a/README.md b/README.md
+index 242cbd65..22807829 100644
+--- a/README.md
++++ b/README.md
+@@ -285,21 +285,25 @@ open _Build/macos/install/KytyPS5.app  # or double-click in Finder
+ ```
+ 
+ On first launch, add one or more game folders in the global settings. The launcher searches those
+-folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
+-whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
+-ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
++folders recursively for game directories containing `eboot.bin`, and for ZArchive (`.zar`) game
++dumps and raw exFAT volume images (`.exfat`) whose root contains `eboot.bin`. Select a detected game
++and run it from the game list. Archives and images are mounted read-only and streamed directly; they
++do not need to be extracted first. An `.exfat` file must be a bare volume image, starting at the
++exFAT boot sector rather than at a partition table.
+ 
+-The emulator can also be started directly with a legally obtained game directory, ELF file, or
+-ZArchive dump:
++The emulator can also be started directly with a legally obtained game directory, ELF file,
++ZArchive dump, or exFAT image:
+ 
+ ```powershell
+ .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+ .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
++.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.exfat"
+ ```
+ 
+ ```bash
+ ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
+ ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
++./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.exfat"
+ ```
+ 
+ On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
+diff --git a/src/common/archive.cpp b/src/common/archive.cpp
+index 4d6f56a8..65630a5e 100644
+--- a/src/common/archive.cpp
++++ b/src/common/archive.cpp
+@@ -1,5 +1,6 @@
+ #include "common/archive.h"
+ 
++#include "common/exfat.h"
+ #include "common/stringUtils.h"
+ 
+ #include <algorithm>
+@@ -87,12 +88,48 @@ std::shared_ptr<ArchiveReader> OpenZArchive(const std::filesystem::path& path) {
+ 	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader)) : nullptr;
+ }
+ 
++// Raw exFAT volume images. ExFatVolume parses directories lazily and serializes its own I/O.
++class ExFatReaderBackend final: public ArchiveReader {
++public:
++	explicit ExFatReaderBackend(std::unique_ptr<ExFatVolume> volume): m_volume(std::move(volume)) {}
++
++	std::optional<Entry> Find(std::string_view member) override {
++		const auto entry = m_volume->Find(member);
++		if (!entry) {
++			return {};
++		}
++		return Entry {entry->id, entry->size, entry->is_file};
++	}
++
++	std::vector<File::DirEntry> List(std::string_view member) override {
++		auto                        items = m_volume->List(member);
++		std::vector<File::DirEntry> result;
++		result.reserve(items.size());
++		for (auto& item: items) {
++			result.push_back({std::move(item.name), item.is_file});
++		}
++		return result;
++	}
++
++	uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) override {
++		return m_volume->Read(id, offset, size, data);
++	}
++
++private:
++	std::unique_ptr<ExFatVolume> m_volume;
++};
++
++std::shared_ptr<ArchiveReader> OpenExFat(const std::filesystem::path& path) {
++	auto volume = ExFatVolume::Open(path);
++	return volume ? std::make_shared<ExFatReaderBackend>(std::move(volume)) : nullptr;
++}
++
+ struct ArchiveFormat {
+ 	std::string_view extension;
+ 	std::shared_ptr<ArchiveReader> (*open)(const std::filesystem::path&);
+ };
+ 
+-constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}};
++constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}, {".exfat", OpenExFat}};
+ using NativeView                  = std::basic_string_view<std::filesystem::path::value_type>;
+ 
+ const ArchiveFormat* FindFormat(NativeView path) {
+diff --git a/src/common/exfat.cpp b/src/common/exfat.cpp
+new file mode 100644
+index 00000000..c5e70fcb
+--- /dev/null
++++ b/src/common/exfat.cpp
+@@ -0,0 +1,635 @@
++#include "common/exfat.h"
++
++#include <algorithm>
++#include <cstring>
++#include <deque>
++#include <fstream>
++#include <ios>
++#include <mutex>
++#include <unordered_map>
++#include <utility>
++
++namespace Common {
++
++namespace {
++
++constexpr size_t   EntrySize         = 32;
++constexpr uint32_t BootSectorSize    = 512;
++constexpr uint32_t FatCacheBlockSize = 4096;
++constexpr uint32_t EndOfChainMin     = 0xFFFFFFF8u;
++constexpr uint32_t MaxClusterCount   = 0xFFFFFFF5u;
++constexpr uint64_t MaxDirectoryBytes = 256ull << 20u; // exFAT limit for one directory
++constexpr uint64_t MaxUpcaseBytes    = 2ull * 65536;
++constexpr size_t   MaxNodes          = 1u << 24u;
++
++// Directory entry types.
++constexpr uint8_t EntryEndOfDirectory = 0x00;
++constexpr uint8_t EntryUpcaseTable    = 0x82;
++constexpr uint8_t EntryFile           = 0x85;
++constexpr uint8_t EntryStreamExt      = 0xC0;
++constexpr uint8_t EntryFileName       = 0xC1;
++
++constexpr uint16_t AttributeDirectory = 0x0010;
++constexpr uint8_t  FlagNoFatChain     = 0x02;
++
++uint16_t Le16(const uint8_t* p) {
++	return static_cast<uint16_t>(p[0] | (p[1] << 8u));
++}
++
++uint32_t Le32(const uint8_t* p) {
++	return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8u) |
++	       (static_cast<uint32_t>(p[2]) << 16u) | (static_cast<uint32_t>(p[3]) << 24u);
++}
++
++uint64_t Le64(const uint8_t* p) {
++	return static_cast<uint64_t>(Le32(p)) | (static_cast<uint64_t>(Le32(p + 4)) << 32u);
++}
++
++void AppendUtf8(std::string& out, uint32_t c) {
++	if (c < 0x80) {
++		out += static_cast<char>(c);
++	} else if (c < 0x800) {
++		out += static_cast<char>(0xC0 | (c >> 6u));
++		out += static_cast<char>(0x80 | (c & 0x3Fu));
++	} else if (c < 0x10000) {
++		out += static_cast<char>(0xE0 | (c >> 12u));
++		out += static_cast<char>(0x80 | ((c >> 6u) & 0x3Fu));
++		out += static_cast<char>(0x80 | (c & 0x3Fu));
++	} else {
++		out += static_cast<char>(0xF0 | (c >> 18u));
++		out += static_cast<char>(0x80 | ((c >> 12u) & 0x3Fu));
++		out += static_cast<char>(0x80 | ((c >> 6u) & 0x3Fu));
++		out += static_cast<char>(0x80 | (c & 0x3Fu));
++	}
++}
++
++std::string Utf16ToUtf8(std::u16string_view in) {
++	std::string out;
++	out.reserve(in.size());
++	for (size_t i = 0; i < in.size(); ++i) {
++		uint32_t c = in[i];
++		if (c >= 0xD800 && c < 0xDC00 && i + 1 < in.size() && in[i + 1] >= 0xDC00 &&
++		    in[i + 1] < 0xE000) {
++			c = 0x10000u + ((c - 0xD800u) << 10u) + (static_cast<uint32_t>(in[i + 1]) - 0xDC00u);
++			++i;
++		} else if (c >= 0xD800 && c < 0xE000) {
++			c = 0xFFFD; // unpaired surrogate
++		}
++		AppendUtf8(out, c);
++	}
++	return out;
++}
++
++std::optional<std::u16string> Utf8ToUtf16(std::string_view in) {
++	std::u16string out;
++	out.reserve(in.size());
++	for (size_t i = 0; i < in.size();) {
++		const auto lead = static_cast<uint8_t>(in[i]);
++		uint32_t   c    = 0;
++		size_t     len  = 0;
++		if (lead < 0x80) {
++			c   = lead;
++			len = 1;
++		} else if ((lead & 0xE0u) == 0xC0u) {
++			c   = lead & 0x1Fu;
++			len = 2;
++		} else if ((lead & 0xF0u) == 0xE0u) {
++			c   = lead & 0x0Fu;
++			len = 3;
++		} else if ((lead & 0xF8u) == 0xF0u) {
++			c   = lead & 0x07u;
++			len = 4;
++		} else {
++			return std::nullopt;
++		}
++		if (i + len > in.size()) {
++			return std::nullopt;
++		}
++		for (size_t k = 1; k < len; ++k) {
++			const auto next = static_cast<uint8_t>(in[i + k]);
++			if ((next & 0xC0u) != 0x80u) {
++				return std::nullopt;
++			}
++			c = (c << 6u) | (next & 0x3Fu);
++		}
++		static constexpr uint32_t MinForLength[] = {0, 0, 0x80, 0x800, 0x10000};
++		if (c < MinForLength[len] || c > 0x10FFFF || (c >= 0xD800 && c < 0xE000)) {
++			return std::nullopt;
++		}
++		if (c >= 0x10000) {
++			c -= 0x10000;
++			out += static_cast<char16_t>(0xD800 + (c >> 10u));
++			out += static_cast<char16_t>(0xDC00 + (c & 0x3FFu));
++		} else {
++			out += static_cast<char16_t>(c);
++		}
++		i += len;
++	}
++	return out;
++}
++
++// A run of consecutive clusters. `first_index` is the position of the run's first cluster within
++// the file, so a file offset maps to a run with a binary search.
++struct Run {
++	uint64_t first_index;
++	uint32_t start;
++	uint32_t count;
++};
++
++struct DirData {
++	bool                                         loaded = false;
++	std::vector<uint32_t>                        children;
++	std::unordered_map<std::u16string, uint32_t> index; // case-folded name -> node
++};
++
++struct Node {
++	std::string              name;
++	uint64_t                 data_length   = 0;
++	uint64_t                 valid_length  = 0;
++	uint32_t                 first_cluster = 0;
++	bool                     is_dir        = false;
++	bool                     no_fat_chain  = false;
++	bool                     runs_loaded   = false;
++	std::vector<Run>         runs;
++	std::unique_ptr<DirData> dir;
++};
++
++} // namespace
++
++struct ExFatVolume::Private {
++	std::mutex    mutex;
++	std::ifstream file;
++	uint64_t      image_size        = 0;
++	uint64_t      bytes_per_cluster = 0;
++	uint64_t      fat_offset        = 0; // bytes
++	uint64_t      heap_offset       = 0; // bytes
++	uint32_t      cluster_count     = 0;
++	uint32_t      root_cluster      = 0;
++
++	std::vector<char16_t> upcase; // empty: ASCII-only folding
++	std::deque<Node>      nodes;  // stable references; index 0 is the root directory
++
++	uint64_t             fat_cache_block = UINT64_MAX;
++	std::vector<uint8_t> fat_cache;
++
++	uint64_t ReadAt(uint64_t offset, void* data, uint64_t size) {
++		if (offset >= image_size || size == 0) {
++			return 0;
++		}
++		size = std::min(size, image_size - offset);
++		file.clear();
++		file.seekg(static_cast<std::streamoff>(offset));
++		if (!file) {
++			return 0;
++		}
++		file.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
++		return static_cast<uint64_t>(file.gcount());
++	}
++
++	std::optional<uint32_t> FatNext(uint32_t cluster) {
++		const uint64_t offset = fat_offset + 4ull * cluster;
++		const uint64_t block  = offset / FatCacheBlockSize;
++		if (block != fat_cache_block) {
++			fat_cache.assign(FatCacheBlockSize, 0);
++			if (ReadAt(block * FatCacheBlockSize, fat_cache.data(), FatCacheBlockSize) == 0) {
++				return std::nullopt;
++			}
++			fat_cache_block = block;
++		}
++		return Le32(fat_cache.data() + (offset % FatCacheBlockSize));
++	}
++
++	bool ValidCluster(uint32_t cluster) const {
++		return cluster >= 2 && cluster - 2 < cluster_count;
++	}
++
++	// Builds the cluster runs of a chain. With a known length the chain must supply every
++	// cluster of it; with an unknown length (the root directory) it is followed to its end.
++	bool BuildRuns(uint32_t first, bool no_fat_chain, bool length_known, uint64_t length,
++	               std::vector<Run>& runs) {
++		runs.clear();
++		if (length_known && length == 0) {
++			return true;
++		}
++		if (!ValidCluster(first)) {
++			return false;
++		}
++		const uint64_t needed =
++		    length_known ? (length + bytes_per_cluster - 1) / bytes_per_cluster : UINT64_MAX;
++		if (no_fat_chain) {
++			if (!length_known || needed > cluster_count ||
++			    uint64_t(first) + needed - 1 > uint64_t(cluster_count) + 1) {
++				return false;
++			}
++			runs.push_back({0, first, static_cast<uint32_t>(needed)});
++			return true;
++		}
++		uint64_t total   = 0;
++		uint32_t current = first;
++		while (true) {
++			if (!ValidCluster(current) || total >= cluster_count) {
++				return false; // bad cluster, out of range, or a loop
++			}
++			if (!runs.empty() && runs.back().start + runs.back().count == current) {
++				++runs.back().count;
++			} else {
++				runs.push_back({total, current, 1});
++			}
++			++total;
++			if (total >= needed) {
++				break;
++			}
++			const auto next = FatNext(current);
++			if (!next) {
++				return false;
++			}
++			if (*next >= EndOfChainMin) {
++				break;
++			}
++			current = *next;
++		}
++		return !length_known || total >= needed;
++	}
++
++	uint64_t ReadRuns(const std::vector<Run>& runs, uint64_t offset, uint8_t* out, uint64_t size) {
++		uint64_t done = 0;
++		while (done < size) {
++			const uint64_t position = offset + done;
++			const uint64_t index    = position / bytes_per_cluster;
++			auto           it       = std::upper_bound(runs.begin(), runs.end(), index,
++			                                           [](uint64_t v, const Run& r) { return v < r.first_index; });
++			if (it == runs.begin()) {
++				break;
++			}
++			--it;
++			const uint64_t in_run = index - it->first_index;
++			if (in_run >= it->count) {
++				break;
++			}
++			const uint64_t run_end = (it->first_index + it->count) * bytes_per_cluster;
++			const uint64_t chunk   = std::min(size - done, run_end - position);
++			const uint64_t disk    = heap_offset +
++			                      (uint64_t(it->start - 2) + in_run) * bytes_per_cluster +
++			                      position % bytes_per_cluster;
++			const uint64_t got = ReadAt(disk, out + done, chunk);
++			done += got;
++			if (got < chunk) {
++				break;
++			}
++		}
++		return done;
++	}
++
++	std::u16string Fold(std::u16string_view name) const {
++		std::u16string out(name);
++		for (auto& c: out) {
++			if (!upcase.empty()) {
++				c = upcase[static_cast<uint16_t>(c)];
++			} else if (c >= u'a' && c <= u'z') {
++				c = static_cast<char16_t>(c - (u'a' - u'A'));
++			}
++		}
++		return out;
++	}
++
++	// The up-case table is stored compressed: 0xFFFF followed by N means "the next N characters
++	// map to themselves".
++	void LoadUpcase(const std::vector<uint8_t>& directory) {
++		for (size_t pos = 0; pos + EntrySize <= directory.size(); pos += EntrySize) {
++			const uint8_t* e = &directory[pos];
++			if (e[0] == EntryEndOfDirectory) {
++				return;
++			}
++			if (e[0] != EntryUpcaseTable) {
++				continue;
++			}
++			const uint32_t first  = Le32(e + 20);
++			const uint64_t length = Le64(e + 24);
++			if (length == 0 || length > MaxUpcaseBytes || length % 2 != 0) {
++				return;
++			}
++			std::vector<Run>     runs;
++			std::vector<uint8_t> raw(length);
++			if (!BuildRuns(first, false, true, length, runs) ||
++			    ReadRuns(runs, 0, raw.data(), length) != length) {
++				return;
++			}
++			std::vector<char16_t> table(65536);
++			for (size_t i = 0; i < table.size(); ++i) {
++				table[i] = static_cast<char16_t>(i);
++			}
++			size_t character = 0;
++			for (size_t i = 0; i + 2 <= raw.size() && character < table.size();) {
++				const uint16_t value = Le16(&raw[i]);
++				i += 2;
++				if (value == 0xFFFF && i + 2 <= raw.size()) {
++					character += Le16(&raw[i]);
++					i += 2;
++				} else {
++					table[character++] = static_cast<char16_t>(value);
++				}
++			}
++			if (table[u'a'] == u'A' && table[u'z'] == u'Z') { // sanity check
++				upcase = std::move(table);
++			}
++			return;
++		}
++	}
++
++	void AddChild(uint32_t parent, Node&& node, std::u16string_view name16) {
++		if (nodes.size() >= MaxNodes) {
++			return;
++		}
++		const auto index  = static_cast<uint32_t>(nodes.size());
++		auto       folded = Fold(name16);
++		auto&      dir    = *nodes[parent].dir;
++		if (dir.index.emplace(std::move(folded), index).second) {
++			dir.children.push_back(index);
++			nodes.push_back(std::move(node));
++		}
++	}
++
++	void ParseDirectory(uint32_t parent, const std::vector<uint8_t>& buf) {
++		for (size_t pos = 0; pos + EntrySize <= buf.size(); pos += EntrySize) {
++			const uint8_t* e = &buf[pos];
++			if (e[0] == EntryEndOfDirectory) {
++				break;
++			}
++			if (e[0] != EntryFile) {
++				continue;
++			}
++			const size_t secondary = e[1];
++			if (secondary < 2) {
++				continue;
++			}
++			const size_t set_bytes = (1 + secondary) * EntrySize;
++			if (pos + set_bytes > buf.size()) {
++				break;
++			}
++			// Whatever happens below, the whole set is consumed.
++			const size_t last = pos + set_bytes - EntrySize;
++
++			uint16_t checksum = 0;
++			for (size_t i = 0; i < set_bytes; ++i) {
++				if (i == 2 || i == 3) {
++					continue;
++				}
++				checksum = static_cast<uint16_t>(((checksum << 15u) | (checksum >> 1u)) + e[i]);
++			}
++			const uint8_t* s = e + EntrySize;
++			if (checksum != Le16(e + 2) || s[0] != EntryStreamExt) {
++				pos = last;
++				continue;
++			}
++
++			const uint8_t  flags       = s[1];
++			const size_t   name_length = s[3];
++			const uint64_t valid       = Le64(s + 8);
++			const uint32_t first       = Le32(s + 20);
++			const uint64_t length      = Le64(s + 24);
++			const bool     is_dir      = (Le16(e + 4) & AttributeDirectory) != 0;
++
++			const size_t name_entries = (name_length + 14) / 15;
++			if (name_length == 0 || name_entries > secondary - 1) {
++				pos = last;
++				continue;
++			}
++			std::u16string name;
++			bool           name_ok = true;
++			for (size_t k = 0; k < name_entries && name_ok; ++k) {
++				const uint8_t* ne = s + EntrySize * (1 + k);
++				if (ne[0] != EntryFileName) {
++					name_ok = false;
++					break;
++				}
++				for (size_t c = 0; c < 15 && name.size() < name_length; ++c) {
++					name += static_cast<char16_t>(Le16(ne + 2 + 2 * c));
++				}
++			}
++			pos = last;
++			if (!name_ok || name.find(u'/') != std::u16string::npos ||
++			    name.find(u'\0') != std::u16string::npos) {
++				continue;
++			}
++			if (length > 0 && !ValidCluster(first)) {
++				continue;
++			}
++			if (is_dir && length > MaxDirectoryBytes) {
++				continue;
++			}
++
++			Node node;
++			node.name          = Utf16ToUtf8(name);
++			node.data_length   = length;
++			node.valid_length  = std::min(valid, length);
++			node.first_cluster = first;
++			node.is_dir        = is_dir;
++			node.no_fat_chain  = (flags & FlagNoFatChain) != 0;
++			if (is_dir) {
++				node.dir = std::make_unique<DirData>();
++			}
++			AddChild(parent, std::move(node), name);
++		}
++	}
++
++	bool LoadDirectory(uint32_t index) {
++		Node& node = nodes[index];
++		if (node.dir->loaded) {
++			return true;
++		}
++		const bool       root = index == 0;
++		std::vector<Run> runs;
++		if (!BuildRuns(node.first_cluster, node.no_fat_chain, !root, node.data_length, runs)) {
++			return false;
++		}
++		uint64_t bytes = node.data_length;
++		if (root) {
++			bytes = runs.empty()
++			            ? 0
++			            : (runs.back().first_index + runs.back().count) * bytes_per_cluster;
++		}
++		if (bytes > MaxDirectoryBytes) {
++			return false;
++		}
++		std::vector<uint8_t> buf(bytes);
++		const uint64_t       got = ReadRuns(runs, 0, buf.data(), bytes);
++		if (got == 0 && bytes != 0) {
++			return false;
++		}
++		buf.resize(got); // a truncated image still yields the entries that are present
++		if (root) {
++			LoadUpcase(buf);
++		}
++		ParseDirectory(index, buf);
++		node.dir->loaded = true;
++		return true;
++	}
++
++	std::optional<uint32_t> Lookup(std::string_view member) {
++		uint32_t current = 0;
++		size_t   pos     = 0;
++		while (pos < member.size()) {
++			const auto separator = member.find('/', pos);
++			const auto component =
++			    member.substr(pos, separator == std::string_view::npos ? std::string_view::npos
++			                                                           : separator - pos);
++			pos = separator == std::string_view::npos ? member.size() : separator + 1;
++			if (component.empty() || component == ".") {
++				continue;
++			}
++			if (!nodes[current].is_dir || !LoadDirectory(current)) {
++				return std::nullopt;
++			}
++			const auto name = Utf8ToUtf16(component);
++			if (!name) {
++				return std::nullopt;
++			}
++			const auto& index = nodes[current].dir->index;
++			const auto  it    = index.find(Fold(*name));
++			if (it == index.end()) {
++				return std::nullopt;
++			}
++			current = it->second;
++		}
++		return current;
++	}
++};
++
++ExFatVolume::ExFatVolume(std::unique_ptr<Private> p): m_p(std::move(p)) {}
++ExFatVolume::~ExFatVolume() = default;
++
++std::unique_ptr<ExFatVolume> ExFatVolume::Open(const std::filesystem::path& path) {
++	auto p = std::make_unique<Private>();
++	p->file.open(path, std::ios::binary);
++	if (!p->file) {
++		return nullptr;
++	}
++	p->file.seekg(0, std::ios::end);
++	const auto end = p->file.tellg();
++	if (end < static_cast<std::streamoff>(BootSectorSize)) {
++		return nullptr;
++	}
++	p->image_size = static_cast<uint64_t>(end);
++
++	uint8_t boot[BootSectorSize];
++	if (p->ReadAt(0, boot, sizeof(boot)) != sizeof(boot)) {
++		return nullptr;
++	}
++	static constexpr uint8_t Signature[8] = {'E', 'X', 'F', 'A', 'T', ' ', ' ', ' '};
++	if (std::memcmp(boot + 3, Signature, sizeof(Signature)) != 0 || boot[510] != 0x55 ||
++	    boot[511] != 0xAA) {
++		return nullptr;
++	}
++	for (size_t i = 11; i < 64; ++i) {
++		if (boot[i] != 0) {
++			return nullptr; // MustBeZero
++		}
++	}
++
++	const uint32_t fat_offset_sectors  = Le32(boot + 80);
++	const uint32_t fat_length_sectors  = Le32(boot + 84);
++	const uint32_t heap_offset_sectors = Le32(boot + 88);
++	const uint32_t cluster_count       = Le32(boot + 92);
++	const uint32_t root_cluster        = Le32(boot + 96);
++	const uint16_t volume_flags        = Le16(boot + 106);
++	const uint8_t  sector_shift        = boot[108];
++	const uint8_t  cluster_shift       = boot[109];
++	const uint8_t  fat_count           = boot[110];
++
++	if (sector_shift < 9 || sector_shift > 12 || cluster_shift > 25 - sector_shift ||
++	    (fat_count != 1 && fat_count != 2) || cluster_count == 0 ||
++	    cluster_count > MaxClusterCount) {
++		return nullptr;
++	}
++	const uint64_t sector_size = 1ull << sector_shift;
++	const uint64_t fat_bytes   = fat_length_sectors * sector_size;
++	if (fat_offset_sectors == 0 || fat_bytes < (uint64_t(cluster_count) + 2) * 4 ||
++	    heap_offset_sectors <
++	        uint64_t(fat_offset_sectors) + uint64_t(fat_length_sectors) * fat_count) {
++		return nullptr;
++	}
++
++	p->bytes_per_cluster = 1ull << (sector_shift + cluster_shift);
++	p->fat_offset        = fat_offset_sectors * sector_size;
++	p->heap_offset       = heap_offset_sectors * sector_size;
++	p->cluster_count     = cluster_count;
++	p->root_cluster      = root_cluster;
++	if (fat_count == 2 && (volume_flags & 1u) != 0) {
++		p->fat_offset += fat_bytes; // TexFAT: the second FAT is the active one
++	}
++	if (p->heap_offset >= p->image_size || !p->ValidCluster(root_cluster)) {
++		return nullptr;
++	}
++
++	Node root;
++	root.is_dir        = true;
++	root.first_cluster = root_cluster;
++	root.dir           = std::make_unique<DirData>();
++	p->nodes.push_back(std::move(root));
++	if (!p->LoadDirectory(0)) {
++		return nullptr;
++	}
++	return std::unique_ptr<ExFatVolume>(new ExFatVolume(std::move(p)));
++}
++
++std::optional<ExFatVolume::Entry> ExFatVolume::Find(std::string_view member) {
++	std::lock_guard lock(m_p->mutex);
++	const auto      index = m_p->Lookup(member);
++	if (!index) {
++		return std::nullopt;
++	}
++	const Node& node = m_p->nodes[*index];
++	return Entry {*index, node.is_dir ? 0 : node.data_length, !node.is_dir};
++}
++
++std::vector<ExFatVolume::DirItem> ExFatVolume::List(std::string_view member) {
++	std::lock_guard lock(m_p->mutex);
++	const auto      index = m_p->Lookup(member);
++	if (!index || !m_p->nodes[*index].is_dir || !m_p->LoadDirectory(*index)) {
++		return {};
++	}
++	std::vector<DirItem> result;
++	const auto&          children = m_p->nodes[*index].dir->children;
++	result.reserve(children.size());
++	for (const auto child: children) {
++		const Node& node = m_p->nodes[child];
++		result.push_back({node.name, !node.is_dir});
++	}
++	return result;
++}
++
++uint64_t ExFatVolume::Read(uint64_t id, uint64_t offset, uint64_t size, void* data) {
++	std::lock_guard lock(m_p->mutex);
++	auto&           p = *m_p;
++	if (id >= p.nodes.size() || data == nullptr) {
++		return 0;
++	}
++	Node& node = p.nodes[id];
++	if (node.is_dir || offset >= node.data_length || size == 0) {
++		return 0;
++	}
++	size = std::min(size, node.data_length - offset);
++	if (!node.runs_loaded) {
++		if (!p.BuildRuns(node.first_cluster, node.no_fat_chain, true, node.data_length,
++		                 node.runs)) {
++			return 0;
++		}
++		node.runs_loaded = true;
++	}
++	auto*    out  = static_cast<uint8_t*>(data);
++	uint64_t done = 0;
++	if (offset < node.valid_length) {
++		const uint64_t wanted = std::min(size, node.valid_length - offset);
++		done                  = p.ReadRuns(node.runs, offset, out, wanted);
++		if (done < wanted) {
++			return done;
++		}
++	}
++	// Bytes between ValidDataLength and DataLength read as zero.
++	if (done < size) {
++		std::memset(out + done, 0, size - done);
++	}
++	return size;
++}
++
++} // namespace Common
+diff --git a/src/common/exfat.h b/src/common/exfat.h
+new file mode 100644
+index 00000000..068b469f
+--- /dev/null
++++ b/src/common/exfat.h
+@@ -0,0 +1,60 @@
++#ifndef KYTY_COMMON_EXFAT_H_
++#define KYTY_COMMON_EXFAT_H_
++
++#include "common/common.h"
++
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace Common {
++
++// Read-only reader for a raw exFAT volume image (the file starts at the boot sector; there is no
++// partition table in front of it). Directories are parsed lazily, so opening an image and
++// probing for a single file only reads the boot sector, the root directory and the directories on
++// the path to that file.
++//
++// Member paths are UTF-8 and use '/' separators without a leading slash; an empty path is the
++// root directory. Lookups are case-insensitive, using the volume's own up-case table.
++//
++// Every method is safe to call from multiple threads.
++class ExFatVolume {
++public:
++	struct Entry {
++		uint64_t id;
++		uint64_t size;
++		bool     is_file;
++	};
++
++	struct DirItem {
++		std::string name;
++		bool        is_file;
++	};
++
++	~ExFatVolume();
++
++	// Returns null if the file cannot be opened or is not a plausible exFAT volume.
++	[[nodiscard]] static std::unique_ptr<ExFatVolume> Open(const std::filesystem::path& path);
++
++	[[nodiscard]] std::optional<Entry> Find(std::string_view member);
++	[[nodiscard]] std::vector<DirItem> List(std::string_view member);
++
++	// Reads from a file entry returned by Find(). Returns the number of bytes copied, which is
++	// smaller than `size` only at the end of the file or if the image is truncated or damaged.
++	[[nodiscard]] uint64_t Read(uint64_t id, uint64_t offset, uint64_t size, void* data);
++
++	KYTY_CLASS_NO_COPY(ExFatVolume);
++
++private:
++	struct Private;
++	explicit ExFatVolume(std::unique_ptr<Private> p);
++	std::unique_ptr<Private> m_p;
++};
++
++} // namespace Common
++
++#endif /* KYTY_COMMON_EXFAT_H_ */
+diff --git a/src/main.cpp b/src/main.cpp
+index cd4c457b..b11783e3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -44,9 +44,9 @@ static std::string GetBuildString() {
+ 
+ static void PrintUsage() {
+ 	::printf("%s\n", GetBuildString().c_str());
+-	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
++	::printf("kyty_emulator --game <dir|elf|zar|exfat> [options]\n\n");
+ 	::printf("Options:\n");
+-	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
++	::printf("  --game <dir|elf|zar|exfat>           Game directory, ELF, ZArchive, or exFAT image to load.\n");
+ 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+ 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
+ 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
+diff --git a/tests/ExFatTests.cpp b/tests/ExFatTests.cpp
+new file mode 100644
+index 00000000..cdd91c2d
+--- /dev/null
++++ b/tests/ExFatTests.cpp
+@@ -0,0 +1,695 @@
++#include "common/archive.h"
++#include "common/exfat.h"
++#include "common/file.h"
++#include "common/stringUtils.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <set>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++void Check(bool value, const char *text) {
++  if (!value) {
++    std::fprintf(stderr, "ExFatTests: failed: %s\n", text);
++    std::abort();
++  }
++}
++
++class TempDirectory {
++public:
++  TempDirectory() {
++    const auto unique =
++        std::chrono::steady_clock::now().time_since_epoch().count();
++    m_path = std::filesystem::temp_directory_path() /
++             ("kyty_exfat_test_" + std::to_string(unique));
++    Check(std::filesystem::create_directories(m_path),
++          "create temporary directory");
++  }
++  ~TempDirectory() {
++    std::error_code error;
++    std::filesystem::remove_all(m_path, error);
++  }
++  [[nodiscard]] const std::filesystem::path &Path() const { return m_path; }
++  KYTY_CLASS_NO_COPY(TempDirectory);
++
++private:
++  std::filesystem::path m_path;
++};
++
++// ---------------------------------------------------------------------------
++// A small exFAT image writer, written from the exFAT specification. Images it
++// produces are accepted by fsck.exfat (exfatprogs). It supports exactly what
++// the tests need: directories spanning several clusters, contiguous files
++// (NoFatChain), interleaved/fragmented files (FAT chains), short valid data
++// length, deleted entries and corrupted entry-set checksums.
++// ---------------------------------------------------------------------------
++
++constexpr uint32_t SectorSize = 512;
++constexpr uint32_t SectorsPerCluster = 2;
++constexpr uint32_t ClusterSize = SectorSize * SectorsPerCluster;
++constexpr uint32_t ClusterCount = 2048;
++constexpr uint32_t FatOffsetSectors = 24;
++constexpr uint32_t FatLengthSectors = 24;
++constexpr uint32_t HeapOffsetSectors = 64;
++constexpr uint32_t UpcaseEntries = 256;
++
++struct Item {
++  std::string name; // UTF-8
++  std::vector<uint8_t> data;
++  uint64_t valid = UINT64_MAX; // default: all of `data`
++  int frag_group = 0; // files of one group in one directory interleave
++  bool corrupt_checksum = false;
++  bool deleted = false;
++  std::vector<uint32_t> clusters;
++};
++
++struct Dir {
++  std::string name;
++  std::vector<Dir> dirs;
++  std::vector<Item> files;
++  std::vector<uint32_t> clusters;
++};
++
++char16_t Upcase(char16_t c) {
++  if (c >= u'a' && c <= u'z') {
++    return static_cast<char16_t>(c - 32);
++  }
++  if (c >= 0xE0 && c <= 0xFE && c != 0xF7) {
++    return static_cast<char16_t>(c - 32);
++  }
++  if (c == 0xFF) {
++    return 0x178;
++  }
++  return c;
++}
++
++std::u16string ToUtf16(const std::string &utf8) {
++  std::u16string out;
++  for (size_t i = 0; i < utf8.size();) {
++    const auto lead = static_cast<uint8_t>(utf8[i]);
++    uint32_t c;
++    size_t len;
++    if (lead < 0x80) {
++      c = lead;
++      len = 1;
++    } else if ((lead & 0xE0) == 0xC0) {
++      c = lead & 0x1F;
++      len = 2;
++    } else if ((lead & 0xF0) == 0xE0) {
++      c = lead & 0x0F;
++      len = 3;
++    } else {
++      c = lead & 0x07;
++      len = 4;
++    }
++    for (size_t k = 1; k < len; ++k) {
++      c = (c << 6) | (static_cast<uint8_t>(utf8[i + k]) & 0x3F);
++    }
++    i += len;
++    if (c >= 0x10000) {
++      c -= 0x10000;
++      out += static_cast<char16_t>(0xD800 + (c >> 10));
++      out += static_cast<char16_t>(0xDC00 + (c & 0x3FF));
++    } else {
++      out += static_cast<char16_t>(c);
++    }
++  }
++  return out;
++}
++
++void Put16(std::vector<uint8_t> &v, size_t at, uint16_t x) {
++  v[at] = x & 0xFF;
++  v[at + 1] = x >> 8;
++}
++void Put32(std::vector<uint8_t> &v, size_t at, uint32_t x) {
++  for (int i = 0; i < 4; ++i) {
++    v[at + i] = (x >> (8 * i)) & 0xFF;
++  }
++}
++void Put64(std::vector<uint8_t> &v, size_t at, uint64_t x) {
++  for (int i = 0; i < 8; ++i) {
++    v[at + i] = (x >> (8 * i)) & 0xFF;
++  }
++}
++
++class ImageBuilder {
++public:
++  Dir root;
++
++  std::vector<uint8_t> Build() {
++    m_image.assign(
++        (uint64_t(HeapOffsetSectors) + uint64_t(ClusterCount) * SectorsPerCluster) * SectorSize, 0);
++    m_fat.assign(FatLengthSectors * SectorSize / 4, 0);
++    m_fat[0] = 0xFFFFFFF8;
++    m_fat[1] = 0xFFFFFFFF;
++    m_bitmap.assign((ClusterCount + 7) / 8, 0);
++
++    m_bitmap_clusters = AllocateChain(m_bitmap.size());
++    std::vector<uint8_t> upcase(UpcaseEntries * 2);
++    for (uint32_t i = 0; i < UpcaseEntries; ++i) {
++      Put16(upcase, i * 2, Upcase(static_cast<char16_t>(i)));
++    }
++    m_upcase_clusters = AllocateChain(upcase.size());
++    Allocate(root, true);
++    WriteClusters(m_bitmap_clusters, m_bitmap);
++    WriteClusters(m_upcase_clusters, upcase);
++    m_upcase_checksum = 0;
++    for (const auto b : upcase) {
++      m_upcase_checksum = ((m_upcase_checksum << 31) | (m_upcase_checksum >> 1)) + b;
++    }
++    Serialize(root, true);
++    WriteClusters(m_bitmap_clusters, m_bitmap); // allocation is final now
++    WriteBootRegion();
++    std::memcpy(m_image.data() + FatOffsetSectors * SectorSize, m_fat.data(),
++                m_fat.size() * 4);
++    return m_image;
++  }
++
++private:
++  std::vector<uint8_t> m_image;
++  std::vector<uint32_t> m_fat;
++  std::vector<uint8_t> m_bitmap;
++  std::vector<uint32_t> m_bitmap_clusters;
++  std::vector<uint32_t> m_upcase_clusters;
++  uint32_t m_upcase_checksum = 0;
++  uint32_t m_next = 2;
++
++  void Mark(uint32_t cluster) {
++    Check(cluster - 2 < ClusterCount, "image is large enough");
++    m_bitmap[(cluster - 2) / 8] |= static_cast<uint8_t>(1u << ((cluster - 2) % 8));
++  }
++
++  // Clusters taken from the allocator are always FAT-chained here; callers
++  // that want NoFatChain simply do not publish the chain into the FAT.
++  std::vector<uint32_t> AllocateRun(uint64_t bytes) {
++    std::vector<uint32_t> clusters;
++    for (uint64_t n = (bytes + ClusterSize - 1) / ClusterSize; n > 0; --n) {
++      Mark(m_next);
++      clusters.push_back(m_next++);
++    }
++    return clusters;
++  }
++
++  void LinkInFat(const std::vector<uint32_t> &clusters) {
++    for (size_t i = 0; i < clusters.size(); ++i) {
++      m_fat[clusters[i]] = i + 1 < clusters.size() ? clusters[i + 1] : 0xFFFFFFFF;
++    }
++  }
++
++  std::vector<uint32_t> AllocateChain(uint64_t bytes) {
++    auto clusters = AllocateRun(std::max<uint64_t>(bytes, 1));
++    LinkInFat(clusters);
++    return clusters;
++  }
++
++  static size_t NameEntries(const std::string &name) {
++    return (ToUtf16(name).size() + 14) / 15;
++  }
++
++  static size_t EntryBytes(const Dir &dir, bool is_root) {
++    size_t entries = is_root ? 2 : 0; // allocation bitmap + up-case table
++    for (const auto &d : dir.dirs) {
++      entries += 2 + NameEntries(d.name);
++    }
++    for (const auto &f : dir.files) {
++      entries += 2 + NameEntries(f.name);
++    }
++    return entries * 32;
++  }
++
++  void Allocate(Dir &dir, bool is_root) {
++    dir.clusters = AllocateChain(EntryBytes(dir, is_root));
++    // Interleaved groups first: every cluster of a group's files is dealt out
++    // round-robin from one region, so each file ends up as many short runs.
++    std::map<int, std::vector<Item *>> groups;
++    for (auto &f : dir.files) {
++      if (f.frag_group != 0) {
++        groups[f.frag_group].push_back(&f);
++      }
++    }
++    for (auto &[group, files] : groups) {
++      std::vector<size_t> need;
++      for (auto *f : files) {
++        need.push_back((f->data.size() + ClusterSize - 1) / ClusterSize);
++      }
++      for (bool more = true; more;) {
++        more = false;
++        for (size_t i = 0; i < files.size(); ++i) {
++          if (files[i]->clusters.size() < need[i]) {
++            Mark(m_next);
++            files[i]->clusters.push_back(m_next++);
++            more = true;
++          }
++        }
++      }
++      for (auto *f : files) {
++        LinkInFat(f->clusters);
++      }
++    }
++    for (auto &f : dir.files) {
++      if (f.frag_group == 0 && !f.data.empty()) {
++        f.clusters = AllocateRun(f.data.size()); // contiguous, NoFatChain
++      }
++    }
++    for (auto &d : dir.dirs) {
++      Allocate(d, false);
++    }
++  }
++
++  void WriteClusters(const std::vector<uint32_t> &clusters,
++                     const std::vector<uint8_t> &data) {
++    for (size_t i = 0; i < clusters.size(); ++i) {
++      const size_t at = (uint64_t(HeapOffsetSectors) * SectorSize) +
++                        uint64_t(clusters[i] - 2) * ClusterSize;
++      const size_t from = i * ClusterSize;
++      if (from < data.size()) {
++        std::memcpy(m_image.data() + at, data.data() + from,
++                    std::min<size_t>(ClusterSize, data.size() - from));
++      }
++    }
++  }
++
++  static uint16_t NameHash(const std::u16string &name) {
++    uint16_t hash = 0;
++    for (const auto c : name) {
++      const auto up = Upcase(c);
++      for (const uint8_t byte : {static_cast<uint8_t>(up & 0xFF), static_cast<uint8_t>(up >> 8)}) {
++        hash = static_cast<uint16_t>(((hash << 15) | (hash >> 1)) + byte);
++      }
++    }
++    return hash;
++  }
++
++  static void AppendSet(std::vector<uint8_t> &out, const std::string &utf8,
++                        bool is_dir, uint8_t flags, uint64_t valid,
++                        uint64_t length, uint32_t first, bool corrupt,
++                        bool deleted) {
++    const auto name = ToUtf16(utf8);
++    const size_t name_entries = (name.size() + 14) / 15;
++    std::vector<uint8_t> set((2 + name_entries) * 32, 0);
++    set[0] = 0x85;
++    set[1] = static_cast<uint8_t>(1 + name_entries);
++    Put16(set, 4, is_dir ? 0x10 : 0x20);
++    for (const size_t at : {8, 12, 16}) { // create, modify, access: 2024-01-01
++      Put32(set, at, (44u << 25) | (1u << 21) | (1u << 16));
++    }
++    set[32] = 0xC0;
++    set[33] = flags;
++    set[35] = static_cast<uint8_t>(name.size());
++    Put16(set, 36, NameHash(name));
++    Put64(set, 40, valid);
++    Put32(set, 52, first);
++    Put64(set, 56, length);
++    for (size_t k = 0; k < name_entries; ++k) {
++      set[64 + k * 32] = 0xC1;
++      for (size_t c = 0; c < 15 && k * 15 + c < name.size(); ++c) {
++        Put16(set, 64 + k * 32 + 2 + c * 2, name[k * 15 + c]);
++      }
++    }
++    uint16_t checksum = 0;
++    for (size_t i = 0; i < set.size(); ++i) {
++      if (i != 2 && i != 3) {
++        checksum = static_cast<uint16_t>(((checksum << 15) | (checksum >> 1)) + set[i]);
++      }
++    }
++    Put16(set, 2, corrupt ? static_cast<uint16_t>(checksum ^ 0x5A5A) : checksum);
++    if (deleted) {
++      for (size_t i = 0; i < set.size(); i += 32) {
++        set[i] &= 0x7F; // clear the in-use bit
++      }
++    }
++    out.insert(out.end(), set.begin(), set.end());
++  }
++
++  void Serialize(Dir &dir, bool is_root) {
++    std::vector<uint8_t> bytes;
++    if (is_root) {
++      std::vector<uint8_t> e(32, 0);
++      e[0] = 0x81;
++      Put32(e, 20, m_bitmap_clusters.front());
++      Put64(e, 24, m_bitmap.size());
++      bytes.insert(bytes.end(), e.begin(), e.end());
++      std::vector<uint8_t> u(32, 0);
++      u[0] = 0x82;
++      Put32(u, 4, m_upcase_checksum);
++      Put32(u, 20, m_upcase_clusters.front());
++      Put64(u, 24, UpcaseEntries * 2);
++      bytes.insert(bytes.end(), u.begin(), u.end());
++    }
++    for (auto &d : dir.dirs) {
++      const uint64_t size = d.clusters.size() * ClusterSize;
++      AppendSet(bytes, d.name, true, 0x01, size, size, d.clusters.front(), false, false);
++    }
++    for (auto &f : dir.files) {
++      const uint64_t length = f.data.size();
++      const uint64_t valid = std::min<uint64_t>(f.valid, length);
++      const bool no_chain = f.frag_group == 0 && length != 0;
++      const uint8_t flags = no_chain ? 0x03 : 0x01;
++      AppendSet(bytes, f.name, false, flags, valid, length,
++                f.clusters.empty() ? 0 : f.clusters.front(), f.corrupt_checksum,
++                f.deleted);
++      WriteClusters(f.clusters, f.data);
++    }
++    WriteClusters(dir.clusters, bytes);
++    for (auto &d : dir.dirs) {
++      Serialize(d, false);
++    }
++  }
++
++  void WriteBootRegion() {
++    std::vector<uint8_t> boot(SectorSize, 0);
++    boot[0] = 0xEB;
++    boot[1] = 0x76;
++    boot[2] = 0x90;
++    std::memcpy(boot.data() + 3, "EXFAT   ", 8);
++    Put64(boot, 72, uint64_t(HeapOffsetSectors) + uint64_t(ClusterCount) * SectorsPerCluster);
++    Put32(boot, 80, FatOffsetSectors);
++    Put32(boot, 84, FatLengthSectors);
++    Put32(boot, 88, HeapOffsetSectors);
++    Put32(boot, 92, ClusterCount);
++    Put32(boot, 96, root.clusters.front());
++    Put32(boot, 100, 0x12345678);
++    Put16(boot, 104, 0x0100);
++    boot[108] = 9;
++    boot[109] = 1;
++    boot[110] = 1;
++    boot[111] = 0x80;
++    boot[112] = 0xFF;
++    boot[510] = 0x55;
++    boot[511] = 0xAA;
++
++    std::vector<uint8_t> region(12 * SectorSize, 0);
++    std::memcpy(region.data(), boot.data(), SectorSize);
++    for (size_t s = 1; s <= 8; ++s) {
++      Put32(region, s * SectorSize + 508, 0xAA550000);
++    }
++    uint32_t checksum = 0;
++    for (size_t i = 0; i < 11 * SectorSize; ++i) {
++      if (i != 106 && i != 107 && i != 112) {
++        checksum = ((checksum << 31) | (checksum >> 1)) + region[i];
++      }
++    }
++    for (size_t i = 0; i < SectorSize; i += 4) {
++      Put32(region, 11 * SectorSize + i, checksum);
++    }
++    std::memcpy(m_image.data(), region.data(), region.size());
++    std::memcpy(m_image.data() + 12 * SectorSize, region.data(), region.size());
++  }
++};
++
++std::vector<uint8_t> Pattern(size_t size, uint32_t seed) {
++  std::vector<uint8_t> data(size);
++  uint32_t state = seed * 2654435761u + 1;
++  for (auto &b : data) {
++    state = state * 1664525u + 1013904223u;
++    b = static_cast<uint8_t>(state >> 24);
++  }
++  return data;
++}
++
++const std::string UnicodeName = "asset-\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.bin";
++const std::string EmojiName = "emoji-\xf0\x9f\x98\x80.bin";
++const std::string LongName = std::string(255, 'a');
++
++struct Fixture {
++  std::map<std::string, std::vector<uint8_t>> files; // member path -> bytes
++  std::vector<uint8_t> image;
++};
++
++Fixture MakeFixture() {
++  Fixture fx;
++  ImageBuilder b;
++  const auto add = [&](Dir &dir, const std::string &prefix, Item item) {
++    fx.files[prefix + item.name] = item.data;
++    dir.files.push_back(std::move(item));
++  };
++  add(b.root, "", {"eboot.bin", Pattern(11, 1)});
++  add(b.root, "", {"MiXeD_CaSe.TXT", Pattern(300, 2)});
++  add(b.root, "", {UnicodeName, Pattern(1500, 3)});
++  add(b.root, "", {EmojiName, Pattern(77, 4)});
++  add(b.root, "", {LongName, Pattern(900, 5)});
++  add(b.root, "", {"empty.bin", {}});
++  add(b.root, "", {"contiguous.bin", Pattern(100 * 1024 + 321, 6)});
++  add(b.root, "", {"frag_a.bin", Pattern(40 * 1024 + 5, 7), UINT64_MAX, 1});
++  add(b.root, "", {"frag_b.bin", Pattern(33 * 1024, 8), UINT64_MAX, 1});
++
++  Item short_valid{"short_valid.bin", Pattern(3000, 9), 1500};
++  fx.files["short_valid.bin"] = short_valid.data;
++  std::fill(fx.files["short_valid.bin"].begin() + 1500, fx.files["short_valid.bin"].end(), 0);
++  b.root.files.push_back(short_valid);
++
++  // Entries the reader has to ignore.
++  b.root.files.push_back({"bad_checksum.bin", Pattern(10, 10), UINT64_MAX, 0, true});
++  b.root.files.push_back({"deleted.bin", Pattern(10, 11), UINT64_MAX, 0, false, true});
++
++  Dir sce{"sce_sys"};
++  add(sce, "sce_sys/", {"param.json", Pattern(64, 12)});
++  b.root.dirs.push_back(std::move(sce));
++
++  Dir many{"many"};
++  for (int i = 0; i < 100; ++i) {
++    char name[64];
++    std::snprintf(name, sizeof(name), "file_%03d_with_a_reasonably_long_name.dat", i);
++    add(many, "many/", {name, Pattern(static_cast<size_t>(i) * 7, 100 + i)});
++  }
++  b.root.dirs.push_back(std::move(many));
++
++  Dir deep{"assets"};
++  Dir sub{"subdir"};
++  Dir deeper{"deeper"};
++  add(deeper, "assets/subdir/deeper/", {"data.bin", Pattern(5000, 13)});
++  sub.dirs.push_back(std::move(deeper));
++  deep.dirs.push_back(std::move(sub));
++  b.root.dirs.push_back(std::move(deep));
++  b.root.dirs.push_back(Dir{"emptydir"});
++
++  fx.image = b.Build();
++  return fx;
++}
++
++void WriteImage(const std::filesystem::path &path, const std::vector<uint8_t> &image,
++                size_t size = SIZE_MAX) {
++  std::ofstream out(path, std::ios::binary | std::ios::trunc);
++  out.write(reinterpret_cast<const char *>(image.data()),
++            static_cast<std::streamsize>(std::min(size, image.size())));
++  Check(out.good(), "write image");
++}
++
++std::vector<uint8_t> ReadAll(Common::ExFatVolume &volume, const std::string &member,
++                             size_t chunk) {
++  const auto entry = volume.Find(member);
++  Check(entry && entry->is_file, "member exists and is a file");
++  std::vector<uint8_t> data(entry->size);
++  size_t done = 0;
++  while (done < data.size()) {
++    const auto want = std::min<uint64_t>(chunk, data.size() - done);
++    const auto got = volume.Read(entry->id, done, want, data.data() + done);
++    Check(got == want, "read returns the requested bytes");
++    done += got;
++  }
++  Check(volume.Read(entry->id, entry->size, 16, data.data()) == 0,
++        "read at end of file returns nothing");
++  return data;
++}
++
++void TestContents(const Fixture &fx, const std::filesystem::path &path) {
++  auto volume = Common::ExFatVolume::Open(path);
++  Check(volume != nullptr, "open image");
++
++  // Listing: ignores deleted and corrupt entry sets, keeps everything else.
++  std::set<std::string> names;
++  for (const auto &item : volume->List("")) {
++    Check(names.insert(item.name).second, "no duplicate names");
++  }
++  Check(!names.count("deleted.bin") && !names.count("bad_checksum.bin"),
++        "deleted and corrupt entry sets are skipped");
++  for (const auto &name : {"eboot.bin", "MiXeD_CaSe.TXT", "empty.bin", "contiguous.bin",
++                           "frag_a.bin", "frag_b.bin", "sce_sys", "many", "assets", "emptydir"}) {
++    Check(names.count(name) == 1, name);
++  }
++  Check(names.count(UnicodeName) && names.count(EmojiName) && names.count(LongName),
++        "unicode, surrogate-pair and 255 character names");
++  Check(volume->List("many").size() == 100, "directory spanning many clusters");
++  Check(volume->List("emptydir").empty(), "empty directory");
++  Check(volume->List("eboot.bin").empty() && volume->List("nope").empty(),
++        "listing a file or a missing directory is empty");
++
++  // Every file, through several read sizes (smaller and larger than a cluster).
++  for (const auto &[member, expected] : fx.files) {
++    for (const size_t chunk : {size_t{1000}, size_t{4097}, size_t{1} << 20}) {
++      Check(ReadAll(*volume, member, chunk) == expected, member.c_str());
++    }
++  }
++
++  // Random partial reads crossing cluster and run boundaries, including past EOF.
++  for (const auto *member : {"frag_a.bin", "frag_b.bin", "contiguous.bin", "short_valid.bin"}) {
++    const auto &expected = fx.files.at(member);
++    const auto entry = volume->Find(member);
++    Check(entry.has_value() && entry->size == expected.size(), "size");
++    uint32_t state = 12345;
++    for (int i = 0; i < 400; ++i) {
++      state = state * 1664525u + 1013904223u;
++      const uint64_t offset = (state >> 8) % (expected.size() + 100);
++      state = state * 1664525u + 1013904223u;
++      const uint64_t size = (state >> 8) % 3000;
++      std::vector<uint8_t> got(size + 1, 0xCC);
++      const auto n = volume->Read(entry->id, offset, size, got.data());
++      const uint64_t want = offset >= expected.size() ? 0 : std::min<uint64_t>(size, expected.size() - offset);
++      Check(n == want, "partial read length");
++      Check(std::equal(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(n),
++                       expected.begin() + static_cast<std::ptrdiff_t>(std::min<uint64_t>(offset, expected.size()))),
++            "partial read bytes");
++      Check(got[size] == 0xCC, "read does not write past the requested size");
++    }
++  }
++
++  // Lookups are case-insensitive, also beyond ASCII (via the volume's up-case table).
++  Check(volume->Find("mixed_case.txt").has_value(), "ascii case folding");
++  Check(volume->Find("SCE_SYS/PARAM.JSON").has_value(), "case folding in directories");
++  Check(volume->Find("ASSET-\xc3\x89-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.BIN").has_value(),
++        "non-ascii case folding");
++  Check(volume->Find("assets//subdir/./deeper/data.bin").has_value(), "redundant separators");
++  Check(!volume->Find("nope").has_value() && !volume->Find("eboot.bin/x").has_value() &&
++            !volume->Find("sce_sys/missing").has_value() && !volume->Find("bad\xff").has_value(),
++        "missing paths are not found");
++  const auto root = volume->Find("");
++  Check(root && !root->is_file, "empty path is the root directory");
++  const auto empty = volume->Find("empty.bin");
++  Check(empty && empty->is_file && empty->size == 0, "empty file");
++}
++
++void TestConcurrency(const Fixture &fx, const std::filesystem::path &path) {
++  auto volume = Common::ExFatVolume::Open(path);
++  Check(volume != nullptr, "open image");
++  std::atomic<int> failures{0};
++  std::vector<std::thread> threads;
++  for (int t = 0; t < 6; ++t) {
++    threads.emplace_back([&, t] {
++      for (int round = 0; round < 20; ++round) {
++        for (const auto &[member, expected] : fx.files) {
++          if ((std::hash<std::string>{}(member) + static_cast<size_t>(t + round)) % 3 != 0) {
++            continue;
++          }
++          const auto entry = volume->Find(member);
++          std::vector<uint8_t> data(expected.size());
++          if (!entry || volume->Read(entry->id, 0, data.size(), data.data()) != data.size() ||
++              data != expected) {
++            ++failures;
++          }
++        }
++      }
++    });
++  }
++  for (auto &thread : threads) {
++    thread.join();
++  }
++  Check(failures == 0, "concurrent reads are consistent");
++}
++
++void TestRejection(const Fixture &fx, const std::filesystem::path &directory) {
++  const auto bad = directory / "bad.exfat";
++  Check(Common::ExFatVolume::Open(directory / "missing.exfat") == nullptr, "missing file");
++
++  WriteImage(bad, std::vector<uint8_t>(4096, 0));
++  Check(Common::ExFatVolume::Open(bad) == nullptr, "zeroed file is not exFAT");
++
++  WriteImage(bad, fx.image, 100);
++  Check(Common::ExFatVolume::Open(bad) == nullptr, "file shorter than a boot sector");
++
++  auto damaged = fx.image;
++  damaged[510] = 0; // boot signature
++  WriteImage(bad, damaged);
++  Check(Common::ExFatVolume::Open(bad) == nullptr, "missing boot signature");
++
++  damaged = fx.image;
++  std::memcpy(damaged.data() + 3, "NTFS    ", 8);
++  WriteImage(bad, damaged);
++  Check(Common::ExFatVolume::Open(bad) == nullptr, "wrong file system name");
++
++  // An image cut off in the middle of the data still opens; reads are short and never crash.
++  WriteImage(bad, fx.image, fx.image.size() / 3);
++  auto truncated = Common::ExFatVolume::Open(bad);
++  Check(truncated != nullptr, "truncated image opens");
++  for (const auto &[member, expected] : fx.files) {
++    const auto entry = truncated->Find(member);
++    if (!entry || entry->size == 0) {
++      continue;
++    }
++    std::vector<uint8_t> data(entry->size);
++    const auto got = truncated->Read(entry->id, 0, data.size(), data.data());
++    Check(got <= data.size(), "short read on truncated image");
++  }
++}
++
++// The same image through the archive layer used by the launcher and the guest file system.
++void TestArchiveIntegration(const Fixture &fx, const std::filesystem::path &path) {
++  Check(Common::IsSupportedArchive("game.exfat") && Common::IsSupportedArchive("GAME.EXFAT") &&
++            !Common::IsSupportedArchive("game.exfat.bak"),
++        "extension routing");
++  const auto root = Common::MakeArchivePath(path);
++  Check(Common::IsArchivePath(root), "archive path marker");
++  Check(Common::File::IsFileExisting(Common::MakeArchivePath(path, "sce_sys/param.json")),
++        "file inside the image exists");
++  Check(!Common::File::IsFileExisting(Common::MakeArchivePath(path, "sce_sys/nope.json")),
++        "missing file inside the image");
++
++  const auto expected = fx.files.at("sce_sys/param.json");
++  Common::File file(Common::MakeArchivePath(path, "sce_sys/param.json"),
++                    Common::File::Mode::Read);
++  Check(!file.IsInvalid() && file.Size() == expected.size(), "open via Common::File");
++  std::vector<uint8_t> data(expected.size());
++  uint32_t read = 0;
++  file.Read(data.data(), static_cast<uint32_t>(data.size()), &read);
++  Check(read == data.size() && data == expected, "read via Common::File");
++
++  // A larger, fragmented file read through the shared 1 MiB chunked path.
++  const auto &frag = fx.files.at("frag_a.bin");
++  Common::File big(Common::MakeArchivePath(path, "frag_a.bin"), Common::File::Mode::Read);
++  Check(!big.IsInvalid() && big.Size() == frag.size(), "open fragmented file");
++  std::vector<uint8_t> big_data(frag.size());
++  read = 0;
++  big.Read(big_data.data(), static_cast<uint32_t>(big_data.size()), &read);
++  Check(read == big_data.size() && big_data == frag, "read fragmented file via Common::File");
++
++  std::set<std::string> names;
++  for (const auto &entry : Common::File::GetDirEntries(root)) {
++    names.insert(entry.name);
++  }
++  Check(names.count("eboot.bin") && names.count("sce_sys") && names.count("many"),
++        "directory listing via Common::File");
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++  // `exfat_tests --write-image <path>` only dumps the fixture image, so that it can be checked
++  // with an independent implementation such as `fsck.exfat`.
++  if (argc == 3 && std::strcmp(argv[1], "--write-image") == 0) {
++    WriteImage(argv[2], MakeFixture().image);
++    return 0;
++  }
++
++  TempDirectory temp;
++  const auto fixture = MakeFixture();
++  const auto image = temp.Path() / "game.exfat";
++  WriteImage(image, fixture.image);
++
++  TestContents(fixture, image);
++  TestConcurrency(fixture, image);
++  TestRejection(fixture, temp.Path());
++  TestArchiveIntegration(fixture, image);
++  std::puts("ExFatTests: all passed");
++  return 0;
++}
+-- 
+2.43.0
+

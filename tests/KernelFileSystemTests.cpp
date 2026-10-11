@@ -1,6 +1,8 @@
 #include "SDL.h"
 #include "common/emulatorConfig.h"
+#include "common/archive.h"
 #include "common/file.h"
+#include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -366,7 +368,7 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main() {
+int main(int, char**) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();

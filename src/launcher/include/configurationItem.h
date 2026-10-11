@@ -3,6 +3,7 @@
 
 #include "common.h"
 
+#include <QIcon>
 #include <QObject>
 #include <QTreeWidgetItem>
 
@@ -20,7 +21,7 @@ public:
 	explicit ConfigurationItem(std::unique_ptr<Configuration> info, QTreeWidget* parent);
 	~ConfigurationItem() override;
 
-	void Update();
+	void Update(bool reload_icon = false);
 	bool operator<(const QTreeWidgetItem& other) const override;
 
 	KYTY_QT_CLASS_NO_COPY(ConfigurationItem);
@@ -39,6 +40,7 @@ private:
 	void UpdateStatusIndicator();
 
 	std::unique_ptr<Configuration> m_info;
+	QIcon                          m_icon;
 	bool                           m_running          = false;
 	QComboBox*                     m_status_combo     = nullptr;
 	QLabel*                        m_status_indicator = nullptr;

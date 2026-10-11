@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12...4.3)
+cmake_minimum_required(VERSION 3.18...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -515,6 +515,21 @@ add_executable(page_protection_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageProtectionTableTests.cpp")
 target_link_libraries(page_protection_table_tests fmt::fmt common)
 target_include_directories(page_protection_table_tests PRIVATE ${inc_headers})
+add_executable(archive_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
+)
+target_link_libraries(archive_file_tests common ZArchive::zarchive)
+target_include_directories(archive_file_tests PRIVATE ${inc_headers})
+
+add_executable(exfat_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExFatTests.cpp"
+)
+target_link_libraries(exfat_tests common)
+target_include_directories(exfat_tests PRIVATE ${inc_headers})
+
+add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp")
+target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
+target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
@@ -598,6 +613,7 @@ add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
 target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(fiber_migration_tests
 	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
+target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -671,6 +687,9 @@ if(BUILD_TESTING)
 	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
+	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME exfat COMMAND $<TARGET_FILE:exfat_tests>)
+	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME native_region_epoch COMMAND $<TARGET_FILE:native_region_epoch_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -749,6 +768,9 @@ if(BUILD_TESTING)
 		demons_souls_idle_tests
 		page_protection_table_tests
 		atrac9_initialization_tests
+		archive_file_tests
+		exfat_tests
+		avplayer_file_tests
 		bit_array_tests
 		native_region_epoch_tests
 		shader_vertex_metadata_tests
